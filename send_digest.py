@@ -44,7 +44,7 @@ def build_digest(logs: list[dict]) -> tuple[str, str]:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     if not all_reviews and not all_errors:
-        subject = f"[night-pr-reviewer] {today} — nothing to review"
+        subject = f"[Night-pr-reviewer] {today} — nothing to review"
         body = (
             f"Daily digest for {today}\n\n"
             f"No new PRs to review in the last 24h across your watched repos.\n\n"
@@ -54,7 +54,7 @@ def build_digest(logs: list[dict]) -> tuple[str, str]:
 
     high_sev = sum(r.get("bug_count", 0) for r in all_reviews)
     close_tag = f" — 🚫 {len(closed_prs)} AUTO-CLOSED" if closed_prs else ""
-    subject = f"[night-pr-reviewer] {today} — {len(all_reviews)} review(s), {high_sev} issue(s){close_tag}"
+    subject = f"[Night-pr-reviewer] {today} — {len(all_reviews)} review(s), {high_sev} issue(s){close_tag}"
 
     lines = [
         f"Daily digest for {today}",

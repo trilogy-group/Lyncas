@@ -58,10 +58,10 @@ jobs:
           path: logs
           key: pr-reviewer-logs-${{ github.run_id }}
 
-      # Daily digest — only runs on the 7am UTC schedule trigger
-      # 7am UTC = 12:30pm IST. Change to '0 2 * * *' for 7:30am IST if you prefer.
+      # Daily digest — fires on 7am UTC schedule OR any workflow_dispatch
+      # (cron-job.org triggers via workflow_dispatch, so demo runs send email too)
       - name: Send daily digest
-        if: github.event.schedule == '0 7 * * *'
+        if: github.event.schedule == '0 7 * * *' || github.event_name == 'workflow_dispatch'
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}

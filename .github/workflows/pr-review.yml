@@ -2,12 +2,14 @@ name: night-pr-reviewer
 
 on:
   schedule:
-    # Hourly PR review scan
-    - cron: '0 * * * *'
+    # Every 15 min — PR review scan
+    - cron: '*/15 * * * *'
+    # Daily digest trigger (7am UTC = 12:30pm IST)
+    - cron: '0 7 * * *'
   # Allow manual trigger from Actions tab for testing / video demo
   workflow_dispatch:
 
-# Prevent overlapping runs if a scan takes longer than an hour
+# Prevent overlapping runs if a scan takes longer than the interval
 concurrency:
   group: pr-reviewer
   cancel-in-progress: false
@@ -56,8 +58,8 @@ jobs:
           path: logs
           key: pr-reviewer-logs-${{ github.run_id }}
 
-      # Daily digest — only runs at 7am UTC (adjust to your timezone)
-      # 7am UTC = 12:30pm IST. Change the hour check to match your morning.
+      # Daily digest — only runs on the 7am UTC schedule trigger
+      # 7am UTC = 12:30pm IST. Change to '0 2 * * *' for 7:30am IST if you prefer.
       - name: Send daily digest
         if: github.event.schedule == '0 7 * * *' || github.event_name == 'workflow_dispatch'
         env:

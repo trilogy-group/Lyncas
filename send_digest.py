@@ -6,9 +6,10 @@ Runs once per day (e.g. 7am) via the same GitHub Actions workflow.
 import html
 import json
 import os
+import shutil
 import smtplib
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -17,6 +18,8 @@ GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]  # NOT your real password 
 RECIPIENT = os.environ.get("DIGEST_RECIPIENT", GMAIL_USER)
 
 LOG_DIR = Path("logs")
+ARCHIVE_DIR = LOG_DIR / "archive"
+DAILY_SCHEDULE = "0 7 * * *"
 
 # ---- Palette ---------------------------------------------------------------
 COLOR_BG = "#fafaf9"
@@ -42,21 +45,56 @@ FONT_SERIF = "Georgia, 'Iowan Old Style', 'Charter', serif"
 FONT_SANS = "-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif"
 
 
-def collect_recent_logs(hours: int = 25) -> list[dict]:
-    """Load all run-*.json files modified in the last `hours` hours."""
+def _load_sent_log_names() -> set[str]:
+    """Union of log filenames recorded across all prior .digest-sent-*.marker files."""
     if not LOG_DIR.exists():
-        return []
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    logs = []
-    for f in sorted(LOG_DIR.glob("run-*.json")):
+        return set()
+    sent: set[str] = set()
+    for marker in LOG_DIR.glob(".digest-sent-*.marker"):
         try:
-            data = json.loads(f.read_text())
-            started = datetime.fromisoformat(data["started_at"])
-            if started >= cutoff:
-                logs.append(data)
+            data = json.loads(marker.read_text())
+            sent.update(data.get("files", []))
+        except Exception as e:
+            print(f"Could not parse marker {marker}: {e}", file=sys.stderr)
+    return sent
+
+
+def _write_sent_marker(log_filenames: list[str]) -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    marker = LOG_DIR / f".digest-sent-{ts}.marker"
+    marker.write_text(json.dumps({"sent_at": ts, "files": log_filenames}, indent=2))
+
+
+def archive_logs(log_filenames: list[str]) -> None:
+    """Move each named log file from logs/ to logs/archive/."""
+    if not log_filenames:
+        return
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    for name in log_filenames:
+        src = LOG_DIR / name
+        if src.exists():
+            shutil.move(str(src), str(ARCHIVE_DIR / name))
+
+
+def collect_unsent_logs() -> tuple[list[dict], list[str]]:
+    """Load run-*.json files not yet included in a previous digest.
+
+    Returns (parsed_logs, included_filenames).
+    """
+    if not LOG_DIR.exists():
+        return [], []
+    sent = _load_sent_log_names()
+    logs: list[dict] = []
+    names: list[str] = []
+    for f in sorted(LOG_DIR.glob("run-*.json")):
+        if f.name in sent:
+            continue
+        try:
+            logs.append(json.loads(f.read_text()))
+            names.append(f.name)
         except Exception as e:
             print(f"Could not parse {f}: {e}", file=sys.stderr)
-    return logs
+    return logs, names
 
 
 def _severity_color(score) -> str:
@@ -377,12 +415,23 @@ def send_email(subject: str, text_body: str, html_body: str) -> None:
 
 
 def main() -> int:
-    logs = collect_recent_logs(hours=25)
+    logs, included = collect_unsent_logs()
+
+    has_content = any(log.get("reviews") or log.get("errors") for log in logs)
+    is_daily = os.environ.get("GITHUB_EVENT_SCHEDULE") == DAILY_SCHEDULE
+
+    if not has_content and not is_daily:
+        print("no new content since last digest, skipping email")
+        return 0
+
     subject, text_body, html_body = build_digest(logs)
     print(f"Subject: {subject}")
     print(f"Text body:\n{text_body}")
     send_email(subject, text_body, html_body)
     print(f"✅ Sent digest to {RECIPIENT}")
+
+    _write_sent_marker(included)
+    archive_logs(included)
     return 0
 
 

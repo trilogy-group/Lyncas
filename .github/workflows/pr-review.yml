@@ -66,4 +66,5 @@ jobs:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           DIGEST_RECIPIENT: ${{ secrets.DIGEST_RECIPIENT }}
+          GITHUB_EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: python send_digest.py

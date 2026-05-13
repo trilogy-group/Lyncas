@@ -382,6 +382,33 @@ def _render_html(logs, all_reviews, all_errors, closed_prs, today) -> str:
 </body></html>"""
 
 
+def _pluralize(n: int, singular: str, plural: str | None = None) -> str:
+    if n == 1:
+        return f"1 {singular}"
+    return f"{n} {plural or singular + 's'}"
+
+
+def _build_subject(all_reviews: list[dict], all_errors: list[dict], closed_prs: list[dict]) -> str:
+    n_reviews = len(all_reviews)
+    n_closed = len(closed_prs)
+    n_errors = len(all_errors)
+    n_bugs = sum(r.get("bug_count", 0) for r in all_reviews)
+
+    if not all_reviews and not all_errors:
+        return "🌙 Night PR Reviewer — all quiet"
+
+    if n_closed:
+        return f"🚫 Night PR Reviewer — {_pluralize(n_closed, 'auto-closed', 'auto-closed')} · {n_reviews} reviewed"
+
+    if n_errors:
+        return f"⚠️ Night PR Reviewer — {n_reviews} reviewed · {_pluralize(n_errors, 'error')}"
+
+    if n_bugs:
+        return f"🌙 Night PR Reviewer — {_pluralize(n_reviews, 'PR')} reviewed · {_pluralize(n_bugs, 'issue')} to look at"
+
+    return f"🌙 Night PR Reviewer — {_pluralize(n_reviews, 'PR')} reviewed, all clean"
+
+
 def build_digest(logs: list[dict]) -> tuple[str, str, str]:
     """Return (subject, text_body, html_body) for the digest email."""
     all_reviews = [r for log in logs for r in log["reviews"]]
@@ -389,12 +416,7 @@ def build_digest(logs: list[dict]) -> tuple[str, str, str]:
     closed_prs = [r for r in all_reviews if r.get("action") == "closed"]
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    if not all_reviews and not all_errors:
-        subject = f"[Night-pr-reviewer] {today} — nothing to review"
-    else:
-        high_sev = sum(r.get("bug_count", 0) for r in all_reviews)
-        close_tag = f" — 🚫 {len(closed_prs)} AUTO-CLOSED" if closed_prs else ""
-        subject = f"[Night-pr-reviewer] {today} — {len(all_reviews)} review(s), {high_sev} issue(s){close_tag}"
+    subject = _build_subject(all_reviews, all_errors, closed_prs)
 
     text_body = _build_text(logs, all_reviews, all_errors, closed_prs, today)
     html_body = _render_html(logs, all_reviews, all_errors, closed_prs, today)

@@ -61,7 +61,7 @@ jobs:
       # Daily digest — only runs on the 7am UTC schedule trigger
       # 7am UTC = 12:30pm IST. Change to '0 2 * * *' for 7:30am IST if you prefer.
       - name: Send daily digest
-        if: github.event.schedule == '0 7 * * *' || github.event_name == 'workflow_dispatch'
+        if: github.event.schedule == '0 7 * * *'
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}

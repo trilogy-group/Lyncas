@@ -60,8 +60,8 @@ jobs:
 
       # Daily digest — fires on 7am UTC schedule OR any workflow_dispatch
       # (cron-job.org triggers via workflow_dispatch, so demo runs send email too)
-      - name: Send daily digest
-        if: github.event.schedule == '0 7 * * *' || github.event_name == 'workflow_dispatch'
+      - name: Send daily digest₹
+        if: github.event.schedule == '20 17 * * *' || github.event_name == 'workflow_dispatch'
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}

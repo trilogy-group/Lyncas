@@ -1,0 +1,67 @@
+name: night-pr-reviewer
+
+on:
+  schedule:
+    # Hourly PR review scan
+    - cron: '0 * * * *'
+  # Allow manual trigger from Actions tab for testing / video demo
+  workflow_dispatch:
+
+# Prevent overlapping runs if a scan takes longer than an hour
+concurrency:
+  group: pr-reviewer
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      # Cache the logs/ dir across runs so the daily digest can see them
+      - name: Restore logs cache
+        uses: actions/cache@v4
+        with:
+          path: logs
+          key: pr-reviewer-logs-${{ github.run_id }}
+          restore-keys: |
+            pr-reviewer-logs-
+
+      - name: Run PR reviewer
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN_PAT: ${{ secrets.PR_REVIEWER_PAT }}
+          REPOS: ${{ secrets.REPOS }}
+          # Opt-in to auto-close. Defaults to false if unset.
+          # The agent will close a PR only if ALL three pass:
+          #   verdict=request_changes AND confidence=high AND severity_score>=9
+          ALLOW_AUTO_CLOSE: ${{ vars.ALLOW_AUTO_CLOSE || 'false' }}
+        run: python pr_reviewer.py
+
+      - name: Save logs cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: logs
+          key: pr-reviewer-logs-${{ github.run_id }}
+
+      # Daily digest — only runs at 7am UTC (adjust to your timezone)
+      # 7am UTC = 12:30pm IST. Change the hour check to match your morning.
+      - name: Send daily digest
+        if: github.event.schedule == '0 7 * * *' || github.event_name == 'workflow_dispatch'
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          DIGEST_RECIPIENT: ${{ secrets.DIGEST_RECIPIENT }}
+        run: python send_digest.py

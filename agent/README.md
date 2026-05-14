@@ -108,7 +108,7 @@ These are the answers to "why did you build it this way":
 | **GitHub Actions cron**, not local cron | Runs even when laptop is closed. Free for public repos, generous free tier for private. Auditable run history. |
 | **15-min scan**, not webhook | Webhooks need a public endpoint; cron does not. 15-min cadence is fast enough for human-scale review. Single moving part. |
 | **Comment marker for idempotency** | Means I can run as often as I want without spamming PRs. The marker is invisible HTML. |
-| **Claude Sonnet, not Opus** | Per Arleif's cost guidance. Sonnet is more than capable for review tasks. ~$0.005-0.02 per PR review. |
+| **Claude Opus 4.5, not Sonnet** | Started on Sonnet for cost reasons, but the n=5 benchmark (see `agent/benchmark.py` + the dashboard `/benchmark` page) showed 100% verdict agreement with low bug-list overlap on complex PRs — i.e. Opus finds *different* and more issues. Since the bug list IS the deliverable that goes into the daily digest email, quality wins over cost here. Opus runs ~5x the per-token cost; we'll revisit if monthly spend crosses the budget threshold. |
 | **Truncate huge diffs at 60k chars** | Caps cost per PR. The note in the comment tells the human reviewer when this happened. |
 | **JSON output schema** | Forces Claude into structured thinking and lets me format the comment consistently. The prompt explicitly warns against hallucinating code. |
 | **Demo on a personal repo** | Won't touch shared/team repos without consent. Config-driven, so the same agent runs on any repo I own. |
@@ -150,8 +150,7 @@ If you ever disagree with a close, anyone with PR write access can reopen it. Th
 
 ## Cost ceiling
 
-Sonnet pricing × 60k char diffs × 15-min runs × N repos.
-Real-world: typically **under $1/day** for a handful of repos. The digest shows token counts per review so you can see exactly what each one cost.
+Opus 4.5 pricing × 60k char diffs × 15-min runs × N repos. Opus is roughly 5x the per-token cost of Sonnet, so budget accordingly — expect a few cents per review instead of fractions of a cent. The benchmark (`/benchmark` page) showed Opus catches issues Sonnet misses on complex PRs, which is why the bug list goes through Opus now. The digest shows token counts per review so you can see exactly what each one cost; if monthly spend exceeds the budget threshold, flip `MODEL` back to `claude-sonnet-4-5` in `pr_reviewer.py`.
 
 ## Failure modes to watch
 

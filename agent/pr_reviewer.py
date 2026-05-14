@@ -30,8 +30,11 @@ AUTO_CLOSE_MIN_SEVERITY = 9   # severity_score must be >= this
 AUTO_CLOSE_REQUIRED_VERDICT = "request_changes"
 AUTO_CLOSE_REQUIRED_CONFIDENCE = "high"
 
-# Cheap model per Arleif's cost guidance. Upgrade only if quality is insufficient.
-MODEL = "claude-sonnet-4-5"
+# claude-opus-4-5: ~5x cost of Sonnet but meaningfully better bug detection.
+# Benchmark (n=5) showed 100% verdict agreement but low bug overlap on complex PRs.
+# For deep review where the bug list IS the deliverable, Opus wins.
+# Switch back to Sonnet if monthly cost exceeds budget threshold.
+MODEL = "claude-opus-4-5"
 MAX_DIFF_CHARS = 60_000  # truncate huge PRs to control token cost
 REVIEW_MARKER = "<!-- night-pr-reviewer:v1 -->"  # used to detect prior reviews
 CLOSE_MARKER = "<!-- night-pr-reviewer:closed:v1 -->"  # used to detect prior auto-close

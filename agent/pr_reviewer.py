@@ -697,12 +697,20 @@ The prompt.md `Output format` section spells out every field's exact content req
     )
 
     text = response.content[0].text.strip()
-    # Strip accidental code fences if Claude adds them despite instructions
+    # Strip the OUTERMOST code fence if Claude wraps its JSON despite
+    # instructions. Important: Phase 3's schema explicitly invites Claude
+    # to embed fenced code blocks inside `suggestion` string values, so we
+    # cannot naively `split("```")` — that would chop the response in half
+    # at the first inner fence and leave us with an unterminated string.
+    # Instead: drop only the opening fence line (e.g. ```json\n or ```\n)
+    # and the trailing fence, leaving inner fences inside string values
+    # untouched.
     if text.startswith("```"):
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
-        text = text.strip()
+        first_nl = text.find("\n")
+        text = text[first_nl + 1:] if first_nl != -1 else text[3:]
+        text = text.rstrip()
+        if text.endswith("```"):
+            text = text[:-3].rstrip()
 
     parsed = json.loads(text)
     parsed["_truncated"] = truncated

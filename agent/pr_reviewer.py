@@ -13,6 +13,7 @@ from pathlib import Path
 
 import requests
 from anthropic import Anthropic
+from supabase import Client, create_client
 
 # --- Config ---------------------------------------------------------------
 
@@ -42,10 +43,110 @@ GH_HEADERS = {
     "X-GitHub-Api-Version": "2022-11-28",
 }
 
-LOG_DIR = Path("logs")
-LOG_DIR.mkdir(exist_ok=True)
-
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
+# --- Supabase state -------------------------------------------------------
+# Optional: if SUPABASE_URL / SUPABASE_SERVICE_KEY are unset, the agent still
+# reviews PRs (the GitHub-side actions don't need a DB). We just skip the
+# state writes and warn at startup. Losing the DB row is recoverable; losing
+# the run is not (see IMPROVEMENTS.md Phase 2, requirement #7).
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+
+supabase: Client | None = None
+if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    except Exception as e:
+        print(f"[ERROR] Failed to initialize Supabase client: {e}", file=sys.stderr)
+else:
+    print(
+        "[WARN] SUPABASE_URL or SUPABASE_SERVICE_KEY is unset — "
+        "agent will review PRs but will not persist state to Supabase",
+        file=sys.stderr,
+    )
+
+
+def insert_run() -> str | None:
+    """Insert a fresh row into `runs` and return its id (None on failure)."""
+    if supabase is None:
+        return None
+    try:
+        resp = (
+            supabase.table("runs")
+            .insert(
+                {
+                    "trigger_source": os.environ.get("GITHUB_EVENT_NAME", "unknown"),
+                    "repos_scanned": REPOS,
+                }
+            )
+            .execute()
+        )
+        return resp.data[0]["id"] if resp.data else None
+    except Exception as e:
+        print(f"[ERROR] Could not insert runs row: {e}", file=sys.stderr)
+        return None
+
+
+def finalize_run(
+    run_id: str | None,
+    reviews_created: int,
+    skipped: int,
+    errors: list[dict],
+) -> None:
+    """Patch the runs row with end-of-run counters. Soft-fails on DB error."""
+    if supabase is None or run_id is None:
+        return
+    try:
+        supabase.table("runs").update(
+            {
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "reviews_created": reviews_created,
+                "skipped": skipped,
+                "errors": errors if errors else None,
+            }
+        ).eq("id", run_id).execute()
+    except Exception as e:
+        print(f"[ERROR] Could not finalize runs row {run_id}: {e}", file=sys.stderr)
+
+
+def upsert_review(
+    *,
+    pr: dict,
+    repo: str,
+    review: dict,
+    action: str,
+    gate_reason: str,
+) -> None:
+    """Upsert one row in `reviews`. Re-reviews of the same (repo, pr_number)
+    overwrite cleanly via the unique index. Raises on failure — the caller
+    decides how to handle (the GitHub comment has already been posted)."""
+    if supabase is None:
+        return
+    payload = {
+        "repo": repo,
+        "pr_number": pr["number"],
+        "pr_url": pr["html_url"],
+        "pr_title": pr["title"],
+        "pr_author": pr.get("user", {}).get("login"),
+        "verdict": review["verdict"],
+        "confidence": review["confidence"],
+        "severity_score": review.get("severity_score"),
+        "summary": review["summary"],
+        "bug_count": len(review.get("bugs") or []),
+        "bugs": review.get("bugs"),
+        "concerns": review.get("concerns"),
+        "questions": review.get("questions"),
+        "praise": review.get("praise"),
+        "action": action,
+        "gate_reason": gate_reason or None,
+        "input_tokens": review.get("_input_tokens"),
+        "output_tokens": review.get("_output_tokens"),
+        "truncated": review.get("_truncated", False),
+    }
+    supabase.table("reviews").upsert(payload, on_conflict="repo,pr_number").execute()
 
 
 # --- GitHub helpers -------------------------------------------------------
@@ -291,20 +392,18 @@ def format_review_comment(review: dict) -> str:
 # --- Main loop ------------------------------------------------------------
 
 def main() -> int:
-    run_log = {
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "repos": REPOS,
-        "reviews": [],
-        "skipped": [],
-        "errors": [],
-    }
+    run_id = insert_run()
+    reviewed_count = 0          # PRs the agent acted on via GitHub this run
+    reviews_created = 0         # rows successfully written to `reviews` table
+    skipped = 0
+    errors: list[dict] = []
 
     for repo in REPOS:
         try:
             prs = list_open_prs(repo)
         except Exception as e:
             print(f"[ERROR] Could not list PRs for {repo}: {e}", file=sys.stderr)
-            run_log["errors"].append({"repo": repo, "error": str(e)})
+            errors.append({"repo": repo, "error": str(e)})
             continue
 
         print(f"[{repo}] {len(prs)} open PR(s)")
@@ -316,7 +415,7 @@ def main() -> int:
             try:
                 if already_reviewed(repo, num):
                     print(f"  [{tag}] already reviewed, skipping")
-                    run_log["skipped"].append({"pr": tag, "reason": "already_reviewed"})
+                    skipped += 1
                     continue
 
                 print(f"  [{tag}] fetching diff...")
@@ -343,32 +442,38 @@ def main() -> int:
                           f"confidence, severity {review.get('severity_score', '?')}) "
                           f"— close gates not met: {gate_reason}")
 
-                run_log["reviews"].append({
-                    "pr": tag,
-                    "url": pr["html_url"],
-                    "title": pr["title"],
-                    "verdict": review["verdict"],
-                    "confidence": review["confidence"],
-                    "severity_score": review.get("severity_score"),
-                    "summary": review["summary"],
-                    "bug_count": len(review.get("bugs", [])),
-                    "input_tokens": review["_input_tokens"],
-                    "output_tokens": review["_output_tokens"],
-                    "action": action,
-                    "gate_reason": gate_reason if action == "commented" else "",
-                })
+                reviewed_count += 1
+
+                # GitHub side is done. Persist to Supabase; soft-fail so a DB
+                # outage doesn't bury the comment we already posted.
+                try:
+                    upsert_review(
+                        pr=pr,
+                        repo=repo,
+                        review=review,
+                        action=action,
+                        gate_reason=gate_reason,
+                    )
+                    reviews_created += 1
+                except Exception as db_e:
+                    print(
+                        f"  [{tag}] ⚠️  Supabase upsert failed: {db_e}",
+                        file=sys.stderr,
+                    )
+                    errors.append({"pr": tag, "error": f"supabase_upsert: {db_e}"})
             except Exception as e:
                 print(f"  [{tag}] ❌ error: {e}", file=sys.stderr)
-                run_log["errors"].append({"pr": tag, "error": str(e)})
+                errors.append({"pr": tag, "error": str(e)})
 
-    # Write log for digest builder
-    run_log["finished_at"] = datetime.now(timezone.utc).isoformat()
-    log_file = LOG_DIR / f"run-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.json"
-    log_file.write_text(json.dumps(run_log, indent=2))
-    print(f"\nWrote log: {log_file}")
-    print(f"Summary: {len(run_log['reviews'])} reviewed, {len(run_log['skipped'])} skipped, {len(run_log['errors'])} errored")
+    finalize_run(run_id, reviews_created, skipped, errors)
+    print(
+        f"\nSummary: {reviewed_count} reviewed on GitHub, "
+        f"{reviews_created} persisted to Supabase, "
+        f"{skipped} skipped, {len(errors)} errored "
+        f"(run_id={run_id})"
+    )
 
-    return 0 if not run_log["errors"] else 1
+    return 0 if not errors else 1
 
 
 if __name__ == "__main__":

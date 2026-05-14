@@ -32,15 +32,6 @@ jobs:
       - name: Install deps
         run: pip install -r agent/requirements.txt
 
-      # Cache the logs/ dir across runs so the daily digest can see them
-      - name: Restore logs cache
-        uses: actions/cache@v4
-        with:
-          path: logs
-          key: pr-reviewer-logs-${{ github.run_id }}
-          restore-keys: |
-            pr-reviewer-logs-
-
       - name: Run PR reviewer
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -50,14 +41,10 @@ jobs:
           # The agent will close a PR only if ALL three pass:
           #   verdict=request_changes AND confidence=high AND severity_score>=9
           ALLOW_AUTO_CLOSE: ${{ vars.ALLOW_AUTO_CLOSE || 'false' }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: python agent/pr_reviewer.py
-
-      - name: Save logs cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: logs
-          key: pr-reviewer-logs-${{ github.run_id }}
 
       # Daily digest — fires on 7am UTC schedule OR any workflow_dispatch
       # (cron-job.org triggers via workflow_dispatch, so demo runs send email too)

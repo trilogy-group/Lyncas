@@ -154,7 +154,14 @@ VERDICT_COMMENT = "#2563eb"
 CLOSED_BG = "#fef2f2"
 
 FONT_MONO = "'JetBrains Mono', 'SF Mono', 'Menlo', 'Consolas', monospace"
-FONT_SERIF = "Georgia, 'Iowan Old Style', 'Charter', serif"
+# Instrument Serif (Google Fonts, italic weight 400) leads the serif stack;
+# every FONT_SERIF use in this file is paired with `font-style:italic`, and
+# Instrument Serif has a particularly elegant italic that matches the
+# magazine-style display feel we want. Fallbacks are progressively safer:
+# Cormorant Garamond is another web-font option some clients may have
+# loaded elsewhere, then Georgia / Iowan / Charter cover system fallbacks
+# for the (many) email clients that strip external <link> stylesheets.
+FONT_SERIF = "'Instrument Serif', 'Cormorant Garamond', Georgia, 'Iowan Old Style', 'Charter', serif"
 FONT_SANS = "-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif"
 
 
@@ -550,7 +557,7 @@ def _render_empty_state(today: str) -> str:
 <html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 </head>
 <body style="margin:0;padding:0;background:{COLOR_BG};">
 <table width="100%" cellpadding="0" cellspacing="0" border="0" role="presentation" style="background:{COLOR_BG};">
@@ -596,7 +603,7 @@ def _render_html(logs, all_reviews, all_errors, closed_prs, today) -> str:
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width">
 <title>Night PR Reviewer Digest</title>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 </head>
 <body style="margin:0;padding:0;background:{COLOR_BG};color:{COLOR_TEXT};">
 <table width="100%" cellpadding="0" cellspacing="0" border="0" role="presentation" style="background:{COLOR_BG};">

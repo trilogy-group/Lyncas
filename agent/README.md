@@ -55,6 +55,50 @@ In the agent repo on GitHub: Settings → Secrets and variables → Actions → 
 
 Go to the Actions tab → night-pr-reviewer → Run workflow. This triggers the scan immediately *and* sends a digest at the end (because of `workflow_dispatch` in the condition). Use this for your video demo.
 
+## Database setup
+
+> Required for v2 (Supabase-backed state). The agent code is being migrated to
+> read/write state from Supabase instead of GitHub Actions cache. See
+> [IMPROVEMENTS.md](../IMPROVEMENTS.md) for the full migration plan.
+
+### 1. Create a Supabase project
+
+Sign in at [supabase.com](https://supabase.com/), create a new project, pick a region close to where the GitHub runners are (US East is fine for `ubuntu-latest`), and wait for it to finish provisioning.
+
+### 2. Run the initial schema migration
+
+In the Supabase web UI:
+
+1. Open **SQL Editor** → **New query**.
+2. Paste the entire contents of [`migrations/001_initial_schema.sql`](migrations/001_initial_schema.sql).
+3. Click **Run**.
+4. Open **Table Editor** and confirm three new tables exist: `reviews`, `runs`, `digests`.
+
+The migration creates the schema with `check` constraints on enum-like fields (`verdict`, `confidence`, `action`), a unique index on `(repo, pr_number)` so re-reviews upsert cleanly, and partial/ordered indexes for the hot query paths the digest and dashboard rely on.
+
+### 3. Grab the API credentials
+
+In Supabase project settings → **API**:
+
+- `Project URL` → this is your `SUPABASE_URL`
+- `service_role` key (under "Project API keys", click **Reveal**) → this is your `SUPABASE_SERVICE_KEY` — **server-side only, never commit this**
+- `anon` / public key → save this as `SUPABASE_ANON_KEY` for the dashboard (Phase 4); the agent doesn't need it
+
+### 4. Add them as GitHub Actions secrets
+
+In this repo on GitHub: Settings → Secrets and variables → Actions → New repository secret. Add:
+
+| Name | Value |
+|---|---|
+| `SUPABASE_URL` | from step 3 |
+| `SUPABASE_SERVICE_KEY` | the `service_role` key from step 3 |
+
+These will be wired into the workflow in Phase 2, when `pr_reviewer.py` starts writing to the `reviews` and `runs` tables.
+
+### Notes on RLS
+
+The migration does **not** enable Row Level Security. The agent talks to the database with the `service_role` key (which bypasses RLS anyway), and v1 of the dashboard is read-only with the `anon` key. RLS will be added in a later iteration.
+
 ## Why these decisions (the things that matter)
 
 These are the answers to "why did you build it this way":

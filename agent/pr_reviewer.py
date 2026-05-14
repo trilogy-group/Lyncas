@@ -400,6 +400,7 @@ def format_review_comment(review: dict) -> str:
 # --- Main loop ------------------------------------------------------------
 
 def main() -> int:
+    print(f"[startup] Using model: {MODEL}")
     run_id = insert_run()
     reviewed_count = 0          # PRs the agent acted on via GitHub this run
     reviews_created = 0         # rows successfully written to `reviews` table

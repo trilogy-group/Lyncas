@@ -1,6 +1,19 @@
+# Python
 __pycache__/
 *.pyc
 .venv/
 venv/
 .env
-logs/
+
+# Node.js
+node_modules/
+.next/
+out/
+dist/
+.env.local
+.env*.local
+
+# IDE
+.vscode/
+.idea/
+.DS_Store

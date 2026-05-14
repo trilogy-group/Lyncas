@@ -137,7 +137,7 @@ def should_auto_close(review: dict) -> tuple[bool, str]:
 # --- Claude review --------------------------------------------------------
 
 def load_prompt() -> str:
-    return Path("prompt.md").read_text(encoding="utf-8")
+    return (Path(__file__).parent / "prompt.md").read_text(encoding="utf-8")
 
 
 def review_pr_with_claude(pr: dict, diff: str) -> dict:

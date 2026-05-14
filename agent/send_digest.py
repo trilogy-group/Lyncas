@@ -1,25 +1,112 @@
 """
-Daily digest sender — reads all log files from the last 24h and emails a summary.
-Runs once per day (e.g. 7am) via the same GitHub Actions workflow.
+Daily digest sender — reads undigested PR reviews from Supabase and emails a
+summary. After a successful send, records the digest in the `digests` table
+and stamps `digested_at` on each included review. Runs daily at 07:00 UTC
+(and on every workflow_dispatch trigger) via the same GitHub Actions workflow
+as pr_reviewer.py.
 """
 
 import html
-import json
 import os
-import shutil
 import smtplib
 import sys
 from datetime import datetime, timezone
 from email.message import EmailMessage
-from pathlib import Path
+
+from supabase import Client, create_client
 
 GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]  # NOT your real password — an app password
 RECIPIENT = os.environ.get("DIGEST_RECIPIENT", GMAIL_USER)
 
-LOG_DIR = Path("logs")
-ARCHIVE_DIR = LOG_DIR / "archive"
+# Cron expression of the daily proof-of-life run. Detected via the
+# GITHUB_EVENT_SCHEDULE env var (set in the workflow). On the daily run we
+# still send an "all quiet" email even with zero undigested reviews; on any
+# other trigger with zero content, we skip the email entirely.
 DAILY_SCHEDULE = "0 7 * * *"
+
+
+# --- Supabase state -------------------------------------------------------
+# Required: the digest is a view over `reviews` + `digests` now. If
+# credentials are missing we warn and exit cleanly rather than send a
+# malformed / empty email built on no data.
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+
+supabase: Client | None = None
+if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    except Exception as e:
+        print(f"[ERROR] Failed to initialize Supabase client: {e}", file=sys.stderr)
+
+
+def collect_undigested_reviews() -> list[dict] | None:
+    """Return all `reviews` rows where digested_at IS NULL, ordered by
+    severity_score desc so the worst PRs naturally end up at the top of the
+    email. Returns None on query failure so the caller can distinguish
+    "DB down" from "zero undigested rows"."""
+    if supabase is None:
+        return None
+    try:
+        resp = (
+            supabase.table("reviews")
+            .select("*")
+            .is_("digested_at", "null")
+            .order("severity_score", desc=True)
+            .execute()
+        )
+        return resp.data or []
+    except Exception as e:
+        print(f"[ERROR] Could not query undigested reviews: {e}", file=sys.stderr)
+        return None
+
+
+def record_digest_sent(
+    *,
+    review_ids: list[str],
+    review_count: int,
+    closed_count: int,
+    subject: str,
+) -> None:
+    """Insert one row into `digests`. Raises on failure (caller decides)."""
+    if supabase is None:
+        return
+    trigger_source = (
+        "schedule"
+        if os.environ.get("GITHUB_EVENT_SCHEDULE")
+        else "workflow_dispatch"
+    )
+    supabase.table("digests").insert(
+        {
+            "review_ids": review_ids,
+            "review_count": review_count,
+            "closed_count": closed_count,
+            "subject": subject,
+            "trigger_source": trigger_source,
+        }
+    ).execute()
+
+
+def mark_reviews_digested(review_ids: list[str]) -> None:
+    """Stamp digested_at on each review just sent. No-op for empty input."""
+    if supabase is None or not review_ids:
+        return
+    supabase.table("reviews").update(
+        {"digested_at": datetime.now(timezone.utc).isoformat()}
+    ).in_("id", review_ids).execute()
+
+
+def _adapt_review(row: dict) -> dict:
+    """Map a Supabase `reviews` row to the field names the renderer expects.
+    The renderer is preserved as-is; this is a minimal name-only adapter."""
+    return {
+        **row,
+        "pr": f"{row['repo']}#{row['pr_number']}",
+        "title": row.get("pr_title", ""),
+        "url": row.get("pr_url", "#"),
+    }
 
 # ---- Palette ---------------------------------------------------------------
 COLOR_BG = "#fafaf9"
@@ -43,58 +130,6 @@ CLOSED_BG = "#fef2f2"
 FONT_MONO = "'JetBrains Mono', 'SF Mono', 'Menlo', 'Consolas', monospace"
 FONT_SERIF = "Georgia, 'Iowan Old Style', 'Charter', serif"
 FONT_SANS = "-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif"
-
-
-def _load_sent_log_names() -> set[str]:
-    """Union of log filenames recorded across all prior .digest-sent-*.marker files."""
-    if not LOG_DIR.exists():
-        return set()
-    sent: set[str] = set()
-    for marker in LOG_DIR.glob(".digest-sent-*.marker"):
-        try:
-            data = json.loads(marker.read_text())
-            sent.update(data.get("files", []))
-        except Exception as e:
-            print(f"Could not parse marker {marker}: {e}", file=sys.stderr)
-    return sent
-
-
-def _write_sent_marker(log_filenames: list[str]) -> None:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    marker = LOG_DIR / f".digest-sent-{ts}.marker"
-    marker.write_text(json.dumps({"sent_at": ts, "files": log_filenames}, indent=2))
-
-
-def archive_logs(log_filenames: list[str]) -> None:
-    """Move each named log file from logs/ to logs/archive/."""
-    if not log_filenames:
-        return
-    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    for name in log_filenames:
-        src = LOG_DIR / name
-        if src.exists():
-            shutil.move(str(src), str(ARCHIVE_DIR / name))
-
-
-def collect_unsent_logs() -> tuple[list[dict], list[str]]:
-    """Load run-*.json files not yet included in a previous digest.
-
-    Returns (parsed_logs, included_filenames).
-    """
-    if not LOG_DIR.exists():
-        return [], []
-    sent = _load_sent_log_names()
-    logs: list[dict] = []
-    names: list[str] = []
-    for f in sorted(LOG_DIR.glob("run-*.json")):
-        if f.name in sent:
-            continue
-        try:
-            logs.append(json.loads(f.read_text()))
-            names.append(f.name)
-        except Exception as e:
-            print(f"Could not parse {f}: {e}", file=sys.stderr)
-    return logs, names
 
 
 def _severity_color(score) -> str:
@@ -409,12 +444,22 @@ def _build_subject(all_reviews: list[dict], all_errors: list[dict], closed_prs: 
     return f"🌙 Night PR Reviewer — {_pluralize(n_reviews, 'PR')} reviewed, all clean"
 
 
-def build_digest(logs: list[dict]) -> tuple[str, str, str]:
-    """Return (subject, text_body, html_body) for the digest email."""
-    all_reviews = [r for log in logs for r in log["reviews"]]
-    all_errors = [e for log in logs for e in log["errors"]]
+def build_digest(reviews: list[dict]) -> tuple[str, str, str]:
+    """Return (subject, text_body, html_body) for the digest email.
+
+    `reviews` is the list of adapter-shaped review dicts (one per Supabase
+    row), already ordered by severity desc. Errors are no longer surfaced
+    in the email — they live in `runs.errors` and will surface on the
+    dashboard (Phase 4)."""
+    all_reviews = reviews
+    all_errors: list[dict] = []
     closed_prs = [r for r in all_reviews if r.get("action") == "closed"]
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # The renderer's "Runs in window" stat was derived from log-file count.
+    # We pass an empty list so that counter reads as 0 — accurate per-run
+    # observability lives on the dashboard now.
+    logs: list[dict] = []
 
     subject = _build_subject(all_reviews, all_errors, closed_prs)
 
@@ -437,23 +482,69 @@ def send_email(subject: str, text_body: str, html_body: str) -> None:
 
 
 def main() -> int:
-    logs, included = collect_unsent_logs()
+    if supabase is None:
+        print(
+            "[ERROR] SUPABASE_URL or SUPABASE_SERVICE_KEY is unset — "
+            "cannot build digest without DB access; skipping",
+            file=sys.stderr,
+        )
+        return 1
 
-    has_content = any(log.get("reviews") or log.get("errors") for log in logs)
+    undigested = collect_undigested_reviews()
+    if undigested is None:
+        print(
+            "[ERROR] Could not fetch undigested reviews from Supabase; "
+            "refusing to send a partial digest",
+            file=sys.stderr,
+        )
+        return 1
+
     is_daily = os.environ.get("GITHUB_EVENT_SCHEDULE") == DAILY_SCHEDULE
 
-    if not has_content and not is_daily:
-        print("no new content since last digest, skipping email")
+    if not undigested and not is_daily:
+        print("no new reviews since last digest, skipping email")
         return 0
 
-    subject, text_body, html_body = build_digest(logs)
+    review_ids = [r["id"] for r in undigested]
+    closed_count = sum(1 for r in undigested if r.get("action") == "closed")
+    review_dicts = [_adapt_review(r) for r in undigested]
+
+    subject, text_body, html_body = build_digest(review_dicts)
     print(f"Subject: {subject}")
     print(f"Text body:\n{text_body}")
+
     send_email(subject, text_body, html_body)
     print(f"✅ Sent digest to {RECIPIENT}")
 
-    _write_sent_marker(included)
-    archive_logs(included)
+    # Order matters: record the digest first, then mark its reviews. If the
+    # update fails, the digests row still exists for manual reconciliation;
+    # the reverse order would leave reviews silently digested with no record.
+    try:
+        record_digest_sent(
+            review_ids=review_ids,
+            review_count=len(undigested),
+            closed_count=closed_count,
+            subject=subject,
+        )
+    except Exception as e:
+        print(
+            f"[ERROR] Could not insert digests row: {e} — "
+            "reviews left undigested; next run will re-send",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        mark_reviews_digested(review_ids)
+    except Exception as e:
+        print(
+            f"[ERROR] Could not stamp digested_at on reviews: {e} — "
+            "digest row exists; reconcile manually with "
+            "UPDATE reviews SET digested_at = now() WHERE id IN (...)",
+            file=sys.stderr,
+        )
+        return 1
+
     return 0
 
 

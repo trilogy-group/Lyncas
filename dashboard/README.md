@@ -89,6 +89,34 @@ every dashboard view is bookmarkable.
    - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
 7. Click Deploy. First build takes ~2 minutes.
 
+## Benchmark
+
+`/benchmark` is a Sonnet-vs-Opus comparison page. For every row in the
+`benchmark_runs` Supabase table it shows:
+
+- summary stats (verdict agreement %, mean severity delta, mean bug
+  overlap %, cost ratio)
+- a methodology blurb (so the page isn't taken as more authoritative
+  than it is)
+- the per-PR comparison rows, each clickable to drill down into
+  Sonnet's bugs vs Opus's bugs side-by-side with matched/unique
+  highlighting and both summaries verbatim
+- a conclusion that is rendered dynamically from the data — there is
+  no hardcoded "model X wins"
+
+Populate the table by running the benchmark script against the same
+Supabase project:
+
+```bash
+cd agent
+python benchmark.py --latest 5
+# or, against specific reviews:
+python benchmark.py --review-ids <uuid>,<uuid>
+```
+
+The page handles the empty state (no rows yet) by telling you to run
+the command above. The conclusion only renders once there is data.
+
 ## Notes
 
 - Every page is `export const dynamic = "force-dynamic"` because the data

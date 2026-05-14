@@ -19,7 +19,7 @@ from supabase import Client, create_client
 
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN_PAT"]  # personal PAT, not the default GITHUB_TOKEN
-REPOS = [r.strip() for r in os.environ["REPOS"].split(",") if r.strip()]  # e.g. "user/repo1,user/repo2"
+REPOS = [r.strip() for r in os.environ.get("REPOS", "").split(",") if r.strip()]  # e.g. "user/repo1,user/repo2"
 
 # --- Auto-close gates ---
 # All three must be true for the agent to close a PR. Set ALLOW_AUTO_CLOSE=true in
@@ -241,8 +241,13 @@ def load_prompt() -> str:
     return (Path(__file__).parent / "prompt.md").read_text(encoding="utf-8")
 
 
-def review_pr_with_claude(pr: dict, diff: str) -> dict:
-    """Ask Claude to review the diff. Returns dict with review fields."""
+def review_pr_with_claude(pr: dict, diff: str, model: str = MODEL) -> dict:
+    """Ask Claude to review the diff. Returns dict with review fields.
+
+    `model` defaults to the production model (MODEL) but is parameterised so
+    benchmark.py can re-run the same prompt against Opus without duplicating
+    this function. Everything else (prompt, parsing, output shape) is identical
+    across models — that's the whole point of the benchmark."""
     truncated = False
     if len(diff) > MAX_DIFF_CHARS:
         diff = diff[:MAX_DIFF_CHARS] + "\n\n[... diff truncated ...]"
@@ -274,7 +279,7 @@ Respond ONLY with valid JSON matching this schema (no markdown fences, no prose 
 }}"""
 
     response = client.messages.create(
-        model=MODEL,
+        model=model,
         max_tokens=2000,
         system=system_prompt,
         messages=[{"role": "user", "content": user_msg}],

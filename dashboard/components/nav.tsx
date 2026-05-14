@@ -24,6 +24,12 @@ export function Nav() {
             runs
           </Link>
           <Link
+            href="/benchmark"
+            className="text-muted hover:text-text transition-colors"
+          >
+            benchmark
+          </Link>
+          <Link
             href="/settings"
             className="text-muted hover:text-text transition-colors"
           >

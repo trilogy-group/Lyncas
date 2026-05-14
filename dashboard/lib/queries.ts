@@ -2,6 +2,8 @@ import { createSupabaseServerClient } from "./supabase/server";
 import type {
   ActivityPoint,
   Action,
+  BenchmarkRun,
+  BenchmarkStats,
   DashboardStats,
   Review,
   Run,
@@ -182,4 +184,83 @@ export async function getAvailableRepos(): Promise<string[]> {
   const seen = new Set<string>();
   for (const r of (data ?? []) as { repo: string }[]) seen.add(r.repo);
   return Array.from(seen).sort();
+}
+
+// --- Benchmark queries ----------------------------------------------------
+
+export async function getBenchmarkRuns(): Promise<BenchmarkRun[]> {
+  const supabase = createSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("benchmark_runs")
+    .select("*")
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+  return (data ?? []) as unknown as BenchmarkRun[];
+}
+
+export async function getBenchmarkStats(): Promise<BenchmarkStats> {
+  const supabase = createSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("benchmark_runs")
+    .select(
+      "verdict_agreement, severity_delta, bug_overlap_count, bugs_only_in_sonnet, bugs_only_in_opus, sonnet_cost_micros, opus_cost_micros",
+    );
+  if (error) throw error;
+
+  type Row = {
+    verdict_agreement: boolean | null;
+    severity_delta: number | null;
+    bug_overlap_count: number | null;
+    bugs_only_in_sonnet: number | null;
+    bugs_only_in_opus: number | null;
+    sonnet_cost_micros: number | null;
+    opus_cost_micros: number | null;
+  };
+  // Only count benchmarks that completed the Opus side — verdict_agreement
+  // being non-null is the signal that the comparison was actually computed.
+  const rows = ((data ?? []) as Row[]).filter(
+    (r) => r.verdict_agreement !== null,
+  );
+  const sample_size = rows.length;
+
+  if (sample_size === 0) {
+    return {
+      sample_size: 0,
+      agreement_pct: 0,
+      mean_sev_delta: 0,
+      mean_bug_overlap_pct: 0,
+      cost_ratio: 0,
+    };
+  }
+
+  const agreed = rows.filter((r) => r.verdict_agreement === true).length;
+  const agreement_pct = (agreed / sample_size) * 100;
+
+  const mean_sev_delta =
+    rows.reduce((s, r) => s + (r.severity_delta ?? 0), 0) / sample_size;
+
+  // Per-row bug overlap %, then averaged. Rows where both models reported
+  // zero bugs count as 100% (vacuous agreement on "no bugs found").
+  const overlapPcts = rows.map((r) => {
+    const ov = r.bug_overlap_count ?? 0;
+    const total = ov + (r.bugs_only_in_sonnet ?? 0) + (r.bugs_only_in_opus ?? 0);
+    return total === 0 ? 100 : (ov / total) * 100;
+  });
+  const mean_bug_overlap_pct =
+    overlapPcts.reduce((s, p) => s + p, 0) / sample_size;
+
+  const sumSonnet = rows.reduce(
+    (s, r) => s + (r.sonnet_cost_micros ?? 0),
+    0,
+  );
+  const sumOpus = rows.reduce((s, r) => s + (r.opus_cost_micros ?? 0), 0);
+  const cost_ratio = sumSonnet > 0 ? sumOpus / sumSonnet : 0;
+
+  return {
+    sample_size,
+    agreement_pct,
+    mean_sev_delta,
+    mean_bug_overlap_pct,
+    cost_ratio,
+  };
 }

@@ -83,3 +83,44 @@ export interface ActivityPoint {
   date: string;
   count: number;
 }
+
+// --- Benchmark types ------------------------------------------------------
+// Match agent/migrations/002_benchmark_runs.sql. Most "opus_*" fields are
+// nullable because benchmark.py only fills them on a successful Opus call.
+
+export interface BenchmarkRun {
+  id: string;
+  created_at: string;
+  review_id: string;
+  pr_url: string;
+  pr_title: string;
+  sonnet_verdict: Verdict;
+  sonnet_confidence: Confidence;
+  sonnet_severity: number;
+  sonnet_bugs: Bug[] | null;
+  sonnet_summary: string | null;
+  sonnet_input_tokens: number | null;
+  sonnet_output_tokens: number | null;
+  opus_verdict: Verdict | null;
+  opus_confidence: Confidence | null;
+  opus_severity: number | null;
+  opus_bugs: Bug[] | null;
+  opus_summary: string | null;
+  opus_input_tokens: number | null;
+  opus_output_tokens: number | null;
+  verdict_agreement: boolean | null;
+  severity_delta: number | null;
+  bug_overlap_count: number | null;
+  bugs_only_in_sonnet: number | null;
+  bugs_only_in_opus: number | null;
+  sonnet_cost_micros: number | null;
+  opus_cost_micros: number | null;
+}
+
+export interface BenchmarkStats {
+  sample_size: number;
+  agreement_pct: number; // 0..100, share of rows where verdicts matched
+  mean_sev_delta: number; // mean of |sonnet_sev - opus_sev|
+  mean_bug_overlap_pct: number; // 0..100, average per-row bug overlap
+  cost_ratio: number; // sum(opus_cost) / sum(sonnet_cost), 0 if no Sonnet cost
+}

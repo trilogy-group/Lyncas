@@ -23,6 +23,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Phase 2: the agent shallow-clones target repos to build a fingerprint.
+      # ubuntu-latest ships with git preinstalled — this step just makes the
+      # version visible in the run log so a future image change is obvious.
+      - name: Verify git is available
+        run: git --version
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'

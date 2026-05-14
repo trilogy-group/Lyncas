@@ -13,6 +13,36 @@ import type {
   Verdict,
 } from "./types";
 
+// --- Cost pricing (shared by getStats and getRepoStats) -------------------
+// Per-1M-token USD rates, in sync with agent/pr_reviewer.py's
+// MODEL_PRICING_USD_PER_M_TOKENS and agent/send_digest.py's copy.
+// Mirroring (not importing) avoids a cross-package dep.
+const PRICING_USD_PER_M_TOKENS: Record<
+  string,
+  { input: number; output: number }
+> = {
+  "claude-opus-4-5": { input: 15, output: 75 },
+  "claude-sonnet-4-5": { input: 3, output: 15 },
+};
+// Reviews predating Phase 3's `model` column have model=null. Phase 1 made
+// Opus the production model, so falling back to Opus matches reality for
+// the rows we'd realistically see in production.
+const FALLBACK_MODEL = "claude-opus-4-5";
+
+function rowCostUSD(
+  model: string | null | undefined,
+  inputTokens: number | null | undefined,
+  outputTokens: number | null | undefined,
+): number {
+  const rates =
+    PRICING_USD_PER_M_TOKENS[model ?? FALLBACK_MODEL] ??
+    PRICING_USD_PER_M_TOKENS[FALLBACK_MODEL];
+  return (
+    ((inputTokens ?? 0) * rates.input + (outputTokens ?? 0) * rates.output) /
+    1_000_000
+  );
+}
+
 export async function getStats(daysWindow = 30): Promise<DashboardStats> {
   const supabase = createSupabaseServerClient();
   const since = new Date(
@@ -27,7 +57,7 @@ export async function getStats(daysWindow = 30): Promise<DashboardStats> {
       .eq("action", "closed"),
     supabase
       .from("reviews")
-      .select("severity_score, input_tokens, output_tokens")
+      .select("severity_score, input_tokens, output_tokens, model")
       .gte("created_at", since),
   ]);
 
@@ -38,16 +68,19 @@ export async function getStats(daysWindow = 30): Promise<DashboardStats> {
     severity_score: number;
     input_tokens: number | null;
     output_tokens: number | null;
+    model: string | null;
   };
   const windowData = (windowRes.data ?? []) as WindowRow[];
   const avgSeverity = windowData.length
     ? windowData.reduce((s, r) => s + (r.severity_score ?? 0), 0) /
       windowData.length
     : 0;
+  // Per-row pricing: post-Phase-3 reviews have a `model` column; older rows
+  // (model=null) fall back to Opus, which matches the production model since
+  // Phase 1. Same approach getRepoStats uses, so the / overview cost and the
+  // /repos per-row cost sum to the same number for any given window.
   const estimatedCostUSD = windowData.reduce(
-    (sum, r) =>
-      sum +
-      ((r.input_tokens ?? 0) * 3 + (r.output_tokens ?? 0) * 15) / 1_000_000,
+    (sum, r) => sum + rowCostUSD(r.model, r.input_tokens, r.output_tokens),
     0,
   );
 
@@ -188,20 +221,7 @@ export async function getAvailableRepos(): Promise<string[]> {
 }
 
 // --- Per-repo stats (Phase 4) --------------------------------------------
-// Per-1M-token USD rates. Kept in sync with agent/pr_reviewer.py's
-// MODEL_PRICING_USD_PER_M_TOKENS and agent/send_digest.py's copy of the
-// same table. Mirroring (not importing) avoids a cross-package dependency.
-const PRICING_USD_PER_M_TOKENS: Record<
-  string,
-  { input: number; output: number }
-> = {
-  "claude-opus-4-5": { input: 15, output: 75 },
-  "claude-sonnet-4-5": { input: 3, output: 15 },
-};
-// Reviews predating Phase 3's `model` column have model=null. Phase 1 made
-// Opus the production model, so falling back to Opus matches reality for
-// the rows we'd realistically see in production.
-const REPO_STATS_FALLBACK_MODEL = "claude-opus-4-5";
+// Pricing constants live above getStats so both functions can share them.
 
 export async function getRepoStats(): Promise<RepoStat[]> {
   const supabase = createSupabaseServerClient();
@@ -254,13 +274,11 @@ export async function getRepoStats(): Promise<RepoStat[]> {
       s.last_reviewed_at = r.created_at;
     }
     if (r.created_at >= since30d) {
-      const rates =
-        PRICING_USD_PER_M_TOKENS[r.model ?? REPO_STATS_FALLBACK_MODEL] ??
-        PRICING_USD_PER_M_TOKENS[REPO_STATS_FALLBACK_MODEL];
-      s.estimated_cost_usd +=
-        ((r.input_tokens ?? 0) * rates.input +
-          (r.output_tokens ?? 0) * rates.output) /
-        1_000_000;
+      s.estimated_cost_usd += rowCostUSD(
+        r.model,
+        r.input_tokens,
+        r.output_tokens,
+      );
     }
   }
 

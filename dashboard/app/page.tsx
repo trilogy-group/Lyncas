@@ -129,7 +129,7 @@ export default async function HomePage({
         <StatCard
           label="Est. cost (30d)"
           value={formatCost(stats.estimatedCostUSD)}
-          hint="claude sonnet"
+          hint="claude opus-4-5"
         />
       </section>
 

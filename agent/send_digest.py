@@ -25,6 +25,32 @@ RECIPIENT = os.environ.get("DIGEST_RECIPIENT", GMAIL_USER)
 # other trigger with zero content, we skip the email entirely.
 DAILY_SCHEDULE = "0 7 * * *"
 
+# --- Pricing (Phase 3) -----------------------------------------------------
+# Per 1M tokens, in USD. Same numbers as agent/pr_reviewer.py — duplicated
+# rather than imported to keep send_digest.py independent of pr_reviewer.py's
+# Anthropic-client setup (which requires ANTHROPIC_API_KEY at import time).
+MODEL_PRICING_USD_PER_M_TOKENS = {
+    "claude-opus-4-5":   {"input": 15.0, "output": 75.0},
+    "claude-sonnet-4-5": {"input": 3.0,  "output": 15.0},
+}
+# Fallback model used when a row predates the Phase 3 `model` column.
+# Phase 1 made Opus the production model, so historical rows almost always
+# used Opus — this matches that assumption.
+FALLBACK_MODEL = "claude-opus-4-5"
+
+
+def compute_cost_usd(model: str | None, input_tokens, output_tokens) -> float:
+    """Convert token counts into USD using MODEL_PRICING_USD_PER_M_TOKENS.
+
+    Returns 0.0 when the model isn't priced — better to render `$0.000` than
+    to crash a digest send on an unfamiliar model string."""
+    rates = MODEL_PRICING_USD_PER_M_TOKENS.get(model or FALLBACK_MODEL)
+    if not rates:
+        return 0.0
+    in_t = input_tokens or 0
+    out_t = output_tokens or 0
+    return (in_t * rates["input"] + out_t * rates["output"]) / 1_000_000.0
+
 
 # --- Supabase state -------------------------------------------------------
 # Required: the digest is a view over `reviews` + `digests` now. If
@@ -167,11 +193,19 @@ def _build_text(logs, all_reviews, all_errors, closed_prs, today) -> str:
             f"Runs in window: {len(logs)}\n"
         )
 
+    total_bugs = sum((r.get("bug_count") or 0) for r in all_reviews)
+    total_cost = sum(
+        compute_cost_usd(r.get("model"), r.get("input_tokens"), r.get("output_tokens"))
+        for r in all_reviews
+    )
+
     lines = [
         f"Daily digest for {today}",
         f"Runs in window: {len(logs)}",
         f"PRs reviewed: {len(all_reviews)}",
         f"PRs auto-closed: {len(closed_prs)}",
+        f"Bugs flagged: {total_bugs}",
+        f"Total cost: ${total_cost:.3f}",
         f"Errors: {len(all_errors)}",
         "",
     ]
@@ -248,6 +282,143 @@ def _render_stats(n_runs: int, n_reviews: int, n_closed: int, n_errors: int) -> 
 """
 
 
+def _render_summary_panel(
+    n_reviews: int, n_closed: int, n_bugs: int, total_cost_usd: float
+) -> str:
+    """Phase 3: 4-stat panel at the top of the digest. Matches the labels
+    'total reviews / total closed / total bugs flagged / total cost'
+    requested in IMPROVEMENTS_v2.md."""
+    cost_str = f"${total_cost_usd:.2f}" if total_cost_usd >= 0.01 else f"${total_cost_usd:.3f}"
+    return f"""
+<tr><td style="padding:8px 24px 4px 24px;">
+  <div style="font-family:{FONT_SANS};font-size:12px;font-weight:600;color:{COLOR_MUTED};text-transform:uppercase;letter-spacing:0.08em;">
+    Summary (this digest)
+  </div>
+</td></tr>
+<tr><td style="padding:8px 24px 16px 24px;">
+  <table width="100%" cellpadding="0" cellspacing="6" border="0" role="presentation">
+    <tr>
+      {_stat_cell("Reviews", str(n_reviews))}
+      {_stat_cell("Auto-closed", str(n_closed), SEV_CRITICAL if n_closed else COLOR_TEXT)}
+      {_stat_cell("Bugs flagged", str(n_bugs), SEV_MODERATE if n_bugs else COLOR_TEXT)}
+      {_stat_cell("Total cost", cost_str)}
+    </tr>
+  </table>
+</td></tr>
+"""
+
+
+def _pick_top_bug(bugs) -> dict | None:
+    """Return the most severe bug from the list (critical > high > medium >
+    low > unknown). Returns None for an empty / non-list value."""
+    if not isinstance(bugs, list) or not bugs:
+        return None
+    order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+    def _key(b):
+        sev = (b.get("severity") if isinstance(b, dict) else "") or ""
+        return order.get(sev.lower(), 99)
+
+    return sorted((b for b in bugs if isinstance(b, dict)), key=_key)[:1][0] if any(
+        isinstance(b, dict) for b in bugs
+    ) else None
+
+
+def _extract_code_snippet(suggestion) -> tuple[str, str]:
+    """Return ``(language, code)`` extracted from a fenced markdown block in
+    ``suggestion``. If no fence is found, returns ``("", "")`` and the caller
+    falls back to plain-text rendering."""
+    if not isinstance(suggestion, str) or "```" not in suggestion:
+        return "", ""
+    # Take everything between the first pair of triple backticks.
+    after_first = suggestion.split("```", 1)[1]
+    if "```" not in after_first:
+        return "", ""
+    inside = after_first.split("```", 1)[0]
+    # First line may be a language tag (e.g. "python\n...").
+    first_nl = inside.find("\n")
+    if first_nl == -1:
+        return "", inside.strip()
+    maybe_lang = inside[:first_nl].strip()
+    body = inside[first_nl + 1:]
+    # Treat short, alpha-only first lines as language tags; everything else
+    # is part of the code.
+    if maybe_lang and maybe_lang.replace("-", "").replace("+", "").isalnum() and len(maybe_lang) <= 20:
+        return maybe_lang, body.rstrip()
+    return "", inside.rstrip()
+
+
+def _render_top_bug(bugs) -> str:
+    """Render the top bug's issue / impact / suggested code snippet as a
+    small embedded panel inside the PR card. Empty string when no bugs."""
+    bug = _pick_top_bug(bugs)
+    if not bug:
+        return ""
+
+    sev = (bug.get("severity") or "").lower()
+    sev_color = {
+        "critical": SEV_CRITICAL,
+        "high":     SEV_CRITICAL,
+        "medium":   SEV_SERIOUS,
+        "low":      SEV_MODERATE,
+    }.get(sev, COLOR_MUTED)
+
+    issue = bug.get("issue") or ""
+    impact = bug.get("impact") or ""
+    file_ = bug.get("file") or ""
+    line = bug.get("line_hint")
+    location = file_ + (f":{line}" if line not in (None, "", "null") else "")
+
+    lang, code = _extract_code_snippet(bug.get("suggestion") or "")
+    snippet_html = ""
+    if code:
+        snippet_html = f"""
+      <div style="font-family:{FONT_MONO};font-size:11px;color:{COLOR_MUTED};text-transform:uppercase;letter-spacing:0.06em;margin-top:10px;margin-bottom:4px;">
+        Suggested fix{f' · {_e(lang)}' if lang else ''}
+      </div>
+      <pre style="margin:0;padding:10px 12px;background:{COLOR_BG};border:1px solid {COLOR_BORDER};border-radius:4px;overflow-x:auto;font-family:{FONT_MONO};font-size:11.5px;line-height:1.5;color:{COLOR_TEXT};"><code>{_e(code)}</code></pre>
+"""
+
+    impact_html = ""
+    if impact:
+        impact_html = f"""
+      <div style="font-family:{FONT_SANS};font-size:12px;color:{COLOR_MUTED};line-height:1.55;margin-top:8px;">
+        <span style="font-weight:600;color:{COLOR_TEXT};">Impact:</span> {_e(impact)}
+      </div>
+"""
+
+    location_html = ""
+    if location:
+        location_html = f'<span style="font-family:{FONT_MONO};font-size:11px;color:{COLOR_MUTED};margin-left:8px;">{_e(location)}</span>'
+
+    return f"""
+    <div style="margin:8px 0 4px 0;padding:12px 14px;background:{COLOR_BG};border-left:3px solid {sev_color};border-radius:4px;">
+      <div style="font-family:{FONT_SANS};font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:{sev_color};">
+        Top bug{f' · {_e(sev)}' if sev else ''}
+      </div>
+      <div style="font-family:{FONT_SANS};font-size:13px;color:{COLOR_TEXT};line-height:1.55;margin-top:4px;">
+        {_e(issue)}{location_html}
+      </div>
+      {impact_html}
+      {snippet_html}
+    </div>
+"""
+
+
+def _render_context_badge(used) -> str:
+    """Phase 3 'Repo context used' badge — yes/no."""
+    is_used = bool(used)
+    bg = SEV_CLEAN if is_used else COLOR_BG
+    fg = "#ffffff" if is_used else COLOR_MUTED
+    border = "" if is_used else f"border:1px solid {COLOR_BORDER};"
+    label = "context: yes" if is_used else "context: no"
+    return (
+        f'<span style="display:inline-block;margin-left:6px;padding:4px 10px;'
+        f'border-radius:4px;background:{bg};color:{fg};font-family:{FONT_MONO};'
+        f'font-size:11px;font-weight:500;{border}">{label}</span>'
+    )
+
+
 def _render_pr_card(r: dict, in_closed_section: bool = False) -> str:
     sev = r.get("severity_score", "?")
     sev_color = _severity_color(sev)
@@ -259,6 +430,14 @@ def _render_pr_card(r: dict, in_closed_section: bool = False) -> str:
     conf = r.get("confidence", "?")
     bg = CLOSED_BG if in_closed_section else COLOR_CARD
 
+    # Phase 3 extras
+    top_bug_html = _render_top_bug(r.get("bugs"))
+    context_badge = _render_context_badge(r.get("repo_context_used"))
+    cost = compute_cost_usd(
+        r.get("model"), r.get("input_tokens"), r.get("output_tokens")
+    )
+    cost_str = f"${cost:.3f}"
+
     return f"""
 <tr><td style="padding:8px 24px;">
   <table width="100%" cellpadding="0" cellspacing="0" border="0" role="presentation" style="background:{bg};border:1px solid {COLOR_BORDER};border-left:4px solid {sev_color};border-radius:8px;">
@@ -267,20 +446,23 @@ def _render_pr_card(r: dict, in_closed_section: bool = False) -> str:
         <span style="display:inline-block;padding:4px 10px;border-radius:4px;background:{verdict_color};color:#fff;font-family:{FONT_MONO};font-size:11px;font-weight:600;letter-spacing:0.02em;">{verdict_label}</span>
         <span style="display:inline-block;margin-left:6px;padding:4px 10px;border-radius:4px;background:{sev_color};color:#fff;font-family:{FONT_MONO};font-size:11px;font-weight:600;">sev {_e(sev)}/10</span>
         <span style="display:inline-block;margin-left:6px;padding:4px 10px;border-radius:4px;background:{COLOR_BG};color:{COLOR_MUTED};font-family:{FONT_MONO};font-size:11px;font-weight:500;border:1px solid {COLOR_BORDER};">{_e(conf)} conf</span>
+        {context_badge}
         {action_tag}
       </div>
       <div style="font-family:{FONT_SANS};font-size:15px;font-weight:600;color:{COLOR_TEXT};line-height:1.4;margin-bottom:6px;">
         {_e(r.get('title', ''))}
       </div>
-      <div style="font-family:{FONT_SANS};font-size:13px;color:{COLOR_MUTED};line-height:1.55;margin-bottom:14px;">
+      <div style="font-family:{FONT_SANS};font-size:13px;color:{COLOR_MUTED};line-height:1.55;margin-bottom:6px;">
         {_e(r.get('summary', ''))}
       </div>
-      <table width="100%" cellpadding="0" cellspacing="0" border="0" role="presentation">
+      {top_bug_html}
+      <table width="100%" cellpadding="0" cellspacing="0" border="0" role="presentation" style="margin-top:14px;">
         <tr>
           <td align="left" style="font-family:{FONT_MONO};font-size:11px;color:{COLOR_MUTED};">
             <span style="color:{COLOR_TEXT};">{_e(r.get('pr', ''))}</span>
             &nbsp;·&nbsp; bugs: <span style="color:{COLOR_TEXT};">{_e(r.get('bug_count', 0))}</span>
             &nbsp;·&nbsp; tok: <span style="color:{COLOR_TEXT};">{_e(r.get('input_tokens', 0))}</span>↓ / <span style="color:{COLOR_TEXT};">{_e(r.get('output_tokens', 0))}</span>↑
+            &nbsp;·&nbsp; cost: <span style="color:{COLOR_TEXT};">{cost_str}</span>
           </td>
           <td align="right" style="font-family:{FONT_MONO};font-size:12px;">
             <a href="{_e(r.get('url', '#'))}" style="color:{COLOR_ACCENT};text-decoration:none;font-weight:500;">View on GitHub →</a>
@@ -390,8 +572,18 @@ def _render_html(logs, all_reviews, all_errors, closed_prs, today) -> str:
     if not all_reviews and not all_errors:
         return _render_empty_state(today)
 
+    # Phase 3: digest-wide summary stats.
+    total_bugs = sum((r.get("bug_count") or 0) for r in all_reviews)
+    total_cost = sum(
+        compute_cost_usd(r.get("model"), r.get("input_tokens"), r.get("output_tokens"))
+        for r in all_reviews
+    )
+
     body = (
         _render_header(today, len(all_reviews), len(closed_prs))
+        + _render_summary_panel(
+            len(all_reviews), len(closed_prs), total_bugs, total_cost
+        )
         + _render_stats(len(logs), len(all_reviews), len(closed_prs), len(all_errors))
         + _render_closed_section(closed_prs)
         + _render_reviews_section(all_reviews)

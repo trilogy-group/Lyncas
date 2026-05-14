@@ -42,6 +42,27 @@ MAX_DIFF_CHARS = 60_000  # truncate huge PRs to control token cost
 REVIEW_MARKER = "<!-- night-pr-reviewer:v1 -->"  # used to detect prior reviews
 CLOSE_MARKER = "<!-- night-pr-reviewer:closed:v1 -->"  # used to detect prior auto-close
 
+# --- Pricing (USD per 1M tokens) -------------------------------------------
+# Used to compute the per-review cost line in the PR comment footer and in
+# the digest email. Sourced from Anthropic's public pricing page. Keep in
+# sync with agent/benchmark.py's PRICING_MICROS dict (same numbers, different
+# units). Update when Anthropic ships a new price card.
+MODEL_PRICING_USD_PER_M_TOKENS = {
+    "claude-opus-4-5":   {"input": 15.0, "output": 75.0},
+    "claude-sonnet-4-5": {"input": 3.0,  "output": 15.0},
+}
+
+# --- Severity → emoji ------------------------------------------------------
+# Used by the rich PR comment renderer (Phase 3). The keys here must match
+# the per-bug severity values produced by the prompt.md schema.
+SEVERITY_EMOJI = {
+    "critical": "🔥",
+    "high":     "🔴",
+    "medium":   "🟠",
+    "low":      "🟡",
+}
+SEVERITY_ORDER = ("critical", "high", "medium", "low")
+
 # --- Repo fingerprint (Phase 2) -------------------------------------------
 # A "fingerprint" is a compact Claude-generated summary of what a repo IS,
 # injected into the review prompt so the reviewer knows whether a given diff
@@ -195,6 +216,9 @@ def upsert_review(
     decides how to handle (the GitHub comment has already been posted)."""
     if supabase is None:
         return
+    # Phase 3: persist enough metadata for the digest to render the new
+    # per-card extras (model name for cost, repo-context badge).
+    fingerprint_status = review.get("_fingerprint_status") or "unavailable"
     payload = {
         "repo": repo,
         "pr_number": pr["number"],
@@ -215,6 +239,8 @@ def upsert_review(
         "input_tokens": review.get("_input_tokens"),
         "output_tokens": review.get("_output_tokens"),
         "truncated": review.get("_truncated", False),
+        "repo_context_used": fingerprint_status in ("cached", "fresh"),
+        "model": review.get("_model") or MODEL,
     }
     supabase.table("reviews").upsert(payload, on_conflict="repo,pr_number").execute()
 
@@ -448,23 +474,29 @@ def _summarize_repo_with_claude(readme: str, deps: str, dir_listing: str) -> str
     return response.content[0].text.strip()
 
 
-def get_or_refresh_fingerprint(repo: str) -> str | None:
-    """Return the repo's fingerprint string, regenerating it via shallow clone
-    if the cached row is missing or older than FINGERPRINT_TTL_DAYS.
+def get_or_refresh_fingerprint(repo: str) -> tuple[str | None, str]:
+    """Return ``(fingerprint, status)`` for the repo. Regenerates via shallow
+    clone if the cached row is missing or older than FINGERPRINT_TTL_DAYS.
 
-    Returns None (with a log line) on any failure — the caller proceeds with
-    no repo context, which is the graceful-degradation contract from Phase 2.
+    `status` is one of:
+      - ``"cached"``      — used the existing Supabase row (cache hit)
+      - ``"fresh"``       — generated a new fingerprint this run
+      - ``"unavailable"`` — generation failed at some step; ``fingerprint`` is None
+
+    Phase 3 plumbs `status` into the PR review comment footer and into the
+    digest's per-card badge. The Phase 2 graceful-degradation contract is
+    unchanged: on any failure the caller proceeds with no repo context.
     """
     if supabase is None:
         # No DB → no cache layer to read or write. We *could* clone + summarize
         # every run, but that would be ~30s per repo per run and never reused.
         # Skip silently; the WARN at startup already covered the DB-missing case.
-        return None
+        return None, "unavailable"
 
     cached = _fingerprint_cache_lookup(repo)
     if cached:
         print(f"  [fingerprint:{repo}] using cached fingerprint ({len(cached.split())} words)")
-        return cached
+        return cached, "cached"
 
     if not GITHUB_TOKEN:
         print(
@@ -472,7 +504,7 @@ def get_or_refresh_fingerprint(repo: str) -> str | None:
             f"proceeding without repo context",
             file=sys.stderr,
         )
-        return None
+        return None, "unavailable"
 
     slug = repo.replace("/", "-")
     clone_dir = Path(tempfile.mkdtemp(prefix=f"fp-{slug}-"))
@@ -500,14 +532,14 @@ def get_or_refresh_fingerprint(repo: str) -> str | None:
                 f"  [fingerprint:{repo}] clone failed (exit {e.returncode}): {stderr_tail}",
                 file=sys.stderr,
             )
-            return None
+            return None, "unavailable"
         except subprocess.TimeoutExpired:
             print(
                 f"  [fingerprint:{repo}] clone timed out after "
                 f"{FINGERPRINT_CLONE_TIMEOUT_SEC}s",
                 file=sys.stderr,
             )
-            return None
+            return None, "unavailable"
 
         readme = _read_readme(clone_dir)
         deps = _read_dep_file(clone_dir)
@@ -522,7 +554,7 @@ def get_or_refresh_fingerprint(repo: str) -> str | None:
                 f"skipping fingerprint",
                 file=sys.stderr,
             )
-            return None
+            return None, "unavailable"
 
         commit_sha = _git_head_sha(clone_dir)
 
@@ -530,11 +562,11 @@ def get_or_refresh_fingerprint(repo: str) -> str | None:
             fingerprint = _summarize_repo_with_claude(readme, deps, dir_listing)
         except Exception as e:
             print(f"  [fingerprint:{repo}] summarizer call failed: {e}", file=sys.stderr)
-            return None
+            return None, "unavailable"
 
         if not fingerprint:
             print(f"  [fingerprint:{repo}] summarizer returned empty text", file=sys.stderr)
-            return None
+            return None, "unavailable"
 
         token_count = len(fingerprint.split())
 
@@ -562,7 +594,7 @@ def get_or_refresh_fingerprint(repo: str) -> str | None:
                 file=sys.stderr,
             )
 
-        return fingerprint
+        return fingerprint, "fresh"
     finally:
         # Always clean up the temp clone — these can be hundreds of MB and
         # GitHub Actions runners have limited disk.
@@ -625,15 +657,37 @@ Unified diff:
 
 Respond ONLY with valid JSON matching this schema (no markdown fences, no prose before or after):
 {{
-  "summary": "1-2 sentence summary of what the PR does",
+  "summary": "1-2 sentence summary of what the PR does AND overall quality",
   "verdict": "approve" | "request_changes" | "comment",
   "confidence": "high" | "medium" | "low",
   "severity_score": 1-10 integer (see prompt rubric — 9+ triggers auto-close, be conservative),
-  "bugs": [{{"severity": "high|medium|low", "file": "path", "issue": "what's wrong", "suggestion": "how to fix"}}],
-  "concerns": ["non-bug concerns: style, naming, testing gaps, etc."],
+  "bugs": [
+    {{
+      "file": "exact path from the diff, or \\"multiple files\\"",
+      "line_hint": "42" | "42-58" | null,
+      "severity": "critical" | "high" | "medium" | "low",
+      "issue": "one sentence: what is wrong",
+      "impact": "one sentence: what could go wrong if unfixed",
+      "suggestion": "concrete fix (prose, or a fenced code snippet of <=10 lines)",
+      "reference": "URL to a doc/RFC/CVE/spec if you can cite one accurately, else null"
+    }}
+  ],
+  "concerns": [
+    {{
+      "file": "path or \\"multiple files\\"",
+      "line_hint": "42" | "42-58" | null,
+      "severity": "low" | "medium",
+      "issue": "non-bug concern: style, naming, testing gap, etc.",
+      "impact": "why this concern matters in one sentence",
+      "suggestion": "concrete improvement",
+      "reference": null
+    }}
+  ],
   "questions": ["questions you'd ask the author if you were unsure"],
   "praise": ["specific things done well — leave empty if nothing stands out"]
-}}"""
+}}
+
+The prompt.md `Output format` section spells out every field's exact content requirements — follow them. If a field doesn't apply (e.g. no good doc to reference), use `null`, not a made-up value."""
 
     response = client.messages.create(
         model=model,
@@ -660,6 +714,153 @@ Respond ONLY with valid JSON matching this schema (no markdown fences, no prose 
 # --- Formatting -----------------------------------------------------------
 
 VERDICT_EMOJI = {"approve": "✅", "request_changes": "🔴", "comment": "💬"}
+
+# Human-friendly labels used in the rich Phase-3 comment header.
+VERDICT_LABEL = {
+    "approve": "APPROVE",
+    "request_changes": "REQUEST CHANGES",
+    "comment": "COMMENT",
+}
+
+# Human-friendly text for the "Repo context" footer line (Phase 3).
+FINGERPRINT_STATUS_LABEL = {
+    "cached":      "cached",
+    "fresh":       "fresh",
+    "unavailable": "unavailable",
+}
+
+
+def compute_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Convert token counts to a USD cost using MODEL_PRICING_USD_PER_M_TOKENS.
+
+    Returns 0.0 if the model isn't in the pricing table — better to render
+    "$0.000" than to crash the comment formatter on an unknown model string.
+    Callers that need precise accounting (benchmark.py) have their own
+    micro-USD computation in integer units."""
+    rates = MODEL_PRICING_USD_PER_M_TOKENS.get(model)
+    if not rates:
+        return 0.0
+    return (
+        (input_tokens or 0) * rates["input"]
+        + (output_tokens or 0) * rates["output"]
+    ) / 1_000_000.0
+
+
+def _format_cost(cost_usd: float) -> str:
+    """Format a USD cost for the comment footer. Three decimal places so
+    sub-cent reviews render as e.g. `$0.008` instead of vanishing to `$0.00`."""
+    return f"${cost_usd:.3f}"
+
+
+def _bug_location(bug: dict) -> str:
+    """Render `file:line` (or just `file`) for the bug heading."""
+    file_ = bug.get("file") or "?"
+    line = bug.get("line_hint")
+    if line in (None, "", "null"):
+        return f"`{file_}`"
+    return f"`{file_}:{line}`"
+
+
+def _render_bug_section(bugs: list[dict]) -> list[str]:
+    """Build the markdown lines for the 🐛 Bugs section in severity order."""
+    if not bugs:
+        return []
+
+    # Group by severity so the comment is severity-sorted, not arbitrary.
+    by_sev: dict[str, list[dict]] = {s: [] for s in SEVERITY_ORDER}
+    extras: list[dict] = []  # anything with a severity we don't recognize
+    for b in bugs:
+        sev = (b.get("severity") or "").lower()
+        if sev in by_sev:
+            by_sev[sev].append(b)
+        else:
+            extras.append(b)
+
+    lines = [f"### 🐛 Bugs ({len(bugs)})", ""]
+    rendered_any = False
+    for sev in SEVERITY_ORDER:
+        for b in by_sev[sev]:
+            rendered_any = True
+            emoji = SEVERITY_EMOJI.get(sev, "•")
+            issue = (b.get("issue") or "").strip()
+            lines.append(f"#### {emoji} {issue} — {_bug_location(b)}")
+            lines.append("")
+            impact = (b.get("impact") or "").strip()
+            if impact:
+                lines.append(f"**Impact:** {impact}")
+                lines.append("")
+            suggestion = (b.get("suggestion") or "").strip()
+            if suggestion:
+                lines.append("**Suggested fix:**")
+                lines.append("")
+                # If the suggestion already contains a fenced block, render
+                # it verbatim. Otherwise treat it as prose and bullet it.
+                if "```" in suggestion:
+                    lines.append(suggestion)
+                else:
+                    lines.append(suggestion)
+                lines.append("")
+            reference = (b.get("reference") or "").strip()
+            if reference and reference.lower() != "null":
+                lines.append(f"_Reference:_ {reference}")
+                lines.append("")
+            lines.append("---")
+            lines.append("")
+    for b in extras:
+        # Render unknown-severity bugs at the end without a leading emoji so
+        # the comment never silently drops a bug just because severity was
+        # mis-cased or hallucinated.
+        rendered_any = True
+        issue = (b.get("issue") or "").strip()
+        lines.append(f"#### • {issue} — {_bug_location(b)}")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    if not rendered_any:
+        # Defensive — shouldn't hit unless `bugs` was a list of empty dicts.
+        return []
+    return lines
+
+
+def _render_concerns_section(concerns: list) -> list[str]:
+    """Concerns may be plain strings (legacy / fallback) or dicts shaped like
+    bugs. Render both. Heading shows the count."""
+    if not concerns:
+        return []
+    lines = [f"### ⚠️ Concerns ({len(concerns)})", ""]
+    for c in concerns:
+        if isinstance(c, dict):
+            issue = (c.get("issue") or "").strip()
+            location = _bug_location(c) if c.get("file") else ""
+            sev = (c.get("severity") or "").lower()
+            sev_tag = f" _[{sev}]_" if sev in SEVERITY_EMOJI else ""
+            head = f"- {issue}"
+            if location:
+                head += f" — {location}"
+            if sev_tag:
+                head += sev_tag
+            lines.append(head)
+            impact = (c.get("impact") or "").strip()
+            if impact:
+                lines.append(f"  - **Impact:** {impact}")
+            suggestion = (c.get("suggestion") or "").strip()
+            if suggestion:
+                lines.append(f"  - **Suggestion:** {suggestion}")
+        else:
+            lines.append(f"- {c}")
+    lines.append("")
+    return lines
+
+
+def _render_simple_list_section(heading: str, items: list) -> list[str]:
+    """For `questions` and `praise` — plain-string lists."""
+    if not items:
+        return []
+    lines = [f"{heading} ({len(items)})", ""]
+    lines.extend(f"- {x}" for x in items)
+    lines.append("")
+    return lines
 
 
 def format_close_comment(review: dict, review_url: str | None = None) -> str:
@@ -703,51 +904,78 @@ def format_close_comment(review: dict, review_url: str | None = None) -> str:
 
 
 def format_review_comment(review: dict) -> str:
-    """Format Claude's review as a markdown PR comment."""
-    lines = [
+    """Format Claude's review as a rich markdown PR comment (Phase 3 layout).
+
+    Reads optional metadata from the review dict so the caller doesn't have
+    to plumb extra args through:
+      - ``_fingerprint_status``: ``"cached"`` / ``"fresh"`` / ``"unavailable"``
+      - ``_model``: model string used for the review (for the footer + cost)
+      - ``_input_tokens`` / ``_output_tokens``: from review_pr_with_claude
+      - ``_truncated``: True if the diff was truncated
+
+    All metadata fields are optional — the formatter falls back to safe
+    defaults so a stripped-down review dict (e.g. from a unit test) still
+    renders."""
+    verdict = review.get("verdict", "")
+    confidence = review.get("confidence", "")
+    severity_score = review.get("severity_score", "?")
+    verdict_emoji = VERDICT_EMOJI.get(verdict, "🤖")
+    verdict_label = VERDICT_LABEL.get(verdict, verdict.upper() or "REVIEW")
+
+    bugs = review.get("bugs") or []
+    concerns = review.get("concerns") or []
+    questions = review.get("questions") or []
+    praise = review.get("praise") or []
+
+    lines: list[str] = [
         REVIEW_MARKER,
-        f"## {VERDICT_EMOJI.get(review['verdict'], '🤖')} Automated review by night-pr-reviewer",
+        "## 🌙 Night PR Reviewer",
         "",
-        f"**Verdict:** `{review['verdict']}` &nbsp;·&nbsp; **Confidence:** `{review['confidence']}` &nbsp;·&nbsp; **Severity:** `{review.get('severity_score', '?')}/10`",
+        f"**Verdict:** {verdict_emoji} {verdict_label}  ",
+        f"**Severity:** {severity_score}/10 · **Confidence:** {confidence}",
         "",
-        "### Summary",
-        review["summary"],
+        f"> {review.get('summary', '').strip()}",
+        "",
+        "---",
         "",
     ]
 
-    if review.get("bugs"):
-        lines.append("### 🐛 Bugs / issues")
-        for b in review["bugs"]:
-            sev = b.get("severity", "?").upper()
-            lines.append(f"- **[{sev}]** `{b.get('file', '?')}` — {b['issue']}")
-            if b.get("suggestion"):
-                lines.append(f"  - *Suggestion:* {b['suggestion']}")
+    bug_lines = _render_bug_section(bugs)
+    if bug_lines:
+        lines.extend(bug_lines)
+    else:
+        # Show an explicit "(0)" so the reviewer's structure is consistent
+        # across PRs and the reader doesn't wonder if a section got dropped.
+        lines.append("### 🐛 Bugs (0)")
+        lines.append("")
+        lines.append("_No bugs flagged._")
+        lines.append("")
+        lines.append("---")
         lines.append("")
 
-    if review.get("concerns"):
-        lines.append("### ⚠️ Concerns")
-        lines.extend(f"- {c}" for c in review["concerns"])
-        lines.append("")
-
-    if review.get("questions"):
-        lines.append("### ❓ Questions for the author")
-        lines.extend(f"- {q}" for q in review["questions"])
-        lines.append("")
-
-    if review.get("praise"):
-        lines.append("### 👍 Done well")
-        lines.extend(f"- {p}" for p in review["praise"])
-        lines.append("")
+    lines.extend(_render_concerns_section(concerns))
+    lines.extend(_render_simple_list_section("### ❓ Questions", questions))
+    lines.extend(_render_simple_list_section("### ✅ Praise", praise))
 
     if review.get("_truncated"):
-        lines.append("> ⚠️ Diff was truncated due to size. Review is based on the first portion only.")
+        lines.append(
+            "> ⚠️ Diff was truncated due to size. Review is based on the first portion only."
+        )
         lines.append("")
+
+    # ---- Footer: model, tokens, cost, repo-context status -----------------
+    model = review.get("_model") or MODEL
+    in_tok = review.get("_input_tokens") or 0
+    out_tok = review.get("_output_tokens") or 0
+    cost = compute_cost_usd(model, in_tok, out_tok)
+    fp_status = review.get("_fingerprint_status") or "unavailable"
+    fp_label = FINGERPRINT_STATUS_LABEL.get(fp_status, fp_status)
 
     lines.append("---")
     lines.append(
-        "*This review is automated. A human (the repo owner) will look at it. "
-        "LLMs can be wrong — treat as a first pass, not a verdict.*"
+        f"*Reviewed by `{model}` · {in_tok} in / {out_tok} out · {_format_cost(cost)}*"
     )
+    lines.append(f"*Repo context: {fp_label}*")
     return "\n".join(lines)
 
 
@@ -774,8 +1002,12 @@ def main() -> int:
         # Fetch the repo fingerprint once per repo, regardless of how many
         # PRs we end up reviewing. Cache hits are free; cache misses do one
         # shallow clone + one Claude summarizer call. On any failure this
-        # returns None and the per-PR review proceeds without repo context.
-        repo_fingerprint = get_or_refresh_fingerprint(repo) if prs else None
+        # returns (None, "unavailable") and the per-PR review proceeds
+        # without repo context.
+        if prs:
+            repo_fingerprint, fingerprint_status = get_or_refresh_fingerprint(repo)
+        else:
+            repo_fingerprint, fingerprint_status = None, "unavailable"
 
         for pr in prs:
             num = pr["number"]
@@ -794,6 +1026,12 @@ def main() -> int:
                 review = review_pr_with_claude(
                     pr, diff, repo_fingerprint=repo_fingerprint
                 )
+                # Stamp the review dict with metadata the rich formatter and
+                # the Supabase upsert both rely on. Keeping it on the dict
+                # (rather than threading more args through) matches the
+                # pattern already used for _input_tokens / _output_tokens.
+                review["_fingerprint_status"] = fingerprint_status
+                review["_model"] = MODEL
 
                 # Decide: post comment, or auto-close
                 close_decision, gate_reason = should_auto_close(review)

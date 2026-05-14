@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+@theme inline {
+  --color-bg: #fafaf9;
+  --color-card: #ffffff;
+  --color-border: #e7e5e4;
+  --color-text: #1c1917;
+  --color-muted: #57534e;
+  --color-accent: #4338ca;
+
+  --color-severity-critical: #dc2626;
+  --color-severity-serious: #ea580c;
+  --color-severity-moderate: #ca8a04;
+  --color-severity-clean: #16a34a;
+
+  --color-verdict-approve: #16a34a;
+  --color-verdict-changes: #dc2626;
+  --color-verdict-comment: #2563eb;
+
+  --color-closed-bg: #fef2f2;
+
+  --font-sans: var(--font-sans-pr);
+  --font-mono: var(--font-mono-pr);
+  --font-serif: Georgia, "Iowan Old Style", Charter, serif;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+}
+
+::selection {
+  background: #ddd6fe;
+}

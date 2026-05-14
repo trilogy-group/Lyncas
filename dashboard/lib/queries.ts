@@ -5,6 +5,7 @@ import type {
   BenchmarkRun,
   BenchmarkStats,
   DashboardStats,
+  RepoStat,
   Review,
   Run,
   SeverityBucket,
@@ -184,6 +185,95 @@ export async function getAvailableRepos(): Promise<string[]> {
   const seen = new Set<string>();
   for (const r of (data ?? []) as { repo: string }[]) seen.add(r.repo);
   return Array.from(seen).sort();
+}
+
+// --- Per-repo stats (Phase 4) --------------------------------------------
+// Per-1M-token USD rates. Kept in sync with agent/pr_reviewer.py's
+// MODEL_PRICING_USD_PER_M_TOKENS and agent/send_digest.py's copy of the
+// same table. Mirroring (not importing) avoids a cross-package dependency.
+const PRICING_USD_PER_M_TOKENS: Record<
+  string,
+  { input: number; output: number }
+> = {
+  "claude-opus-4-5": { input: 15, output: 75 },
+  "claude-sonnet-4-5": { input: 3, output: 15 },
+};
+// Reviews predating Phase 3's `model` column have model=null. Phase 1 made
+// Opus the production model, so falling back to Opus matches reality for
+// the rows we'd realistically see in production.
+const REPO_STATS_FALLBACK_MODEL = "claude-opus-4-5";
+
+export async function getRepoStats(): Promise<RepoStat[]> {
+  const supabase = createSupabaseServerClient();
+  const since30d = new Date(
+    Date.now() - 30 * 86_400_000,
+  ).toISOString();
+
+  const { data, error } = await supabase
+    .from("reviews")
+    .select(
+      "repo, action, severity_score, input_tokens, output_tokens, model, created_at",
+    );
+  if (error) throw error;
+
+  type Row = {
+    repo: string;
+    action: string | null;
+    severity_score: number | null;
+    input_tokens: number | null;
+    output_tokens: number | null;
+    model: string | null;
+    created_at: string;
+  };
+
+  type Accum = RepoStat & { _sev_sum: number; _sev_n: number };
+  const byRepo = new Map<string, Accum>();
+
+  for (const r of ((data ?? []) as Row[])) {
+    let s = byRepo.get(r.repo);
+    if (!s) {
+      s = {
+        repo: r.repo,
+        total_reviews: 0,
+        total_closed: 0,
+        avg_severity: 0,
+        estimated_cost_usd: 0,
+        last_reviewed_at: null,
+        _sev_sum: 0,
+        _sev_n: 0,
+      };
+      byRepo.set(r.repo, s);
+    }
+    s.total_reviews += 1;
+    if (r.action === "closed") s.total_closed += 1;
+    if (typeof r.severity_score === "number") {
+      s._sev_sum += r.severity_score;
+      s._sev_n += 1;
+    }
+    if (!s.last_reviewed_at || r.created_at > s.last_reviewed_at) {
+      s.last_reviewed_at = r.created_at;
+    }
+    if (r.created_at >= since30d) {
+      const rates =
+        PRICING_USD_PER_M_TOKENS[r.model ?? REPO_STATS_FALLBACK_MODEL] ??
+        PRICING_USD_PER_M_TOKENS[REPO_STATS_FALLBACK_MODEL];
+      s.estimated_cost_usd +=
+        ((r.input_tokens ?? 0) * rates.input +
+          (r.output_tokens ?? 0) * rates.output) /
+        1_000_000;
+    }
+  }
+
+  return Array.from(byRepo.values())
+    .map((s) => ({
+      repo: s.repo,
+      total_reviews: s.total_reviews,
+      total_closed: s.total_closed,
+      avg_severity: s._sev_n ? s._sev_sum / s._sev_n : 0,
+      estimated_cost_usd: s.estimated_cost_usd,
+      last_reviewed_at: s.last_reviewed_at,
+    }))
+    .sort((a, b) => b.total_reviews - a.total_reviews);
 }
 
 // --- Benchmark queries ----------------------------------------------------

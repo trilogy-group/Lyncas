@@ -84,6 +84,19 @@ export interface ActivityPoint {
   count: number;
 }
 
+// Per-repo aggregate, shown on /repos and on the "By repo" overview section.
+// `total_reviews`, `total_closed`, `avg_severity`, and `last_reviewed_at` are
+// all-time. `estimated_cost_usd` is windowed to the last 30 days — Phase 4 of
+// IMPROVEMENTS_v2.md explicitly labels it "(30d)".
+export interface RepoStat {
+  repo: string;
+  total_reviews: number;
+  total_closed: number;
+  avg_severity: number;
+  estimated_cost_usd: number;
+  last_reviewed_at: string | null;
+}
+
 // --- Benchmark types ------------------------------------------------------
 // Match agent/migrations/002_benchmark_runs.sql. Most "opus_*" fields are
 // nullable because benchmark.py only fills them on a successful Opus call.

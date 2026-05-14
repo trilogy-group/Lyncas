@@ -18,6 +18,12 @@ export function Nav() {
             overview
           </Link>
           <Link
+            href="/repos"
+            className="text-muted hover:text-text transition-colors"
+          >
+            repos
+          </Link>
+          <Link
             href="/runs"
             className="text-muted hover:text-text transition-colors"
           >

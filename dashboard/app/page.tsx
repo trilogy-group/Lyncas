@@ -4,11 +4,13 @@ import { Filters } from "@/components/filters";
 import { ReviewsTable } from "@/components/reviews-table";
 import { SeverityChart } from "@/components/severity-chart";
 import { StatCard } from "@/components/ui/stat-card";
-import { formatCost, severityColors } from "@/lib/design";
+import { Table, TableBody, TableHeader, Td, Th } from "@/components/ui/table";
+import { formatCost, severityColor, severityColors } from "@/lib/design";
 import {
   getActivityByDay,
   getAvailableRepos,
   getRecentReviews,
+  getRepoStats,
   getSeverityDistribution,
   getStats,
 } from "@/lib/queries";
@@ -60,23 +62,25 @@ export default async function HomePage({
     ? clamp(Number(sp.maxSev), 1, 10)
     : undefined;
 
-  const [stats, recent, repos, severity, activity] = await Promise.all([
-    getStats(30),
-    getRecentReviews({
-      limit: PAGE_SIZE,
-      offset: (page - 1) * PAGE_SIZE,
-      repo: sp.repo || undefined,
-      verdict,
-      action,
-      minSeverity,
-      maxSeverity,
-      sortBy,
-      sortDir,
-    }),
-    getAvailableRepos(),
-    getSeverityDistribution(30),
-    getActivityByDay(30),
-  ]);
+  const [stats, recent, repos, repoStats, severity, activity] =
+    await Promise.all([
+      getStats(30),
+      getRecentReviews({
+        limit: PAGE_SIZE,
+        offset: (page - 1) * PAGE_SIZE,
+        repo: sp.repo || undefined,
+        verdict,
+        action,
+        minSeverity,
+        maxSeverity,
+        sortBy,
+        sortDir,
+      }),
+      getAvailableRepos(),
+      getRepoStats(),
+      getSeverityDistribution(30),
+      getActivityByDay(30),
+    ]);
 
   const totalPages = Math.max(1, Math.ceil(recent.totalCount / PAGE_SIZE));
 
@@ -128,6 +132,71 @@ export default async function HomePage({
           hint="claude sonnet"
         />
       </section>
+
+      {repoStats.length > 0 && (
+        <section className="space-y-3">
+          <div>
+            <h2 className="text-lg font-semibold">By repo</h2>
+            <p className="text-xs text-muted font-mono">
+              {repoStats.length}
+              {repoStats.length === 1 ? " repo" : " repos"} watched ·{" "}
+              <Link
+                href="/repos"
+                className="underline hover:text-text"
+              >
+                full breakdown →
+              </Link>
+            </p>
+          </div>
+          <Table>
+            <TableHeader>
+              <tr>
+                <Th>Repo</Th>
+                <Th className="text-right">Reviews</Th>
+                <Th className="text-right">Closed</Th>
+                <Th className="text-right">Avg severity</Th>
+              </tr>
+            </TableHeader>
+            <TableBody>
+              {repoStats.map((r) => (
+                <tr key={r.repo}>
+                  <Td className="font-mono text-xs">
+                    <Link
+                      href={`/?repo=${encodeURIComponent(r.repo)}`}
+                      className="text-accent hover:underline"
+                    >
+                      {r.repo}
+                    </Link>
+                  </Td>
+                  <Td className="font-mono text-xs text-right">
+                    {r.total_reviews}
+                  </Td>
+                  <Td
+                    className="font-mono text-xs text-right"
+                    style={
+                      r.total_closed > 0
+                        ? { color: severityColors.critical }
+                        : undefined
+                    }
+                  >
+                    {r.total_closed}
+                  </Td>
+                  <Td
+                    className="font-mono text-xs text-right"
+                    style={
+                      r.avg_severity
+                        ? { color: severityColor(r.avg_severity) }
+                        : undefined
+                    }
+                  >
+                    {r.avg_severity ? r.avg_severity.toFixed(1) : "—"}
+                  </Td>
+                </tr>
+              ))}
+            </TableBody>
+          </Table>
+        </section>
+      )}
 
       <section className="space-y-4">
         <div className="flex items-end justify-between gap-4 flex-wrap">

@@ -18,6 +18,11 @@ import requests
 from anthropic import Anthropic
 from supabase import Client, create_client
 
+# Phase 6: review now runs through a LangGraph reviewer→critic→(arbiter)→final
+# graph. review_pr_with_claude is preserved (benchmark.py still uses it as the
+# single-pass baseline) but main() invokes the graph instead.
+from review_graph import run_review_graph
+
 # --- Config ---------------------------------------------------------------
 
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
@@ -241,6 +246,13 @@ def upsert_review(
         "truncated": review.get("_truncated", False),
         "repo_context_used": fingerprint_status in ("cached", "fresh"),
         "model": review.get("_model") or MODEL,
+        # Phase 6: persist the per-node JSON outputs so the /pr/[id] page can
+        # render the agent's deliberation (reviewer vs critic vs arbiter).
+        # All three default to NULL/false for pre-Phase-6 rows and for the
+        # webhook path (which intentionally still runs single-pass).
+        "critic_output": review.get("_critic_output"),
+        "arbiter_output": review.get("_arbiter_output"),
+        "escalated": bool(review.get("_escalated", False)),
     }
     supabase.table("reviews").upsert(payload, on_conflict="repo,pr_number").execute()
 
@@ -1030,14 +1042,16 @@ def main() -> int:
                 print(f"  [{tag}] fetching diff...")
                 diff = get_pr_diff(repo, num)
 
-                print(f"  [{tag}] asking Claude for review...")
-                review = review_pr_with_claude(
+                print(f"  [{tag}] running LangGraph review (reviewer → critic → router → ...)...")
+                review = run_review_graph(
                     pr, diff, repo_fingerprint=repo_fingerprint
                 )
                 # Stamp the review dict with metadata the rich formatter and
                 # the Supabase upsert both rely on. Keeping it on the dict
                 # (rather than threading more args through) matches the
                 # pattern already used for _input_tokens / _output_tokens.
+                # _critic_output / _arbiter_output / _escalated are set by
+                # run_review_graph itself — we do not overwrite them here.
                 review["_fingerprint_status"] = fingerprint_status
                 review["_model"] = MODEL
 

@@ -5,15 +5,33 @@ import {
   formatRelativeTime,
   palette,
   severityColor,
+  severityColors,
   tokenCostUSD,
   verdictBadge,
 } from "@/lib/design";
-import type { Bug, Review } from "@/lib/types";
+import type { Bug, HumanAction, HumanActionType, Review } from "@/lib/types";
 
 const SEVERITY_COLOR_MAP: Record<Bug["severity"], string> = {
   high: "#dc2626",
   medium: "#ea580c",
   low: "#ca8a04",
+};
+
+// Phase 7: human-verdict styling. Agreements show green, failures red,
+// pending muted. Labels mirror /learning so the two pages feel coherent.
+const HUMAN_ACTION_LABEL: Record<HumanActionType, string> = {
+  agreement_close: "Agreement (close)",
+  false_close: "False close",
+  agreement_approve: "Agreement (approve)",
+  missed_issue: "Missed issue",
+  pending: "Pending",
+};
+const HUMAN_ACTION_COLOR: Record<HumanActionType, string> = {
+  agreement_close: "#16a34a",
+  agreement_approve: "#16a34a",
+  false_close: severityColors.critical,
+  missed_issue: severityColors.critical,
+  pending: palette.muted,
 };
 
 function groupBugs(bugs: Bug[]): {
@@ -28,7 +46,13 @@ function groupBugs(bugs: Bug[]): {
   };
 }
 
-export function PrDetail({ review }: { review: Review }) {
+export function PrDetail({
+  review,
+  humanAction,
+}: {
+  review: Review;
+  humanAction?: HumanAction | null;
+}) {
   const v = verdictBadge(review.verdict);
   const sevColor = severityColor(review.severity_score);
   const cost = tokenCostUSD(review.input_tokens, review.output_tokens);
@@ -82,6 +106,60 @@ export function PrDetail({ review }: { review: Review }) {
         </div>
         <p className="text-base leading-relaxed">{review.summary}</p>
       </Card>
+
+      {humanAction && (
+        <Card className="p-5">
+          <div className="text-[11px] font-mono uppercase tracking-wider text-muted mb-3">
+            Human verdict
+          </div>
+          <div className="flex items-center gap-2 flex-wrap mb-3">
+            <Badge color={HUMAN_ACTION_COLOR[humanAction.action_type]}>
+              {HUMAN_ACTION_LABEL[humanAction.action_type]}
+            </Badge>
+            <span className="text-xs font-mono text-muted">
+              observed {formatRelativeTime(humanAction.observed_at)}
+            </span>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs font-mono">
+            <div>
+              <div className="uppercase tracking-wider text-[10px] text-muted mb-0.5">
+                PR state
+              </div>
+              <div className="text-text">{humanAction.pr_state}</div>
+            </div>
+            <div>
+              <div className="uppercase tracking-wider text-[10px] text-muted mb-0.5">
+                Reopened
+              </div>
+              <div className="text-text">
+                {humanAction.reopened ? "yes" : "no"}
+              </div>
+            </div>
+            <div>
+              <div className="uppercase tracking-wider text-[10px] text-muted mb-0.5">
+                Merged
+              </div>
+              <div className="text-text">
+                {humanAction.merged ? "yes" : "no"}
+              </div>
+            </div>
+            <div>
+              <div className="uppercase tracking-wider text-[10px] text-muted mb-0.5">
+                Reverted
+              </div>
+              <div className="text-text">
+                {humanAction.reverted ? "yes" : "no"}
+              </div>
+            </div>
+          </div>
+          {humanAction.notes && (
+            <p className="mt-3 text-sm text-muted leading-relaxed">
+              <span className="font-semibold text-text">Notes: </span>
+              {humanAction.notes}
+            </p>
+          )}
+        </Card>
+      )}
 
       {totalBugs > 0 && (
         <section>

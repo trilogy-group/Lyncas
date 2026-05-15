@@ -30,6 +30,12 @@ export function Nav() {
             runs
           </Link>
           <Link
+            href="/learning"
+            className="text-muted hover:text-text transition-colors"
+          >
+            learning
+          </Link>
+          <Link
             href="/benchmark"
             className="text-muted hover:text-text transition-colors"
           >

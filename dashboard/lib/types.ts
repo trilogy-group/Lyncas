@@ -97,6 +97,67 @@ export interface RepoStat {
   last_reviewed_at: string | null;
 }
 
+// --- Phase 7: self-learning ----------------------------------------------
+// Match agent/migrations/006_human_actions.sql + 007_agent_alerts.sql. The
+// five-bucket action_type enum is the agent's ground-truth signal: every
+// settled review eventually lands on one of the four terminal buckets, and
+// the dashboard's accuracy stat is `agreements / non-pending`.
+
+export type HumanActionType =
+  | "agreement_close"
+  | "false_close"
+  | "agreement_approve"
+  | "missed_issue"
+  | "pending";
+
+export interface HumanAction {
+  id: string;
+  review_id: string;
+  observed_at: string;
+  action_type: HumanActionType;
+  pr_state: string;
+  reopened: boolean;
+  merged: boolean;
+  reverted: boolean;
+  poll_count: number;
+  notes: string | null;
+}
+
+// Joined shape used by /learning's recent-misses table. The review fields
+// give the table enough to link to the PR detail page without a second
+// round-trip.
+export interface HumanActionWithReview extends HumanAction {
+  repo: string;
+  pr_number: number;
+  pr_url: string;
+  pr_title: string;
+}
+
+export interface AccuracyStats {
+  // All non-pending observations in the window. Used as the denominator
+  // for the headline accuracy percentage.
+  total_non_pending: number;
+  agreements: number; // agreement_close + agreement_approve
+  failures: number; // false_close + missed_issue
+  pending: number;
+  accuracy_pct: number; // 0..100, 0 when total_non_pending == 0
+}
+
+export interface AccuracyTimePoint {
+  date: string; // YYYY-MM-DD
+  accuracy_pct: number; // 0..100, daily share of agreements among non-pending
+  total: number; // non-pending observations on that day (for tooltip context)
+}
+
+export interface AgentAlert {
+  id: string;
+  raised_at: string;
+  alert_type: string;
+  metric_value: number;
+  threshold: number;
+  resolved_at: string | null;
+}
+
 // --- Benchmark types ------------------------------------------------------
 // Match agent/migrations/002_benchmark_runs.sql. Most "opus_*" fields are
 // nullable because benchmark.py only fills them on a successful Opus call.

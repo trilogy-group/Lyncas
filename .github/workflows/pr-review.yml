@@ -6,6 +6,10 @@ on:
     - cron: '*/15 * * * *'
     # Daily digest trigger (7am UTC = 12:30pm IST)
     - cron: '0 7 * * *'
+    # Phase 7 — every 6 hours, poll GitHub for human responses to past
+    # reviews and recompute drift metrics. Lighter-weight than the review
+    # scan, hence the slower cadence.
+    - cron: '0 */6 * * *'
   # Allow manual trigger from Actions tab for testing / video demo
   workflow_dispatch:
 
@@ -64,3 +68,28 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GITHUB_EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: python agent/send_digest.py
+
+  # Phase 7 — separate job, fires only on its own 6-hour cron (and any
+  # workflow_dispatch). Polls GitHub for human responses to past reviews
+  # and computes drift metrics.
+  poll-human-actions:
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '0 */6 * * *' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'agent/requirements.txt'
+      - name: Install deps
+        run: pip install -r agent/requirements.txt
+      - name: Poll human actions
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GITHUB_TOKEN_PAT: ${{ secrets.PR_REVIEWER_PAT }}
+        run: python agent/track_human_actions.py

@@ -1,10 +1,16 @@
 import { createSupabaseServerClient } from "./supabase/server";
 import type {
+  AccuracyStats,
+  AccuracyTimePoint,
   ActivityPoint,
   Action,
+  AgentAlert,
   BenchmarkRun,
   BenchmarkStats,
   DashboardStats,
+  HumanAction,
+  HumanActionType,
+  HumanActionWithReview,
   RepoStat,
   Review,
   Run,
@@ -292,6 +298,164 @@ export async function getRepoStats(): Promise<RepoStat[]> {
       last_reviewed_at: s.last_reviewed_at,
     }))
     .sort((a, b) => b.total_reviews - a.total_reviews);
+}
+
+// --- Phase 7: self-learning queries --------------------------------------
+// All four read from the public anon role. RLS policies on human_actions
+// and agent_alerts (see migrations 006 + 007) explicitly grant anon SELECT.
+
+const AGREEMENT_TYPES: ReadonlySet<HumanActionType> = new Set([
+  "agreement_close",
+  "agreement_approve",
+]);
+const FAILURE_TYPES: ReadonlySet<HumanActionType> = new Set([
+  "false_close",
+  "missed_issue",
+]);
+
+export async function getHumanAction(
+  reviewId: string,
+): Promise<HumanAction | null> {
+  const supabase = createSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("human_actions")
+    .select("*")
+    .eq("review_id", reviewId)
+    .maybeSingle();
+  if (error) throw error;
+  return (data ?? null) as unknown as HumanAction | null;
+}
+
+export async function getAccuracyStats(
+  daysWindow = 30,
+): Promise<AccuracyStats> {
+  const supabase = createSupabaseServerClient();
+  const since = new Date(
+    Date.now() - daysWindow * 86_400_000,
+  ).toISOString();
+
+  const { data, error } = await supabase
+    .from("human_actions")
+    .select("action_type")
+    .gte("observed_at", since);
+  if (error) throw error;
+
+  let agreements = 0;
+  let failures = 0;
+  let pending = 0;
+  for (const r of (data ?? []) as { action_type: HumanActionType }[]) {
+    if (AGREEMENT_TYPES.has(r.action_type)) agreements += 1;
+    else if (FAILURE_TYPES.has(r.action_type)) failures += 1;
+    else pending += 1;
+  }
+  const total_non_pending = agreements + failures;
+  const accuracy_pct = total_non_pending
+    ? (agreements / total_non_pending) * 100
+    : 0;
+  return { total_non_pending, agreements, failures, pending, accuracy_pct };
+}
+
+export async function getAccuracyOverTime(
+  daysWindow = 90,
+): Promise<AccuracyTimePoint[]> {
+  const supabase = createSupabaseServerClient();
+  const since = new Date(
+    Date.now() - daysWindow * 86_400_000,
+  ).toISOString();
+
+  // Pull every non-pending action in the window, then bucket by observed
+  // day. Days with no non-pending observations are simply omitted — the
+  // chart renders them as gaps rather than misleading 0% points.
+  const { data, error } = await supabase
+    .from("human_actions")
+    .select("action_type, observed_at")
+    .gte("observed_at", since)
+    .neq("action_type", "pending");
+  if (error) throw error;
+
+  const byDay = new Map<string, { agree: number; total: number }>();
+  for (const r of (data ?? []) as {
+    action_type: HumanActionType;
+    observed_at: string;
+  }[]) {
+    const day = r.observed_at.slice(0, 10);
+    const bucket = byDay.get(day) ?? { agree: 0, total: 0 };
+    bucket.total += 1;
+    if (AGREEMENT_TYPES.has(r.action_type)) bucket.agree += 1;
+    byDay.set(day, bucket);
+  }
+
+  return Array.from(byDay.entries())
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([date, { agree, total }]) => ({
+      date,
+      accuracy_pct: total ? (agree / total) * 100 : 0,
+      total,
+    }));
+}
+
+export async function getRecentMisses(
+  limit = 50,
+): Promise<HumanActionWithReview[]> {
+  const supabase = createSupabaseServerClient();
+  // Two-step: pull misses first, then enrich with review fields. PostgREST
+  // joins through RLS-enabled tables can be fiddly; explicit fetch keeps
+  // the data shape obvious and the query plan trivial.
+  const { data: actions, error } = await supabase
+    .from("human_actions")
+    .select("*")
+    .in("action_type", ["false_close", "missed_issue"])
+    .order("observed_at", { ascending: false })
+    .limit(limit);
+  if (error) throw error;
+
+  const rows = (actions ?? []) as HumanAction[];
+  if (rows.length === 0) return [];
+
+  const reviewIds = rows.map((r) => r.review_id);
+  const { data: reviewsData, error: rErr } = await supabase
+    .from("reviews")
+    .select("id, repo, pr_number, pr_url, pr_title")
+    .in("id", reviewIds);
+  if (rErr) throw rErr;
+
+  type ReviewLite = {
+    id: string;
+    repo: string;
+    pr_number: number;
+    pr_url: string;
+    pr_title: string;
+  };
+  const byId = new Map<string, ReviewLite>();
+  for (const r of (reviewsData ?? []) as ReviewLite[]) byId.set(r.id, r);
+
+  const out: HumanActionWithReview[] = [];
+  for (const a of rows) {
+    const r = byId.get(a.review_id);
+    if (!r) continue; // review row went away (cascade delete); skip
+    out.push({
+      ...a,
+      repo: r.repo,
+      pr_number: r.pr_number,
+      pr_url: r.pr_url,
+      pr_title: r.pr_title,
+    });
+  }
+  return out;
+}
+
+export async function getAgentAlerts(
+  onlyUnresolved = true,
+): Promise<AgentAlert[]> {
+  const supabase = createSupabaseServerClient();
+  let query = supabase
+    .from("agent_alerts")
+    .select("*")
+    .order("raised_at", { ascending: false });
+  if (onlyUnresolved) query = query.is("resolved_at", null);
+  const { data, error } = await query;
+  if (error) throw error;
+  return (data ?? []) as unknown as AgentAlert[];
 }
 
 // --- Benchmark queries ----------------------------------------------------

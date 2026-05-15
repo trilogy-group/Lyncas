@@ -7,6 +7,7 @@ import { StatCard } from "@/components/ui/stat-card";
 import { Table, TableBody, TableHeader, Td, Th } from "@/components/ui/table";
 import { formatCost, severityColor, severityColors } from "@/lib/design";
 import {
+  getAccuracyStats,
   getActivityByDay,
   getAvailableRepos,
   getRecentReviews,
@@ -62,7 +63,7 @@ export default async function HomePage({
     ? clamp(Number(sp.maxSev), 1, 10)
     : undefined;
 
-  const [stats, recent, repos, repoStats, severity, activity] =
+  const [stats, recent, repos, repoStats, severity, activity, accuracy] =
     await Promise.all([
       getStats(30),
       getRecentReviews({
@@ -80,6 +81,7 @@ export default async function HomePage({
       getRepoStats(),
       getSeverityDistribution(30),
       getActivityByDay(30),
+      getAccuracyStats(30),
     ]);
 
   const totalPages = Math.max(1, Math.ceil(recent.totalCount / PAGE_SIZE));
@@ -109,7 +111,7 @@ export default async function HomePage({
         </p>
       </section>
 
-      <section className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+      <section className="grid grid-cols-2 lg:grid-cols-5 gap-4">
         <StatCard
           label="Total reviews"
           value={String(stats.totalReviews)}
@@ -130,6 +132,24 @@ export default async function HomePage({
           label="Est. cost (30d)"
           value={formatCost(stats.estimatedCostUSD)}
           hint="claude opus-4-5"
+        />
+        <StatCard
+          label="Agent accuracy (30d)"
+          value={
+            accuracy.total_non_pending > 0
+              ? `${accuracy.accuracy_pct.toFixed(0)}%`
+              : "—"
+          }
+          hint={
+            accuracy.total_non_pending > 0
+              ? `${accuracy.agreements} / ${accuracy.total_non_pending}`
+              : "no settled obs yet"
+          }
+          accent={
+            accuracy.total_non_pending > 0 && accuracy.accuracy_pct < 95
+              ? severityColors.serious
+              : undefined
+          }
         />
       </section>
 

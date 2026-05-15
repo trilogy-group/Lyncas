@@ -136,8 +136,12 @@ Required env vars on Vercel:
 
 - `WEBHOOK_SECRET` — random string also pasted into the GitHub webhook
   "Secret" field.
-- `PR_REVIEWER_PAT` — fine-grained PAT with `actions: write` on the
-  agent repo.
+- `AGENT_WORKFLOW_PAT` — fine-grained PAT with `actions: write` on the
+  agent repo. **Distinct from** the agent-side `PR_REVIEWER_PAT` (used by
+  the Python script to fetch diffs and post comments on the target
+  repos); a fine-grained PAT can only access repos owned by the account
+  that created it, so when the agent repo and the target repos live
+  under different accounts you need one PAT per account.
 - `AGENT_REPO` — `<owner>/<repo>` of the agent repo (the one that hosts
   `pr-review.yml`), e.g. `HarshBti1805/Night-PR-Reviewer`. **Not** the
   repo a PR was opened against.

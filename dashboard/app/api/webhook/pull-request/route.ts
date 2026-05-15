@@ -20,8 +20,13 @@ import crypto from "node:crypto";
 //
 // Required env vars (set on Vercel):
 //   WEBHOOK_SECRET   — same string configured in the GitHub webhook UI.
-//   PR_REVIEWER_PAT  — fine-grained PAT with `actions: write` on the
-//                      agent repo (the repo that hosts pr-review.yml).
+//   AGENT_WORKFLOW_PAT — fine-grained PAT with `actions: write` on the
+//                        agent repo (the repo that hosts pr-review.yml).
+//                        Distinct from the agent-side PR_REVIEWER_PAT
+//                        (used by the Python script to read diffs / post
+//                        comments on the target repos) because the two
+//                        roles need access to different repos owned by
+//                        potentially different GitHub accounts.
 //   AGENT_REPO       — `<owner>/<repo>` of the agent repo, e.g.
 //                      "HarshBti1805/Night-PR-Reviewer". This is the
 //                      repo whose Actions workflow we dispatch — NOT
@@ -79,12 +84,12 @@ async function dispatchWorkflow(meta: {
   prNumber: number;
   action: string;
 }): Promise<void> {
-  const token = process.env.PR_REVIEWER_PAT;
+  const token = process.env.AGENT_WORKFLOW_PAT;
   const agentRepo = process.env.AGENT_REPO;
   const workflow = process.env.AGENT_WORKFLOW || "pr-review.yml";
   const ref = process.env.AGENT_WORKFLOW_REF || "main";
 
-  if (!token) throw new Error("PR_REVIEWER_PAT is not set");
+  if (!token) throw new Error("AGENT_WORKFLOW_PAT is not set");
   if (!agentRepo) {
     throw new Error(
       "AGENT_REPO is not set (expected '<owner>/<repo>' of the repo hosting pr-review.yml)",

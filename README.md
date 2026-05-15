@@ -19,4 +19,6 @@ and emails a daily digest. Includes a Next.js dashboard for visualization.
 
 - Agent docs: [agent/README.md](agent/README.md)
 - Dashboard docs: [dashboard/README.md](dashboard/README.md)
-- Improvements / roadmap: [IMPROVEMENTS.md](IMPROVEMENTS.md)
+- Forward-looking plan, v3 roadmap, and technical debt: [PROJECT_PLAN.md](PROJECT_PLAN.md)
+- System architecture reference (diagrams, components, schema, env vars): [ARCHITECTURE.md](ARCHITECTURE.md)
+- Rules for AI assistants (Claude Code / Cursor) picking up this project: [CLAUDE.md](CLAUDE.md)

@@ -1,27 +1,45 @@
 import crypto from "node:crypto";
 
-import { reviewPullRequest, type WebhookPullRequest } from "@/lib/webhook/review";
-
-// Phase 5: GitHub PR webhook → inline review.
+// GitHub PR webhook → GitHub Actions workflow_dispatch.
 //
-// Triggered by GitHub on `pull_request` events. Verifies the HMAC-SHA256
-// signature using WEBHOOK_SECRET, ignores anything other than `opened` /
-// `synchronize` / `reopened`, then runs the same review pipeline as the
-// 10-minute cron (agent/pr_reviewer.py).
+// This route is intentionally thin. It does NOT review the PR inline.
+// Its only job is to verify the webhook signature, filter to the two
+// actionable events, and trigger the existing `pr-review.yml` workflow
+// via the GitHub Actions API. The agent's LangGraph pipeline then runs
+// in CI exactly the way the cron schedule already does — same code,
+// same secrets, same review quality.
 //
-// The cron stays running as a fallback — if a webhook delivery is dropped
-// (transient Vercel outage, GitHub queue blip) the cron will catch it on
-// its next tick.
+// Why dispatch instead of inline review:
+//   • A single source of truth (LangGraph in `agent/`) regardless of
+//     whether a PR arrived via cron or webhook. No webhook-only drift.
+//   • Vercel functions have no git binary, no Python, and a 10s default
+//     execution budget — running the full review inline was always
+//     fighting the platform.
+//   • The cron remains the safety net for missed deliveries; instant
+//     dispatch is the happy path.
+//
+// Required env vars (set on Vercel):
+//   WEBHOOK_SECRET   — same string configured in the GitHub webhook UI.
+//   PR_REVIEWER_PAT  — fine-grained PAT with `actions: write` on the
+//                      agent repo (the repo that hosts pr-review.yml).
+//   AGENT_REPO       — `<owner>/<repo>` of the agent repo, e.g.
+//                      "HarshBti1805/Night-PR-Reviewer". This is the
+//                      repo whose Actions workflow we dispatch — NOT
+//                      the repo the PR was opened against.
+//   AGENT_WORKFLOW   — (optional) workflow file name. Defaults to
+//                      "pr-review.yml".
+//   AGENT_WORKFLOW_REF — (optional) git ref to run the workflow on.
+//                      Defaults to "main".
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 120;
+export const maxDuration = 30;
 
-const REVIEWABLE_ACTIONS = new Set(["opened", "synchronize", "reopened"]);
+const REVIEWABLE_ACTIONS = new Set(["opened", "synchronize"]);
 
 function timingSafeHexCompare(expected: string, actual: string): boolean {
-  // crypto.timingSafeEqual throws on length mismatch, which would itself be
-  // a side channel — guard the length first.
+  // crypto.timingSafeEqual throws on length mismatch — that itself is a
+  // side channel, so check length first and only then compare.
   if (expected.length !== actual.length) return false;
   try {
     return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(actual));
@@ -45,7 +63,7 @@ function verifySignature(rawBody: string, signatureHeader: string | null): boole
 
 interface WebhookPayload {
   action?: string;
-  pull_request?: WebhookPullRequest;
+  pull_request?: { number?: number; html_url?: string };
   repository?: { full_name?: string };
 }
 
@@ -56,19 +74,63 @@ function jsonResponse(status: number, body: Record<string, unknown>): Response {
   });
 }
 
+async function dispatchWorkflow(meta: {
+  triggerRepo: string;
+  prNumber: number;
+  action: string;
+}): Promise<void> {
+  const token = process.env.PR_REVIEWER_PAT;
+  const agentRepo = process.env.AGENT_REPO;
+  const workflow = process.env.AGENT_WORKFLOW || "pr-review.yml";
+  const ref = process.env.AGENT_WORKFLOW_REF || "main";
+
+  if (!token) throw new Error("PR_REVIEWER_PAT is not set");
+  if (!agentRepo) {
+    throw new Error(
+      "AGENT_REPO is not set (expected '<owner>/<repo>' of the repo hosting pr-review.yml)",
+    );
+  }
+
+  const url = `https://api.github.com/repos/${agentRepo}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `token ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "night-pr-reviewer-dispatcher",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ ref, inputs: {} }),
+  });
+
+  // GitHub returns 204 No Content on a successful dispatch. Anything
+  // else (404 — missing workflow, 422 — bad ref, 403 — PAT missing
+  // `actions: write`) is a hard failure we surface to the caller.
+  if (res.status !== 204) {
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `workflow_dispatch failed: ${res.status} ${res.statusText} — ${body.slice(0, 400)}`,
+    );
+  }
+
+  console.log(
+    `[webhook] dispatched ${workflow}@${ref} on ${agentRepo} for ${meta.triggerRepo}#${meta.prNumber} (action=${meta.action})`,
+  );
+}
+
 export async function POST(request: Request): Promise<Response> {
   const rawBody = await request.text();
 
-  // 1. HMAC verification — strict. A misconfigured secret should fail
-  //    closed, not open: anyone with the public URL could otherwise post
-  //    arbitrary "PRs" and burn ANTHROPIC_API_KEY budget.
+  // 1. HMAC verification — fail closed. Without the secret, anyone with
+  //    the public URL could otherwise trigger workflow runs at will.
   const signature = request.headers.get("x-hub-signature-256");
   if (!verifySignature(rawBody, signature)) {
     return jsonResponse(401, { error: "invalid signature" });
   }
 
-  // 2. Acknowledge ping events explicitly so the GitHub webhook UI shows
-  //    a 200 OK when the user clicks "Redeliver" on the test ping.
+  // 2. Acknowledge GitHub's `ping` test so the webhook UI shows green
+  //    on the first delivery.
   const eventType = request.headers.get("x-github-event");
   if (eventType === "ping") {
     return jsonResponse(200, { pong: true });
@@ -77,7 +139,6 @@ export async function POST(request: Request): Promise<Response> {
     return jsonResponse(200, { ignored: eventType ?? "unknown" });
   }
 
-  // 3. Parse — never let a malformed body crash the function.
   let payload: WebhookPayload;
   try {
     payload = JSON.parse(rawBody) as WebhookPayload;
@@ -85,42 +146,49 @@ export async function POST(request: Request): Promise<Response> {
     return jsonResponse(400, { error: "invalid JSON body" });
   }
 
+  // 3. Action filter — opened / synchronize only. Everything else (closed,
+  //    edited, labeled, reviewed, etc.) is a no-op for us.
   const action = payload.action;
   if (!action || !REVIEWABLE_ACTIONS.has(action)) {
     return jsonResponse(200, { ignored: action ?? "no_action" });
   }
 
-  const repo = payload.repository?.full_name;
-  const pr = payload.pull_request;
-  if (!repo || !pr || typeof pr.number !== "number") {
-    return jsonResponse(400, { error: "missing repository.full_name or pull_request fields" });
+  const triggerRepo = payload.repository?.full_name;
+  const prNumber = payload.pull_request?.number;
+  if (!triggerRepo || typeof prNumber !== "number") {
+    return jsonResponse(400, {
+      error: "missing repository.full_name or pull_request.number",
+    });
   }
 
-  // 4. Run the review pipeline. Every internal call has its own try/catch;
-  //    this outer wrapper exists so an unexpected throw still returns JSON
-  //    instead of an HTML stack trace.
+  // 4. Dispatch and return immediately. The actual review runs in CI;
+  //    its lifecycle is observed via the GitHub Actions UI and the
+  //    `runs` / `reviews` tables in Supabase, same as the cron path.
   try {
-    console.log(`[webhook] received ${action} for ${repo}#${pr.number} (${pr.html_url})`);
-    const result = await reviewPullRequest(repo, pr);
+    await dispatchWorkflow({ triggerRepo, prNumber, action });
     return jsonResponse(200, {
       ok: true,
+      dispatched: true,
       action,
-      repo,
-      pr_number: pr.number,
-      result,
+      trigger_repo: triggerRepo,
+      pr_number: prNumber,
     });
   } catch (e) {
     const message = (e as Error).message;
-    console.error(`[webhook] ${repo}#${pr.number} failed:`, message);
+    console.error(
+      `[webhook] dispatch failed for ${triggerRepo}#${prNumber}: ${message}`,
+    );
     return jsonResponse(500, {
       ok: false,
       error: message,
-      repo,
-      pr_number: pr.number,
+      trigger_repo: triggerRepo,
+      pr_number: prNumber,
     });
   }
 }
 
 export async function GET(): Promise<Response> {
-  return jsonResponse(405, { error: "POST only — this endpoint is the GitHub webhook receiver" });
+  return jsonResponse(405, {
+    error: "POST only — this endpoint is the GitHub webhook receiver",
+  });
 }

@@ -117,6 +117,41 @@ python benchmark.py --review-ids <uuid>,<uuid>
 The page handles the empty state (no rows yet) by telling you to run
 the command above. The conclusion only renders once there is data.
 
+## Webhook (workflow dispatcher)
+
+`POST /api/webhook/pull-request` is the GitHub webhook receiver. It does
+**not** run the review inline. Instead, it verifies the HMAC-SHA256
+signature, filters to `opened` / `synchronize` events, and immediately
+triggers the agent's `pr-review.yml` GitHub Actions workflow via the
+`workflow_dispatch` API. The agent then runs the same LangGraph pipeline
+in CI that the cron schedule already runs.
+
+This means **all reviews use the same LangGraph pipeline regardless of
+trigger source** — there is exactly one place where reviews are produced
+(the agent in CI), and the webhook is just a low-latency way to wake it
+up. The 15-min cron stays in place as a safety net for any missed
+delivery.
+
+Required env vars on Vercel:
+
+- `WEBHOOK_SECRET` — random string also pasted into the GitHub webhook
+  "Secret" field.
+- `PR_REVIEWER_PAT` — fine-grained PAT with `actions: write` on the
+  agent repo.
+- `AGENT_REPO` — `<owner>/<repo>` of the agent repo (the one that hosts
+  `pr-review.yml`), e.g. `HarshBti1805/Night-PR-Reviewer`. **Not** the
+  repo a PR was opened against.
+
+Optional overrides:
+
+- `AGENT_WORKFLOW` (default `pr-review.yml`)
+- `AGENT_WORKFLOW_REF` (default `main`)
+
+GitHub webhook setup on each target repo: Settings → Webhooks → Add
+webhook → payload URL `https://<your-vercel-url>/api/webhook/pull-request`,
+content type `application/json`, paste the same `WEBHOOK_SECRET`, select
+the "Pull requests" event only.
+
 ## Notes
 
 - Every page is `export const dynamic = "force-dynamic"` because the data

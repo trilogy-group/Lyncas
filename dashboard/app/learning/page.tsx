@@ -9,18 +9,22 @@ import {
   getAccuracyOverTime,
   getAccuracyStats,
   getAgentAlerts,
+  getOpenPromptTunerRuns,
   getRecentMisses,
 } from "@/lib/queries";
 import type { HumanActionType } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
-// Phase 7 self-learning surface. Mirrors the Phase-7 spec verbatim:
+// Self-learning surface. Originally Phase 7; Phase 8 adds the
+// "Pending prompt improvements" section at the bottom.
 //  * headline accuracy stat over the last 30 days
 //  * 90-day accuracy line chart
 //  * recent misses table (false_close + missed_issue) — the cases that
-//    will drive prompt improvements in v3
+//    drive prompt improvements
 //  * unresolved drift alerts at the top, red banner
+//  * Phase 8 — open PRs from agent/prompt_tuner.py, each with the
+//    failure cases that drove it and the proposed prompt.md diff
 
 const ACTION_LABEL: Record<HumanActionType, string> = {
   agreement_close: "Agreement (close)",
@@ -44,11 +48,12 @@ const ALERT_LABEL: Record<string, string> = {
 };
 
 export default async function LearningPage() {
-  const [stats, timeline, misses, alerts] = await Promise.all([
+  const [stats, timeline, misses, alerts, promptTunerRuns] = await Promise.all([
     getAccuracyStats(30),
     getAccuracyOverTime(90),
     getRecentMisses(50),
     getAgentAlerts(true),
+    getOpenPromptTunerRuns(),
   ]);
 
   return (
@@ -197,8 +202,151 @@ export default async function LearningPage() {
         )}
       </section>
 
-      <section className="text-xs font-mono text-muted italic">
-        Prompt-improvement suggestions are queued for v3.
+      <section className="space-y-3">
+        <div>
+          <h2 className="text-lg font-semibold">Pending prompt improvements</h2>
+          <p className="text-xs text-muted font-mono">
+            open PRs from the prompt-tuner agent · each one proposes a{" "}
+            <code className="px-1 py-0.5 bg-card rounded border border-border">
+              agent/prompt.md
+            </code>{" "}
+            edit driven by the misses above
+          </p>
+        </div>
+        {promptTunerRuns.length === 0 ? (
+          <Card className="p-6 text-sm font-mono text-muted text-center">
+            no open prompt-tuner PRs · the agent hasn&apos;t found enough
+            failure cases to justify a prompt change yet
+          </Card>
+        ) : (
+          <div className="space-y-4">
+            {promptTunerRuns.map((run) => (
+              <Card key={run.id} className="p-5 space-y-4">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <a
+                      href={run.pr_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-accent hover:underline font-semibold"
+                    >
+                      {run.agent_repo}#{run.pr_number}
+                    </a>
+                    <div className="text-sm text-text mt-0.5">
+                      {run.pr_title}
+                    </div>
+                    <div className="text-xs font-mono text-muted mt-1">
+                      opened {formatRelativeTime(run.created_at)} · branch{" "}
+                      <code className="px-1 py-0.5 bg-bg rounded border border-border">
+                        {run.branch_name}
+                      </code>
+                    </div>
+                  </div>
+                  <Badge color={palette.accent}>OPEN</Badge>
+                </div>
+
+                {run.rationale && (
+                  <div>
+                    <div className="text-xs font-mono text-muted uppercase tracking-wide mb-1">
+                      Rationale
+                    </div>
+                    <p className="text-sm text-text whitespace-pre-line">
+                      {run.rationale}
+                    </p>
+                  </div>
+                )}
+
+                <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs font-mono">
+                  <span>
+                    <span className="text-muted">cases driving it:</span>{" "}
+                    <span className="text-text font-semibold">
+                      {run.failure_case_count}
+                    </span>
+                  </span>
+                  {run.accuracy_before_pct !== null && (
+                    <span>
+                      <span className="text-muted">accuracy before:</span>{" "}
+                      <span className="text-text">
+                        {run.accuracy_before_pct.toFixed(1)}%
+                      </span>
+                    </span>
+                  )}
+                  {run.accuracy_after_pct_est !== null && (
+                    <span>
+                      <span className="text-muted">est. after:</span>{" "}
+                      <span className="text-text">
+                        {run.accuracy_after_pct_est.toFixed(1)}%
+                      </span>
+                    </span>
+                  )}
+                </div>
+
+                {run.failure_cases.length > 0 && (
+                  <div>
+                    <div className="text-xs font-mono text-muted uppercase tracking-wide mb-2">
+                      Failure cases
+                    </div>
+                    <Table>
+                      <TableHeader>
+                        <tr>
+                          <Th>PR</Th>
+                          <Th>Type</Th>
+                          <Th>Agent verdict</Th>
+                          <Th>Observed</Th>
+                        </tr>
+                      </TableHeader>
+                      <TableBody>
+                        {run.failure_cases.map((c) => (
+                          <tr key={`${run.id}-${c.review_id}`}>
+                            <Td>
+                              <Link
+                                href={`/pr/${c.review_id}`}
+                                className="text-accent hover:underline font-mono text-xs"
+                              >
+                                {c.repo}#{c.pr_number}
+                              </Link>
+                              <div className="text-xs text-muted truncate max-w-[28ch]">
+                                {c.pr_title}
+                              </div>
+                            </Td>
+                            <Td>
+                              <Badge color={ACTION_COLOR[c.action_type]}>
+                                {ACTION_LABEL[c.action_type]}
+                              </Badge>
+                            </Td>
+                            <Td className="font-mono text-xs text-muted">
+                              {c.agent_verdict ?? "?"}
+                              {typeof c.agent_severity === "number" && (
+                                <> · sev {c.agent_severity}</>
+                              )}
+                            </Td>
+                            <Td className="font-mono text-xs text-muted">
+                              {formatRelativeTime(c.observed_at)}
+                            </Td>
+                          </tr>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                )}
+
+                <div>
+                  <div className="text-xs font-mono text-muted uppercase tracking-wide mb-2">
+                    Proposed diff (agent/prompt.md)
+                  </div>
+                  <pre className="text-xs font-mono bg-bg border border-border rounded p-3 overflow-x-auto max-h-96 leading-relaxed">
+                    {run.proposed_diff}
+                  </pre>
+                </div>
+
+                <p className="text-xs font-mono text-muted italic">
+                  The agent never merges its own PR. Review the diff on
+                  GitHub before merging.
+                </p>
+              </Card>
+            ))}
+          </div>
+        )}
       </section>
     </main>
   );

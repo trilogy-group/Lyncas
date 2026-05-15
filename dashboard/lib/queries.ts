@@ -11,6 +11,7 @@ import type {
   HumanAction,
   HumanActionType,
   HumanActionWithReview,
+  PromptTunerRun,
   RepoStat,
   Review,
   Run,
@@ -456,6 +457,23 @@ export async function getAgentAlerts(
   const { data, error } = await query;
   if (error) throw error;
   return (data ?? []) as unknown as AgentAlert[];
+}
+
+// --- Phase 8: prompt-tuner runs ------------------------------------------
+// Each row is a PR opened by agent/prompt_tuner.py against the agent
+// repo. The script flips `status` to merged / closed when it polls
+// GitHub on subsequent runs, so this filter stays accurate without the
+// dashboard hitting the GitHub API.
+
+export async function getOpenPromptTunerRuns(): Promise<PromptTunerRun[]> {
+  const supabase = createSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("prompt_tuner_runs")
+    .select("*")
+    .eq("status", "open")
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+  return (data ?? []) as unknown as PromptTunerRun[];
 }
 
 // --- Benchmark queries ----------------------------------------------------

@@ -1,25 +1,40 @@
 """
-review_graph.py — LangGraph orchestration for PR review (Phase 6).
+review_graph.py — LangGraph orchestration for PR review.
 
-Replaces the single LLM call in `pr_reviewer.py` with a structured graph:
+Phase 6 introduced the structured graph. Phase 8 extends it with a
+Repo Context Agent in front of the reviewer:
 
-    diff + context
-      → [Reviewer Node]          (standard review pass)
+    diff + fingerprint
+      → [Repo Context Node]      (extracts diff-specific repo context)
+      → [Reviewer Node]          (standard review pass, sees the context)
       → [Critic  Node]           (adversarial: what did the reviewer miss / over-flag?)
       → router
             ↘ (if verdict differs OR |Δseverity| ≥ 2)
                → [Arbiter Node]  (independent third pass, sees both prior outputs)
       → [Final Node]             (merges outputs, builds comment payload)
 
-Why three passes:
+Why three passes (Phase 6):
   Single-pass review has predictable blind spots — confirmation bias on the
   first pattern Claude latches onto, missed subtle bugs in long diffs,
   occasional severity inflation. The critic adds an explicit adversarial
   step. The arbiter only runs when the first two disagree meaningfully, so
   we pay for it on the cases that matter and skip it on clean PRs.
 
+Why a Repo Context Agent (Phase 8):
+  The repo fingerprint is a *general* description of the repo. For a
+  specific diff, only a slice of that fingerprint is relevant — the
+  directories the diff actually touches, the conventions that govern those
+  files, and the kinds of bugs that matter for that subsystem. Forcing the
+  reviewer to do this filtering inline diluted its bug-spotting attention.
+  The Repo Context Agent does the filtering once and hands the reviewer a
+  short, focused note. The Phase 2 graceful-degradation contract still
+  applies: with no fingerprint (or a Claude failure here), we fall through
+  to the same prompt the reviewer used pre-Phase-8.
+
 The reviewer's prompt is unchanged from Phase 3 (agent/prompt.md) so any
-prompt iteration there flows into the graph automatically.
+prompt iteration there flows into the graph automatically. The Phase 8
+diff-specific context is layered on top as additional context, not a
+replacement for the rubric.
 
 Returns a dict shaped like `review_pr_with_claude(...)`'s return so the
 existing `format_review_comment`, `should_auto_close`, and `upsert_review`
@@ -51,10 +66,18 @@ PROMPT_PATH = Path(__file__).parent / "prompt.md"
 
 # Per-node token ceilings. Reviewer matches the pre-Phase-6 cap (2000) so
 # the unchanged prompt sees the same budget. Critic and arbiter get the
-# same headroom since they produce the same schema.
+# same headroom since they produce the same schema. Repo context is a
+# short bullet list, not JSON, so it gets a much smaller cap.
 _REVIEW_MAX_TOKENS = 2000
 _CRITIC_MAX_TOKENS = 2000
 _ARBITER_MAX_TOKENS = 2000
+_REPO_CONTEXT_MAX_TOKENS = 600
+
+# Hard cap on the repo-context node's diff payload. The whole point of
+# this node is to *summarize* — feeding it the full 60K-char diff defeats
+# the purpose and inflates input tokens. We keep just enough of the diff
+# to identify which files / dirs are touched.
+_REPO_CONTEXT_DIFF_CHARS = 8_000
 
 # Router threshold: |reviewer.severity - critic.severity| >= 2 escalates.
 ESCALATION_SEVERITY_DELTA = 2
@@ -72,11 +95,42 @@ def _load_review_system_prompt() -> str:
     return PROMPT_PATH.read_text(encoding="utf-8")
 
 
-# --- Critic & Arbiter system prompts -------------------------------------
-# Both are intentionally short framings *prepended* to the reviewer's
-# prompt, so all three nodes share the exact same severity rubric and
-# JSON schema. The critic and arbiter then layer their own behavior on
-# top. Keeping the rubric central avoids drift between the three nodes.
+# --- Repo Context, Critic & Arbiter system prompts -----------------------
+# The critic and arbiter framings are intentionally short framings
+# *prepended* to the reviewer's prompt, so all three review nodes share
+# the exact same severity rubric and JSON schema. The critic and arbiter
+# then layer their own behavior on top. Keeping the rubric central avoids
+# drift between the three nodes.
+#
+# The Repo Context Agent (Phase 8) is structurally different: it does NOT
+# produce a JSON review, it produces a short plain-text bullet list that
+# becomes additional context for the reviewer. It therefore has its own
+# self-contained system prompt and does not inherit the reviewer rubric.
+
+_REPO_CONTEXT_SYSTEM_PROMPT = """You are a senior code reviewer's research assistant. Your one job is to
+read a repository fingerprint and a unified PR diff, and produce a short
+focused note of the repo context that is most relevant to reviewing THIS
+specific diff.
+
+Output requirements:
+1. Return 4-8 plain-text bullet points. No preamble, no closing remarks.
+2. Each bullet covers ONE of:
+   - Which directory / subsystem this diff touches and what it does
+     within the repo
+   - Which conventions from the fingerprint apply to the touched files
+     (naming, test layout, error handling, etc.)
+   - Which kinds of bugs are worth extra attention here given what this
+     subsystem does (e.g. "auth code — check for missing authz" /
+     "DB layer — check transaction boundaries")
+   - What is OUT of scope for this repo, if relevant to the diff
+3. Be specific and factual. Cite the fingerprint or the diff. Do NOT
+   invent conventions or directories that are not stated.
+4. If the fingerprint is missing or the diff is too small / unrelated to
+   give meaningful repo-specific context, return the single line:
+   "(no repo-specific context applies)"
+
+Do not review the diff. Do not flag bugs. Do not produce JSON. Your
+output is consumed verbatim by the reviewer node as additional context."""
 
 _CRITIC_FRAMING = """You are a second-pass adversarial reviewer on a GitHub PR. A first reviewer
 has already produced a JSON analysis. Your job is to *challenge* it.
@@ -147,6 +201,20 @@ class ReviewState(TypedDict):
     diff: str
     repo_fingerprint: str | None
 
+    # Phase 8 — populated by the Repo Context Agent before the reviewer
+    # runs. The reviewer node reads this and includes it in its user
+    # message. None when fingerprint is unavailable or the context node
+    # itself failed (graceful degradation: reviewer still runs).
+    diff_specific_context: str | None
+
+    # Phase 8 — placeholder for prompt-tuner output. The Prompt Tuner
+    # Agent runs *out of band* (separate scheduled script, not a graph
+    # node), so this field is currently always None when the graph
+    # executes. We keep it on the state for spec-compatibility and to
+    # leave room for a future "show prompt-tuner suggestions inline in
+    # the review comment" feature without another schema migration.
+    prompt_tuner_suggestions: list | None
+
     # Node outputs
     reviewer_output: dict | None
     critic_output: dict | None
@@ -215,19 +283,68 @@ def _call_claude_json(
 
 # --- User-message templates ----------------------------------------------
 
-def _build_reviewer_user_msg(
+def _build_repo_context_user_msg(
     pr: dict, diff: str, repo_fingerprint: str | None
+) -> str:
+    """User message for the Phase-8 Repo Context Agent. We deliberately
+    truncate the diff hard here — the node's job is to summarize *which
+    parts* of the repo the diff touches, not to read every hunk. The full
+    diff still goes to the reviewer node."""
+    fingerprint_block = (
+        repo_fingerprint
+        if repo_fingerprint
+        else "(no repo fingerprint available)"
+    )
+    diff_for_context = diff
+    if len(diff_for_context) > _REPO_CONTEXT_DIFF_CHARS:
+        diff_for_context = (
+            diff_for_context[:_REPO_CONTEXT_DIFF_CHARS]
+            + "\n\n[... diff truncated for context extraction ...]"
+        )
+    return f"""REPOSITORY FINGERPRINT:
+{fingerprint_block}
+
+---
+
+PR METADATA:
+title: {pr['title']}
+base branch: {pr['base']['ref']}
+files changed: {pr.get('changed_files', 'unknown')}
+
+UNIFIED DIFF (truncated for context extraction):
+```diff
+{diff_for_context}
+```
+
+Produce the diff-specific repo context note now, per the system prompt's bullet rules."""
+
+
+def _build_reviewer_user_msg(
+    pr: dict,
+    diff: str,
+    repo_fingerprint: str | None,
+    diff_specific_context: str | None = None,
 ) -> str:
     """Identical to pr_reviewer.review_pr_with_claude's user message —
     the reviewer node is meant to be byte-identical to the pre-graph call
-    so any Phase 3 prompt iteration still applies unchanged."""
-    context_block = ""
+    so any Phase 3 prompt iteration still applies unchanged.
+
+    Phase 8 layers an optional `diff_specific_context` block produced by
+    the Repo Context Agent on top of the base fingerprint. We keep both:
+    the fingerprint gives the reviewer the full repo description; the
+    diff-specific note focuses attention. When the repo-context node is
+    skipped or fails, this falls back to the Phase-3 shape automatically."""
+    context_parts: list[str] = []
     if repo_fingerprint:
-        context_block = (
-            "REPOSITORY CONTEXT:\n"
-            f"{repo_fingerprint}\n"
-            "\n---\n\n"
+        context_parts.append(f"REPOSITORY CONTEXT:\n{repo_fingerprint}")
+    if diff_specific_context:
+        context_parts.append(
+            "DIFF-SPECIFIC REPO CONTEXT (from repo-context agent):\n"
+            f"{diff_specific_context}"
         )
+    context_block = ""
+    if context_parts:
+        context_block = "\n\n".join(context_parts) + "\n\n---\n\n"
 
     return f"""{context_block}PR DIFF:
 PR title: {pr['title']}
@@ -282,10 +399,15 @@ def _build_critic_user_msg(
     diff: str,
     repo_fingerprint: str | None,
     reviewer_output: dict,
+    diff_specific_context: str | None = None,
 ) -> str:
     """Wraps the reviewer user message with the prior reviewer's full
-    JSON, so the critic sees exactly what it is challenging."""
-    base = _build_reviewer_user_msg(pr, diff, repo_fingerprint)
+    JSON, so the critic sees exactly what it is challenging. The Phase-8
+    diff-specific context (if any) is carried through to the critic so
+    both passes see the same repo context."""
+    base = _build_reviewer_user_msg(
+        pr, diff, repo_fingerprint, diff_specific_context
+    )
     return (
         "FIRST REVIEWER'S OUTPUT (challenge this — agree or disagree honestly):\n"
         "```json\n"
@@ -302,10 +424,15 @@ def _build_arbiter_user_msg(
     repo_fingerprint: str | None,
     reviewer_output: dict,
     critic_output: dict,
+    diff_specific_context: str | None = None,
 ) -> str:
     """Wraps the reviewer user message with both prior JSON outputs so
-    the arbiter has full deliberation context."""
-    base = _build_reviewer_user_msg(pr, diff, repo_fingerprint)
+    the arbiter has full deliberation context. The Phase-8 diff-specific
+    context (if any) is also threaded through so the arbiter sees the
+    same repo context as the prior two passes."""
+    base = _build_reviewer_user_msg(
+        pr, diff, repo_fingerprint, diff_specific_context
+    )
     return (
         "FIRST REVIEWER'S OUTPUT:\n"
         "```json\n"
@@ -379,10 +506,110 @@ def _merge_bug_lists(*bug_lists: list | None) -> list:
 # Each node is built as a closure over the PR dict so the strict ReviewState
 # schema stays exactly as specified in Phase 6 (no PR metadata fields).
 
+def _call_claude_text(
+    *,
+    system: str,
+    user: str,
+    max_tokens: int,
+) -> tuple[str, int, int]:
+    """One Claude call → plain-text response + (input_tokens, output_tokens).
+
+    Used by the Phase-8 Repo Context Agent, which produces a bullet list
+    rather than JSON. Kept separate from `_call_claude_json` so a stray
+    bullet character can't fail JSON parsing."""
+    response = _client.messages.create(
+        model=MODEL,
+        max_tokens=max_tokens,
+        system=system,
+        messages=[{"role": "user", "content": user}],
+    )
+    text = response.content[0].text.strip()
+    return text, response.usage.input_tokens, response.usage.output_tokens
+
+
+def _make_repo_context_node(pr: dict):
+    """Phase 8 — the first node in the graph. Reads the repo fingerprint
+    from state (loaded by the orchestrator from Supabase repo_fingerprints
+    in pr_reviewer.py) and asks Claude to produce a short note focused on
+    THIS diff's subsystem and conventions. Writes the note to
+    `diff_specific_context`, which the reviewer/critic/arbiter all read.
+
+    Failure is non-fatal — on any error or with no fingerprint, we leave
+    diff_specific_context = None and the rest of the graph behaves as in
+    Phase 6 (reviewer just sees the raw fingerprint). This is the same
+    graceful-degradation contract Phase 2 set for the fingerprint itself."""
+
+    def repo_context_node(state: ReviewState) -> dict:
+        tag = f"  [graph:{state['repo']}#{state['pr_number']}] repo context node"
+        fingerprint = state.get("repo_fingerprint")
+        if not fingerprint:
+            print(
+                f"{tag}: skipped (no repo fingerprint available — "
+                f"diff_specific_context will be None)",
+                file=sys.stderr,
+            )
+            return {
+                "diff_specific_context": None,
+                "total_input_tokens": state.get("total_input_tokens", 0),
+                "total_output_tokens": state.get("total_output_tokens", 0),
+            }
+
+        print(f"{tag}: extracting diff-specific context...", file=sys.stderr)
+        try:
+            user_msg = _build_repo_context_user_msg(
+                pr, state["diff"], fingerprint
+            )
+            text, in_tok, out_tok = _call_claude_text(
+                system=_REPO_CONTEXT_SYSTEM_PROMPT,
+                user=user_msg,
+                max_tokens=_REPO_CONTEXT_MAX_TOKENS,
+            )
+        except Exception as e:
+            print(
+                f"{tag}: failed ({e}) — falling through without diff-specific context",
+                file=sys.stderr,
+            )
+            return {
+                "diff_specific_context": None,
+                "total_input_tokens": state.get("total_input_tokens", 0),
+                "total_output_tokens": state.get("total_output_tokens", 0),
+            }
+
+        # The system prompt instructs Claude to return a literal sentinel
+        # when there's nothing useful to say. Treat that as "no context"
+        # so the reviewer doesn't get a noisy empty bullet list.
+        cleaned = text.strip()
+        if cleaned == "(no repo-specific context applies)":
+            cleaned_out: str | None = None
+            print(
+                f"{tag}: model returned no-context sentinel — diff_specific_context=None",
+                file=sys.stderr,
+            )
+        else:
+            cleaned_out = cleaned
+            print(
+                f"{tag}: produced {len(cleaned.splitlines())}-line context note",
+                file=sys.stderr,
+            )
+
+        return {
+            "diff_specific_context": cleaned_out,
+            "total_input_tokens": state.get("total_input_tokens", 0) + in_tok,
+            "total_output_tokens": state.get("total_output_tokens", 0) + out_tok,
+        }
+
+    return repo_context_node
+
+
 def _make_reviewer_node(pr: dict, system_prompt: str):
     def reviewer_node(state: ReviewState) -> dict:
         print(f"  [graph:{state['repo']}#{state['pr_number']}] reviewer node...", file=sys.stderr)
-        user_msg = _build_reviewer_user_msg(pr, state["diff"], state.get("repo_fingerprint"))
+        user_msg = _build_reviewer_user_msg(
+            pr,
+            state["diff"],
+            state.get("repo_fingerprint"),
+            state.get("diff_specific_context"),
+        )
         output, in_tok, out_tok = _call_claude_json(
             system=system_prompt,
             user=user_msg,
@@ -405,7 +632,11 @@ def _make_critic_node(pr: dict, base_system_prompt: str):
         print(f"  [graph:{state['repo']}#{state['pr_number']}] critic node...", file=sys.stderr)
         reviewer_output = state.get("reviewer_output") or {}
         user_msg = _build_critic_user_msg(
-            pr, state["diff"], state.get("repo_fingerprint"), reviewer_output
+            pr,
+            state["diff"],
+            state.get("repo_fingerprint"),
+            reviewer_output,
+            state.get("diff_specific_context"),
         )
         output, in_tok, out_tok = _call_claude_json(
             system=system,
@@ -435,6 +666,7 @@ def _make_arbiter_node(pr: dict, base_system_prompt: str):
             state.get("repo_fingerprint"),
             reviewer_output,
             critic_output,
+            state.get("diff_specific_context"),
         )
         output, in_tok, out_tok = _call_claude_json(
             system=system,
@@ -522,16 +754,23 @@ def _final_node(state: ReviewState) -> dict:
 
 def _build_graph(pr: dict):
     """Builds and compiles the StateGraph for one PR. Node closures bind
-    the PR metadata so ReviewState stays exactly as Phase 6 specifies."""
+    the PR metadata so ReviewState stays exactly as the spec specifies.
+
+    Phase 8 wires the Repo Context Agent in front of the reviewer:
+      repo_context → reviewer → critic → router → (arbiter) → final
+    The repo-context node is non-fatal: on any failure it returns
+    diff_specific_context=None and the rest of the graph runs unchanged."""
     review_system_prompt = _load_review_system_prompt()
 
     graph = StateGraph(ReviewState)
+    graph.add_node("repo_context", _make_repo_context_node(pr))
     graph.add_node("reviewer", _make_reviewer_node(pr, review_system_prompt))
     graph.add_node("critic", _make_critic_node(pr, review_system_prompt))
     graph.add_node("arbiter", _make_arbiter_node(pr, review_system_prompt))
     graph.add_node("final", _final_node)
 
-    graph.set_entry_point("reviewer")
+    graph.set_entry_point("repo_context")
+    graph.add_edge("repo_context", "reviewer")
     graph.add_edge("reviewer", "critic")
     graph.add_conditional_edges(
         "critic",
@@ -556,13 +795,20 @@ def run_review_graph(
       - summary, verdict, confidence, severity_score
       - bugs (the merged union — what gets rendered in the PR comment)
       - concerns, questions, praise (taken from the winner — reviewer or arbiter)
-      - _input_tokens, _output_tokens   (sum across all nodes)
+      - _input_tokens, _output_tokens   (sum across all nodes, including
+                                         the Phase-8 repo-context node)
       - _truncated                       (True if MAX_DIFF_CHARS was hit)
 
-    New keys this commit introduces (consumed by upsert_review):
+    Keys introduced in Phase 6 (consumed by upsert_review):
       - _critic_output   (full critic JSON, or None on critic-side failure)
       - _arbiter_output  (full arbiter JSON, or None if arbiter did not fire)
       - _escalated       (True iff arbiter fired)
+
+    Phase 8 does not add new keys to the return dict — the repo-context
+    node's output stays internal to the graph (it's just additional
+    context for the reviewer). Persisting it is intentionally deferred:
+    the dashboard would render it on /pr/[id], and that page is
+    explicitly out of Phase 8 scope.
     """
     repo = pr.get("base", {}).get("repo", {}).get("full_name") or "?"
     pr_url = pr.get("html_url") or ""
@@ -578,6 +824,8 @@ def run_review_graph(
         "pr_url": pr_url,
         "diff": diff,
         "repo_fingerprint": repo_fingerprint,
+        "diff_specific_context": None,
+        "prompt_tuner_suggestions": None,
         "reviewer_output": None,
         "critic_output": None,
         "arbiter_output": None,

@@ -158,6 +158,55 @@ export interface AgentAlert {
   resolved_at: string | null;
 }
 
+// --- Phase 8: prompt-tuner runs ------------------------------------------
+// Match agent/migrations/008_prompt_tuner_runs.sql. One row per PR the
+// prompt-tuner script (agent/prompt_tuner.py) opens against the agent
+// repo. The /learning page renders rows with status='open' as "pending
+// prompt improvements"; the script flips status to merged/closed once a
+// human disposes of the PR.
+
+export type PromptTunerStatus = "open" | "merged" | "closed" | "unknown";
+
+// Denormalized failure-case shape persisted on the row. Mirrors the
+// dict the prompt-tuner script bundles per case (minus the heavy `diff`
+// field, which it strips before insert).
+export interface PromptTunerFailureCase {
+  human_action_id?: string;
+  review_id: string;
+  repo: string;
+  pr_number: number;
+  pr_url: string;
+  pr_title: string;
+  action_type: HumanActionType;
+  observed_at: string;
+  agent_action?: string | null;
+  agent_verdict?: string | null;
+  agent_confidence?: string | null;
+  agent_severity?: number | null;
+  agent_summary?: string | null;
+  agent_bugs?: unknown[] | null;
+  human_notes?: string | null;
+}
+
+export interface PromptTunerRun {
+  id: string;
+  created_at: string;
+  pr_url: string;
+  pr_number: number;
+  pr_title: string;
+  branch_name: string;
+  base_branch: string;
+  agent_repo: string;
+  failure_case_count: number;
+  failure_cases: PromptTunerFailureCase[];
+  proposed_diff: string;
+  rationale: string | null;
+  accuracy_before_pct: number | null;
+  accuracy_after_pct_est: number | null;
+  status: PromptTunerStatus;
+  status_observed_at: string;
+}
+
 // --- Benchmark types ------------------------------------------------------
 // Match agent/migrations/002_benchmark_runs.sql. Most "opus_*" fields are
 // nullable because benchmark.py only fills them on a successful Opus call.

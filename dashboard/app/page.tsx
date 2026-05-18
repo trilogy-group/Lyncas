@@ -46,8 +46,13 @@ export default async function HomePage({
   const sp = await searchParams;
 
   const page = Math.max(1, Number(sp.page) || 1);
+  // Default sort is most-recent-first because that's what reviewers
+  // naturally expect on a feed. Explicit ?sortBy=severity_score still
+  // works for triage views. Mirror the same default in
+  // lib/queries.ts → getRecentReviews so a non-URL-driven caller (test,
+  // server action) gets the same ordering.
   const sortBy: "severity_score" | "created_at" =
-    sp.sortBy === "created_at" ? "created_at" : "severity_score";
+    sp.sortBy === "severity_score" ? "severity_score" : "created_at";
   const sortDir: "asc" | "desc" = sp.sortDir === "asc" ? "asc" : "desc";
 
   const verdict = VERDICTS.includes(sp.verdict as Verdict)

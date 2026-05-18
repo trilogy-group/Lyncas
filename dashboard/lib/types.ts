@@ -88,6 +88,12 @@ export interface ActivityPoint {
 // `total_reviews`, `total_closed`, `avg_severity`, and `last_reviewed_at` are
 // all-time. `estimated_cost_usd` is windowed to the last 30 days — Phase 4 of
 // IMPROVEMENTS_v2.md explicitly labels it "(30d)".
+//
+// `rules_status` is derived from the repo_rules row (Phase 9): "none" when
+// no row exists, "enabled" / "disabled" otherwise. Used by /repos to render
+// the dashboard status dot without a second round-trip.
+export type RepoRulesStatus = "none" | "enabled" | "disabled";
+
 export interface RepoStat {
   repo: string;
   total_reviews: number;
@@ -95,6 +101,32 @@ export interface RepoStat {
   avg_severity: number;
   estimated_cost_usd: number;
   last_reviewed_at: string | null;
+  rules_status: RepoRulesStatus;
+}
+
+// --- Phase 9: per-repo rules ---------------------------------------------
+// Matches agent/migrations/009_repo_rules.sql. Written by the dashboard's
+// /repos/<owner>/<name>/settings page (anon write — see migration header),
+// read by agent/pr_reviewer.py.get_repo_rules() before each review.
+//
+// Most fields are nullable / default-empty so a fresh row inserted with
+// only `{ repo }` set still validates. The agent treats an absent row and
+// a row with every field at its default as equivalent.
+export interface RepoRule {
+  id: string;
+  created_at: string;
+  updated_at: string;
+  repo: string;
+  enabled: boolean;
+  auto_close_all: boolean;
+  watch_paths: string[];
+  skip_paths: string[];
+  custom_instructions: string | null;
+  rules_file_content: string | null;
+  auto_close_severity_threshold: number | null;
+  // Populated by the agent (upsert_repo_directory_tree). Displayed
+  // read-only in the dashboard.
+  repo_directory_tree: string | null;
 }
 
 // --- Phase 7: self-learning ----------------------------------------------

@@ -343,26 +343,205 @@ def close_pr(repo: str, pr_number: int, reason_comment: str) -> None:
     r.raise_for_status()
 
 
-def should_auto_close(review: dict) -> tuple[bool, str]:
-    """Apply the three-gate check. Returns (should_close, reason_if_not)."""
+def should_auto_close(
+    review: dict,
+    rules: dict | None = None,
+) -> tuple[bool, str]:
+    """Apply the three-gate check. Returns (should_close, reason_if_not).
+
+    Phase 9: when `rules` is passed (from get_repo_rules) the per-repo
+    overrides apply:
+      * rules['auto_close_all']=True bypasses every gate and closes.
+      * rules['auto_close_severity_threshold']=N replaces the global
+        AUTO_CLOSE_MIN_SEVERITY constant for THIS PR only.
+    ALLOW_AUTO_CLOSE is still the outer kill-switch — if it's false the
+    function returns False regardless of repo rules. That matches the
+    documented constraint in CLAUDE.md: the global auto-close gate is
+    never loosened without explicit operator intent."""
     if not ALLOW_AUTO_CLOSE:
         return False, "ALLOW_AUTO_CLOSE is false (default)"
+
+    rules = rules or {}
+
+    if rules.get("auto_close_all"):
+        return True, "auto_close_all=true (repo rules override)"
 
     score = review.get("severity_score", 0)
     verdict = review.get("verdict", "")
     confidence = review.get("confidence", "")
+
+    min_severity = (
+        rules.get("auto_close_severity_threshold")
+        or AUTO_CLOSE_MIN_SEVERITY
+    )
 
     failed = []
     if verdict != AUTO_CLOSE_REQUIRED_VERDICT:
         failed.append(f"verdict={verdict} (need {AUTO_CLOSE_REQUIRED_VERDICT})")
     if confidence != AUTO_CLOSE_REQUIRED_CONFIDENCE:
         failed.append(f"confidence={confidence} (need {AUTO_CLOSE_REQUIRED_CONFIDENCE})")
-    if not isinstance(score, int) or score < AUTO_CLOSE_MIN_SEVERITY:
-        failed.append(f"severity={score} (need >= {AUTO_CLOSE_MIN_SEVERITY})")
+    if not isinstance(score, int) or score < min_severity:
+        failed.append(f"severity={score} (need >= {min_severity})")
 
     if failed:
         return False, "; ".join(failed)
     return True, ""
+
+
+# --- Phase 9: per-repo rules ---------------------------------------------
+# Per-repo configuration is written by the dashboard's
+# /repos/<owner>/<name>/settings page into the repo_rules Supabase table
+# (see agent/migrations/009_repo_rules.sql) and read here once per repo
+# per run. Cache hits are free; cache misses do one Supabase select.
+#
+# The rules dict shape is the canonical interchange — callers never
+# touch the Supabase row directly. Default values match the migration's
+# column defaults so an absent row and an all-default row behave
+# identically.
+
+REPO_RULES_DEFAULTS: dict = {
+    "enabled": True,
+    "auto_close_all": False,
+    "watch_paths": [],
+    "skip_paths": [],
+    "custom_instructions": None,
+    "rules_file_content": None,
+    "auto_close_severity_threshold": None,
+    "repo_directory_tree": None,
+}
+
+
+def get_repo_rules(repo: str) -> dict:
+    """Return the rules dict for `repo`. Falls back to defaults if no row
+    exists, if Supabase is offline, or if the table itself is missing
+    (so the agent works against a not-yet-migrated database — the only
+    consequence is that no repo gets any non-default behavior)."""
+    if supabase is None:
+        return dict(REPO_RULES_DEFAULTS)
+    try:
+        resp = (
+            supabase.table("repo_rules")
+            .select("*")
+            .eq("repo", repo)
+            .maybe_single()
+            .execute()
+        )
+    except Exception as e:
+        print(f"  [{repo}] could not load repo rules: {e}", file=sys.stderr)
+        return dict(REPO_RULES_DEFAULTS)
+    data = getattr(resp, "data", None)
+    if not data:
+        return dict(REPO_RULES_DEFAULTS)
+    merged = dict(REPO_RULES_DEFAULTS)
+    merged.update({k: v for k, v in data.items() if k in REPO_RULES_DEFAULTS})
+    # Empty arrays come back as [] from Postgres — leave them as-is so
+    # `if rules['watch_paths']:` checks short-circuit correctly.
+    return merged
+
+
+def upsert_repo_directory_tree(repo: str, tree_text: str) -> None:
+    """Persist the observed directory list back to repo_rules so the
+    dashboard's read-only structure view can render it. Best-effort:
+    silently no-ops if Supabase is offline or the table is missing.
+    Creates the row if one doesn't exist yet (with rules at defaults)
+    so a brand-new repo's tree is recorded without forcing the operator
+    to visit /settings first."""
+    if supabase is None or not tree_text:
+        return
+    try:
+        supabase.table("repo_rules").upsert(
+            {"repo": repo, "repo_directory_tree": tree_text},
+            on_conflict="repo",
+        ).execute()
+    except Exception as e:
+        print(
+            f"  [{repo}] could not save repo_directory_tree: {e}",
+            file=sys.stderr,
+        )
+
+
+def _extract_files_from_diff(diff: str) -> list[str]:
+    """Pull the list of B-side file paths out of a unified diff.
+
+    A git diff starts each file block with:
+        diff --git a/<path> b/<path>
+    We use the B path (post-change) so renamed/deleted files map to
+    their final identity. Returns a deduplicated list in source order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in diff.split("\n"):
+        if not line.startswith("diff --git "):
+            continue
+        marker = " b/"
+        idx = line.rfind(marker)
+        if idx == -1:
+            continue
+        path = line[idx + len(marker):].strip()
+        if path and path not in seen:
+            seen.add(path)
+            out.append(path)
+    return out
+
+
+def _path_matches_any(path: str, prefixes: list[str]) -> bool:
+    """True if `path` is covered by ANY entry in `prefixes`.
+
+    Entries are either exact file names (`README.md`), directory paths
+    with or without a trailing slash (`docs/`, `docs`), or path
+    prefixes. Matching rules:
+      - 'README.md' matches exactly 'README.md'
+      - 'docs/' (or 'docs') matches 'docs', 'docs/foo', 'docs/foo/bar'
+    Empty prefixes are skipped so a stray blank line in the textarea
+    can't accidentally widen the filter to everything."""
+    for raw in prefixes:
+        p = raw.strip()
+        if not p:
+            continue
+        if p.endswith("/"):
+            p = p[:-1]
+        if path == p or path.startswith(p + "/"):
+            return True
+    return False
+
+
+def _directory_tree_from_files(files: list[str]) -> str:
+    """Return a newline-joined, sorted list of unique directory paths
+    observed in `files` (root files are recorded as './'). Used for the
+    /settings page's read-only structure view — operators copy lines
+    out of here into watch_paths / skip_paths."""
+    dirs: set[str] = set()
+    has_root = False
+    for f in files:
+        if "/" not in f:
+            has_root = True
+            continue
+        parts = f.split("/")
+        # Every prefix is interesting — operators may want to scope
+        # rules to 'src/' or 'src/api/' depending on the change.
+        for i in range(1, len(parts)):
+            dirs.add("/".join(parts[:i]) + "/")
+    out = sorted(dirs)
+    if has_root:
+        out.insert(0, "./")
+    return "\n".join(out)
+
+
+def _build_operator_rules_block(rules: dict) -> str:
+    """Render custom_instructions + rules_file_content as a single
+    OPERATOR RULES block to prepend to the diff. Returns an empty
+    string when neither is set, so the prompt is byte-identical to
+    the pre-Phase-9 prompt for repos with no rules configured."""
+    parts: list[str] = []
+    custom = (rules.get("custom_instructions") or "").strip()
+    file_content = (rules.get("rules_file_content") or "").strip()
+    if custom:
+        parts.append(custom)
+    if file_content:
+        parts.append(file_content)
+    if not parts:
+        return ""
+    body = "\n\n".join(parts)
+    return f"OPERATOR RULES:\n{body}\n---\n\n"
 
 
 # --- Repo fingerprint -----------------------------------------------------
@@ -1069,6 +1248,15 @@ def main() -> int:
     errors: list[dict] = []
 
     for repo in repos_to_scan:
+        # Phase 9: dashboard-configured per-repo rules. Loaded once per
+        # repo per run; the same dict is reused for every PR in this
+        # repo so we don't pay a Supabase round-trip per PR.
+        repo_rules = get_repo_rules(repo)
+        if not repo_rules.get("enabled", True):
+            print(f"[{repo}] skipped (disabled via dashboard)")
+            skipped += 1
+            continue
+
         try:
             if filter_active:
                 prs = [get_pr(repo, filter_pr_number)]  # type: ignore[arg-type]
@@ -1104,9 +1292,57 @@ def main() -> int:
                 print(f"  [{tag}] fetching diff...")
                 diff = get_pr_diff(repo, num)
 
+                # Phase 9: apply path filters before doing any review work.
+                # File list comes from the diff itself rather than a separate
+                # /files API call so the filter sees exactly what the
+                # reviewer would see.
+                pr_files = _extract_files_from_diff(diff)
+                watch_paths = repo_rules.get("watch_paths") or []
+                skip_paths = repo_rules.get("skip_paths") or []
+
+                if skip_paths and pr_files and all(
+                    _path_matches_any(f, skip_paths) for f in pr_files
+                ):
+                    print(
+                        f"  [{tag}] skipped (only touches skip_paths: "
+                        f"{', '.join(pr_files[:3])}"
+                        f"{'...' if len(pr_files) > 3 else ''})"
+                    )
+                    skipped += 1
+                    continue
+
+                if watch_paths and pr_files and not any(
+                    _path_matches_any(f, watch_paths) for f in pr_files
+                ):
+                    print(f"  [{tag}] skipped (no watched paths)")
+                    skipped += 1
+                    continue
+
+                # Persist the observed directory layout so /settings can
+                # render it as a read-only tree. Cheap (one upsert) and
+                # best-effort — failures don't block the review.
+                if pr_files:
+                    upsert_repo_directory_tree(
+                        repo, _directory_tree_from_files(pr_files)
+                    )
+
+                # Inject operator rules into the prompt by prepending an
+                # OPERATOR RULES block to the diff string. Living inside
+                # the ```diff fence is intentional — that's the place
+                # in the prompt the reviewer is told to read most
+                # carefully, and the OPERATOR RULES: header + ---
+                # separator are unambiguous to the model.
+                operator_block = _build_operator_rules_block(repo_rules)
+                if operator_block:
+                    print(
+                        f"  [{tag}] applying operator rules "
+                        f"({len(operator_block)} chars)"
+                    )
+                diff_for_review = operator_block + diff
+
                 print(f"  [{tag}] running LangGraph review (reviewer → critic → router → ...)...")
                 review = run_review_graph(
-                    pr, diff, repo_fingerprint=repo_fingerprint
+                    pr, diff_for_review, repo_fingerprint=repo_fingerprint
                 )
                 # Stamp the review dict with metadata the rich formatter and
                 # the Supabase upsert both rely on. Keeping it on the dict
@@ -1117,8 +1353,12 @@ def main() -> int:
                 review["_fingerprint_status"] = fingerprint_status
                 review["_model"] = MODEL
 
-                # Decide: post comment, or auto-close
-                close_decision, gate_reason = should_auto_close(review)
+                # Decide: post comment, or auto-close. Per-repo rules
+                # (auto_close_all + threshold override) participate here;
+                # see should_auto_close docstring.
+                close_decision, gate_reason = should_auto_close(
+                    review, rules=repo_rules
+                )
 
                 action = "commented"
                 if close_decision:

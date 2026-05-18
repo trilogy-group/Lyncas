@@ -12,6 +12,8 @@ import type {
   HumanActionType,
   HumanActionWithReview,
   PromptTunerRun,
+  RepoRule,
+  RepoRulesStatus,
   RepoStat,
   Review,
   Run,
@@ -120,7 +122,10 @@ export async function getRecentReviews(
   if (typeof opts.maxSeverity === "number")
     query = query.lte("severity_score", opts.maxSeverity);
 
-  const sortBy = opts.sortBy ?? "severity_score";
+  // Default to most-recent-first because that's what reviewers naturally
+  // expect on a feed page. The /pr/[id] deep link still preserves whatever
+  // sort the user picked via the URL.
+  const sortBy = opts.sortBy ?? "created_at";
   const sortDir = opts.sortDir ?? "desc";
   query = query.order(sortBy, { ascending: sortDir === "asc" });
   if (sortBy !== "created_at") {
@@ -236,12 +241,30 @@ export async function getRepoStats(): Promise<RepoStat[]> {
     Date.now() - 30 * 86_400_000,
   ).toISOString();
 
-  const { data, error } = await supabase
-    .from("reviews")
-    .select(
-      "repo, action, severity_score, input_tokens, output_tokens, model, created_at",
-    );
-  if (error) throw error;
+  // Reviews + rules are pulled in parallel — the join is local so we
+  // never block on PostgREST's foreign-key resolver. The rules table
+  // (Phase 9) may be empty or missing rows for some repos; both cases
+  // collapse to rules_status='none' in the merge below.
+  const [reviewsRes, rulesRes] = await Promise.all([
+    supabase
+      .from("reviews")
+      .select(
+        "repo, action, severity_score, input_tokens, output_tokens, model, created_at",
+      ),
+    supabase.from("repo_rules").select("repo, enabled"),
+  ]);
+  if (reviewsRes.error) throw reviewsRes.error;
+  // Rules table might not exist yet on a fresh database; tolerate that
+  // by treating it as "no rules" rather than crashing the /repos page.
+  const rulesByRepo = new Map<string, boolean>();
+  if (!rulesRes.error) {
+    for (const r of (rulesRes.data ?? []) as {
+      repo: string;
+      enabled: boolean;
+    }[]) {
+      rulesByRepo.set(r.repo, r.enabled);
+    }
+  }
 
   type Row = {
     repo: string;
@@ -256,7 +279,7 @@ export async function getRepoStats(): Promise<RepoStat[]> {
   type Accum = RepoStat & { _sev_sum: number; _sev_n: number };
   const byRepo = new Map<string, Accum>();
 
-  for (const r of ((data ?? []) as Row[])) {
+  for (const r of ((reviewsRes.data ?? []) as Row[])) {
     let s = byRepo.get(r.repo);
     if (!s) {
       s = {
@@ -266,6 +289,7 @@ export async function getRepoStats(): Promise<RepoStat[]> {
         avg_severity: 0,
         estimated_cost_usd: 0,
         last_reviewed_at: null,
+        rules_status: "none",
         _sev_sum: 0,
         _sev_n: 0,
       };
@@ -289,16 +313,76 @@ export async function getRepoStats(): Promise<RepoStat[]> {
     }
   }
 
+  // Repos that have a rules row but no reviews yet still belong on
+  // /repos so operators can configure them ahead of the first review.
+  for (const [repo, enabled] of rulesByRepo.entries()) {
+    if (!byRepo.has(repo)) {
+      byRepo.set(repo, {
+        repo,
+        total_reviews: 0,
+        total_closed: 0,
+        avg_severity: 0,
+        estimated_cost_usd: 0,
+        last_reviewed_at: null,
+        rules_status: enabled ? "enabled" : "disabled",
+        _sev_sum: 0,
+        _sev_n: 0,
+      });
+    }
+  }
+
   return Array.from(byRepo.values())
-    .map((s) => ({
-      repo: s.repo,
-      total_reviews: s.total_reviews,
-      total_closed: s.total_closed,
-      avg_severity: s._sev_n ? s._sev_sum / s._sev_n : 0,
-      estimated_cost_usd: s.estimated_cost_usd,
-      last_reviewed_at: s.last_reviewed_at,
-    }))
+    .map((s) => {
+      const ruleEnabled = rulesByRepo.get(s.repo);
+      const rules_status: RepoRulesStatus =
+        ruleEnabled === undefined
+          ? "none"
+          : ruleEnabled
+            ? "enabled"
+            : "disabled";
+      return {
+        repo: s.repo,
+        total_reviews: s.total_reviews,
+        total_closed: s.total_closed,
+        avg_severity: s._sev_n ? s._sev_sum / s._sev_n : 0,
+        estimated_cost_usd: s.estimated_cost_usd,
+        last_reviewed_at: s.last_reviewed_at,
+        rules_status,
+      };
+    })
     .sort((a, b) => b.total_reviews - a.total_reviews);
+}
+
+// --- Phase 9: per-repo rules ---------------------------------------------
+// Read-side is used by the dashboard's /settings page and by /repos (folded
+// into getRepoStats above). Write-side is the only place the dashboard
+// mutates Supabase — see agent/migrations/009_repo_rules.sql for the
+// anon-write policy rationale.
+
+export async function getRepoRule(repo: string): Promise<RepoRule | null> {
+  const supabase = createSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("repo_rules")
+    .select("*")
+    .eq("repo", repo)
+    .maybeSingle();
+  if (error) {
+    // Tolerate the table being absent on a fresh database (PGRST205 /
+    // 42P01). The settings page will render with empty defaults and
+    // the upsert will surface a clearer error if write also fails.
+    return null;
+  }
+  return (data ?? null) as unknown as RepoRule | null;
+}
+
+export async function upsertRepoRule(
+  rule: Partial<RepoRule> & { repo: string },
+): Promise<void> {
+  const supabase = createSupabaseServerClient();
+  const { error } = await supabase
+    .from("repo_rules")
+    .upsert(rule, { onConflict: "repo" });
+  if (error) throw error;
 }
 
 // --- Phase 7: self-learning queries --------------------------------------

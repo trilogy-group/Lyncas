@@ -1,6 +1,23 @@
+"use client";
+
 import Link from "next/link";
+import { usePathname } from "next/navigation";
+
+// Hide the v1 demo navigation on:
+//   - /login / /landing — those have their own header chrome.
+//   - /dashboard/*       — the authenticated route group renders its
+//                          own AuthedNav with user info + sign-out.
+// Everything else (the demo routes /, /repos, /runs, /benchmark,
+// /settings, /learning, /pr/[id]) keeps the original Nav unchanged so
+// the existing main-branch demo behavior stays intact on this branch.
+const HIDDEN_PREFIXES = ["/login", "/landing", "/dashboard", "/auth/callback"];
 
 export function Nav() {
+  const pathname = usePathname() ?? "/";
+  if (HIDDEN_PREFIXES.some((p) => pathname === p || pathname.startsWith(p + "/"))) {
+    return null;
+  }
+
   return (
     <nav className="border-b border-border bg-card">
       <div className="max-w-6xl mx-auto px-6 h-14 flex items-center justify-between">

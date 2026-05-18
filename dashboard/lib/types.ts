@@ -104,6 +104,34 @@ export interface RepoStat {
   rules_status: RepoRulesStatus;
 }
 
+// --- v2 SaaS: auth profile + per-user watched repos ----------------------
+// Matches agent/migrations/010_saas_auth.sql. Read by /dashboard/* pages
+// only — the legacy /repos, /runs etc. demo routes never touch these.
+
+export type UserPlan = "free" | "pro" | "enterprise";
+
+export interface UserProfile {
+  id: string;
+  created_at: string;
+  email: string | null;
+  github_username: string | null;
+  display_name: string | null;
+  avatar_url: string | null;
+  plan: UserPlan;
+  repo_limit: number;
+}
+
+export interface WatchedRepo {
+  id: string;
+  created_at: string;
+  user_id: string;
+  repo: string;
+  // github_token is intentionally omitted from the type — the dashboard
+  // never reads it back to the browser. Server-side code that needs it
+  // queries Supabase directly with an explicit select('github_token').
+  enabled: boolean;
+}
+
 // --- Phase 9: per-repo rules ---------------------------------------------
 // Matches agent/migrations/009_repo_rules.sql. Written by the dashboard's
 // /repos/<owner>/<name>/settings page (anon write — see migration header),

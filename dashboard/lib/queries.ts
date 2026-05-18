@@ -19,7 +19,9 @@ import type {
   Run,
   SeverityBucket,
   SeverityBucketLabel,
+  UserProfile,
   Verdict,
+  WatchedRepo,
 } from "./types";
 
 // --- Cost pricing (shared by getStats and getRepoStats) -------------------
@@ -53,7 +55,7 @@ function rowCostUSD(
 }
 
 export async function getStats(daysWindow = 30): Promise<DashboardStats> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const since = new Date(
     Date.now() - daysWindow * 86_400_000,
   ).toISOString();
@@ -111,7 +113,7 @@ export interface RecentReviewsOptions {
 export async function getRecentReviews(
   opts: RecentReviewsOptions,
 ): Promise<{ reviews: Review[]; totalCount: number }> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   let query = supabase.from("reviews").select("*", { count: "exact" });
 
   if (opts.repo) query = query.eq("repo", opts.repo);
@@ -144,7 +146,7 @@ export async function getRecentReviews(
 }
 
 export async function getReviewById(id: string): Promise<Review | null> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const { data, error } = await supabase
     .from("reviews")
     .select("*")
@@ -155,7 +157,7 @@ export async function getReviewById(id: string): Promise<Review | null> {
 }
 
 export async function getRuns(limit = 50): Promise<Run[]> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const { data, error } = await supabase
     .from("runs")
     .select("*")
@@ -168,7 +170,7 @@ export async function getRuns(limit = 50): Promise<Run[]> {
 export async function getSeverityDistribution(
   daysWindow = 30,
 ): Promise<SeverityBucket[]> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const since = new Date(
     Date.now() - daysWindow * 86_400_000,
   ).toISOString();
@@ -200,7 +202,7 @@ export async function getSeverityDistribution(
 export async function getActivityByDay(
   daysWindow = 30,
 ): Promise<ActivityPoint[]> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const since = new Date(
     Date.now() - daysWindow * 86_400_000,
   ).toISOString();
@@ -224,7 +226,7 @@ export async function getActivityByDay(
 }
 
 export async function getAvailableRepos(): Promise<string[]> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const { data, error } = await supabase.from("reviews").select("repo");
   if (error) throw error;
   const seen = new Set<string>();
@@ -236,7 +238,7 @@ export async function getAvailableRepos(): Promise<string[]> {
 // Pricing constants live above getStats so both functions can share them.
 
 export async function getRepoStats(): Promise<RepoStat[]> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const since30d = new Date(
     Date.now() - 30 * 86_400_000,
   ).toISOString();
@@ -360,7 +362,7 @@ export async function getRepoStats(): Promise<RepoStat[]> {
 // anon-write policy rationale.
 
 export async function getRepoRule(repo: string): Promise<RepoRule | null> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const { data, error } = await supabase
     .from("repo_rules")
     .select("*")
@@ -378,7 +380,7 @@ export async function getRepoRule(repo: string): Promise<RepoRule | null> {
 export async function upsertRepoRule(
   rule: Partial<RepoRule> & { repo: string },
 ): Promise<void> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const { error } = await supabase
     .from("repo_rules")
     .upsert(rule, { onConflict: "repo" });
@@ -401,7 +403,7 @@ const FAILURE_TYPES: ReadonlySet<HumanActionType> = new Set([
 export async function getHumanAction(
   reviewId: string,
 ): Promise<HumanAction | null> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const { data, error } = await supabase
     .from("human_actions")
     .select("*")
@@ -414,7 +416,7 @@ export async function getHumanAction(
 export async function getAccuracyStats(
   daysWindow = 30,
 ): Promise<AccuracyStats> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const since = new Date(
     Date.now() - daysWindow * 86_400_000,
   ).toISOString();
@@ -443,7 +445,7 @@ export async function getAccuracyStats(
 export async function getAccuracyOverTime(
   daysWindow = 90,
 ): Promise<AccuracyTimePoint[]> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const since = new Date(
     Date.now() - daysWindow * 86_400_000,
   ).toISOString();
@@ -482,7 +484,7 @@ export async function getAccuracyOverTime(
 export async function getRecentMisses(
   limit = 50,
 ): Promise<HumanActionWithReview[]> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   // Two-step: pull misses first, then enrich with review fields. PostgREST
   // joins through RLS-enabled tables can be fiddly; explicit fetch keeps
   // the data shape obvious and the query plan trivial.
@@ -532,7 +534,7 @@ export async function getRecentMisses(
 export async function getAgentAlerts(
   onlyUnresolved = true,
 ): Promise<AgentAlert[]> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   let query = supabase
     .from("agent_alerts")
     .select("*")
@@ -550,7 +552,7 @@ export async function getAgentAlerts(
 // dashboard hitting the GitHub API.
 
 export async function getOpenPromptTunerRuns(): Promise<PromptTunerRun[]> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const { data, error } = await supabase
     .from("prompt_tuner_runs")
     .select("*")
@@ -563,7 +565,7 @@ export async function getOpenPromptTunerRuns(): Promise<PromptTunerRun[]> {
 // --- Benchmark queries ----------------------------------------------------
 
 export async function getBenchmarkRuns(): Promise<BenchmarkRun[]> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const { data, error } = await supabase
     .from("benchmark_runs")
     .select("*")
@@ -573,7 +575,7 @@ export async function getBenchmarkRuns(): Promise<BenchmarkRun[]> {
 }
 
 export async function getBenchmarkStats(): Promise<BenchmarkStats> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const { data, error } = await supabase
     .from("benchmark_runs")
     .select(
@@ -637,4 +639,60 @@ export async function getBenchmarkStats(): Promise<BenchmarkStats> {
     mean_bug_overlap_pct,
     cost_ratio,
   };
+}
+
+// --- v2 SaaS: user profile + watched repos --------------------------------
+// All three of these read auth.uid()-scoped tables (RLS-protected by
+// migration 010). They're called from /dashboard/* server components,
+// never from the legacy v1 demo routes.
+
+// Sensible defaults rendered when no profile row exists yet (rare race
+// between OAuth callback insert and the first dashboard hit, or a
+// Supabase outage that failed the upsert).
+const DEFAULT_PROFILE: Omit<UserProfile, "id" | "created_at"> = {
+  email: null,
+  github_username: null,
+  display_name: null,
+  avatar_url: null,
+  plan: "free",
+  repo_limit: 2,
+};
+
+export async function getUserProfile(
+  userId: string,
+): Promise<UserProfile | null> {
+  const supabase = await createSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("user_profiles")
+    .select("*")
+    .eq("id", userId)
+    .maybeSingle();
+  if (error) {
+    // Table missing or RLS misconfigured — render with defaults rather
+    // than 500. The connect-repo guard uses repo_limit, which falls
+    // back to the free-plan number in DEFAULT_PROFILE.
+    return null;
+  }
+  if (data) return data as unknown as UserProfile;
+  // Phantom-row fallback: the JWT is valid but the profile upsert in
+  // /auth/callback didn't land. Synthesize one in memory so the page
+  // still renders.
+  return {
+    id: userId,
+    created_at: new Date().toISOString(),
+    ...DEFAULT_PROFILE,
+  };
+}
+
+export async function getWatchedRepos(
+  userId: string,
+): Promise<WatchedRepo[]> {
+  const supabase = await createSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("watched_repos")
+    .select("id, created_at, user_id, repo, enabled")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false });
+  if (error) return [];
+  return (data ?? []) as unknown as WatchedRepo[];
 }

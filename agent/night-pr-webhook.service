@@ -1,0 +1,70 @@
+# night-pr-webhook.service
+#
+# systemd unit file for the Night PR Reviewer webhook handler. Drop it
+# into the appropriate systemd directory, reload, enable, start. The
+# unit can run either as a system service (recommended for EC2 because
+# it survives logout) or as a per-user service (no sudo needed).
+#
+# --------------------------------------------------------------------
+# System service install (recommended on EC2)
+# --------------------------------------------------------------------
+#   sudo cp agent/night-pr-webhook.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now night-pr-webhook
+#   sudo systemctl status night-pr-webhook
+#   sudo journalctl -u night-pr-webhook -f       # tail logs
+#
+# --------------------------------------------------------------------
+# User service install (no sudo)
+# --------------------------------------------------------------------
+#   mkdir -p ~/.config/systemd/user
+#   cp agent/night-pr-webhook.service ~/.config/systemd/user/
+#   # Comment out the User= line below before installing as --user.
+#   loginctl enable-linger "$USER"               # so the service survives logout
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now night-pr-webhook
+#   systemctl --user status night-pr-webhook
+#   journalctl --user -u night-pr-webhook -f
+#
+# --------------------------------------------------------------------
+# Per-host tuning
+# --------------------------------------------------------------------
+# Adjust the three absolute paths (User=, WorkingDirectory=,
+# EnvironmentFile=, ExecStart=) for your EC2 user and checkout path.
+# The defaults assume `ubuntu` is the unprivileged service user and
+# the repo lives at /home/ubuntu/trilogy/Night-PR-Reviewer-v2 — the
+# same layout agent/start_webhook.sh assumes.
+#
+# To open port 8080 to GitHub's webhook delivery range, configure your
+# EC2 security group inbound rules; this unit does not touch the
+# firewall.
+
+[Unit]
+Description=Night PR Reviewer webhook handler (EC2)
+Documentation=https://github.com/trilogy-group/Night-PR-Reviewer-v2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Comment out User= when installing as a --user service.
+User=ubuntu
+WorkingDirectory=/home/ubuntu/trilogy/Night-PR-Reviewer-v2
+# EnvironmentFile honors KEY=value lines and ignores blank lines /
+# comments — same format the start_webhook.sh `. agent/.env` path
+# expects, so a single .env serves both bring-up paths.
+EnvironmentFile=/home/ubuntu/trilogy/Night-PR-Reviewer-v2/agent/.env
+ExecStart=/usr/bin/python3 /home/ubuntu/trilogy/Night-PR-Reviewer-v2/agent/webhook_handler.py
+Restart=on-failure
+RestartSec=5
+# Send stdout/stderr to the journal so `journalctl -u night-pr-webhook`
+# is the single observability surface. webhook_handler.py emits
+# structured [webhook] lines that grep well.
+StandardOutput=journal
+StandardError=journal
+# Give the handler room to spawn a long-lived child reviewer process
+# without hitting the default per-service pid cap on small instances.
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

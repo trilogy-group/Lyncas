@@ -165,8 +165,13 @@ else:
     )
 
 
-def insert_run() -> str | None:
-    """Insert a fresh row into `runs` and return its id (None on failure)."""
+def insert_run(repos_scanned: list[str] | None = None) -> str | None:
+    """Insert a fresh row into `runs` and return its id (None on failure).
+
+    `repos_scanned` defaults to the module-level REPOS list. The webhook
+    path (PR_FILTER_REPO/NUMBER set) passes the single-element list it's
+    actually scanning so the dashboard's run history reflects what the
+    run did, not what the env would have allowed."""
     if supabase is None:
         return None
     try:
@@ -175,7 +180,7 @@ def insert_run() -> str | None:
             .insert(
                 {
                     "trigger_source": os.environ.get("GITHUB_EVENT_NAME", "unknown"),
-                    "repos_scanned": REPOS,
+                    "repos_scanned": repos_scanned if repos_scanned is not None else REPOS,
                 }
             )
             .execute()
@@ -269,6 +274,23 @@ def list_open_prs(repo: str) -> list[dict]:
     )
     r.raise_for_status()
     return [pr for pr in r.json() if not pr.get("draft")]
+
+
+def get_pr(repo: str, pr_number: int) -> dict:
+    """Fetch a single PR by number. Used by the webhook-triggered path
+    (agent/webhook_handler.py) when PR_FILTER_REPO + PR_FILTER_NUMBER
+    scope this invocation to one specific PR — we don't need the full
+    open-PR list, and the targeted PR may not even be in it (drafts,
+    just-closed, etc.). Drafts are NOT filtered here; the cron path's
+    draft filter is in list_open_prs(), but if a webhook explicitly
+    asks us to review a draft we honor that."""
+    r = requests.get(
+        f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}",
+        headers=GH_HEADERS,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
 
 
 def already_reviewed(repo: str, pr_number: int) -> bool:
@@ -1003,15 +1025,55 @@ def format_review_comment(review: dict) -> str:
 
 def main() -> int:
     print(f"[startup] Using model: {MODEL}")
-    run_id = insert_run()
+
+    # Webhook-triggered runs (agent/webhook_handler.py) set PR_FILTER_REPO
+    # + PR_FILTER_NUMBER to scope this invocation to a single PR. The cron
+    # path leaves both unset and continues to scan every repo in REPOS.
+    # Both must be set for the filter to take effect — a half-configured
+    # filter falls back to a full scan with a warning so we never silently
+    # mis-interpret operator intent.
+    filter_repo = os.environ.get("PR_FILTER_REPO") or None
+    filter_pr_raw = os.environ.get("PR_FILTER_NUMBER")
+    filter_pr_number: int | None = None
+    if filter_repo and filter_pr_raw:
+        try:
+            filter_pr_number = int(filter_pr_raw)
+        except ValueError:
+            print(
+                f"[startup] PR_FILTER_NUMBER={filter_pr_raw!r} is not an int; "
+                "ignoring filter and scanning all repos",
+                file=sys.stderr,
+            )
+            filter_repo = None
+    elif filter_repo or filter_pr_raw:
+        print(
+            f"[startup] PR_FILTER_REPO={filter_repo!r} / "
+            f"PR_FILTER_NUMBER={filter_pr_raw!r} is half-set; "
+            "ignoring filter and scanning all repos",
+            file=sys.stderr,
+        )
+        filter_repo = None
+
+    filter_active = bool(filter_repo and filter_pr_number is not None)
+    repos_to_scan = [filter_repo] if filter_active else REPOS  # type: ignore[list-item]
+    if filter_active:
+        print(
+            f"[startup] filter active: reviewing only "
+            f"{filter_repo}#{filter_pr_number}"
+        )
+
+    run_id = insert_run(repos_to_scan)
     reviewed_count = 0          # PRs the agent acted on via GitHub this run
     reviews_created = 0         # rows successfully written to `reviews` table
     skipped = 0
     errors: list[dict] = []
 
-    for repo in REPOS:
+    for repo in repos_to_scan:
         try:
-            prs = list_open_prs(repo)
+            if filter_active:
+                prs = [get_pr(repo, filter_pr_number)]  # type: ignore[arg-type]
+            else:
+                prs = list_open_prs(repo)
         except Exception as e:
             print(f"[ERROR] Could not list PRs for {repo}: {e}", file=sys.stderr)
             errors.append({"repo": repo, "error": str(e)})

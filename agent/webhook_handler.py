@@ -72,6 +72,7 @@ REVIEWABLE_ACTIONS = {"opened", "synchronize"}
 AGENT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = AGENT_DIR.parent
 PR_REVIEWER_SCRIPT = AGENT_DIR / "pr_reviewer.py"
+VENV_PYTHON = AGENT_DIR / ".venv" / "bin" / "python"
 
 
 # --- HMAC verification ----------------------------------------------------
@@ -122,7 +123,7 @@ def dispatch_review(repo: str, pr_number: int) -> int:
     # reads this var when inserting the run row.
     env["GITHUB_EVENT_NAME"] = "webhook"
     proc = subprocess.Popen(
-        [sys.executable, str(PR_REVIEWER_SCRIPT)],
+        [str(VENV_PYTHON), str(PR_REVIEWER_SCRIPT)],
         cwd=str(REPO_ROOT),
         env=env,
         stdout=sys.stdout,

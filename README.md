@@ -5,6 +5,8 @@ and emails a daily digest. Includes a Next.js dashboard for visualization.
 
 ## v2 features
 
+
+
 - Supabase-backed state for reviews, runs, and digests
 - Next.js dashboard with stats, filters, charts, and per-PR detail views
 - Sonnet-vs-Opus benchmark page (`/benchmark`) — re-runs the same prompt on real PR diffs through both models and shows agreement, severity delta, bug overlap, and cost ratio with a methodology blurb and a data-driven conclusion

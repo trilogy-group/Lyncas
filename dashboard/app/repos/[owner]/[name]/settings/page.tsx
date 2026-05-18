@@ -1,10 +1,9 @@
 "use client";
 
 // Per-repo configuration page. The only 'use client' page in the
-// dashboard — everything else is a server component. We need client
-// because: file upload (FileReader), local form state, optimistic
-// save toasts, and direct Supabase writes from the browser through
-// the anon key (RLS policy in 009_repo_rules.sql allows anon write).
+// dashboard — file upload, local form state, and direct Supabase
+// upserts via the browser anon key (RLS policy in 009_repo_rules.sql
+// allows anon write).
 //
 // Route is /repos/<owner>/<name>/settings. Two dynamic segments rather
 // than a catch-all because Next requires catch-alls to be the last
@@ -43,13 +42,15 @@ const DEFAULT_FORM: FormState = {
   rules_file_name: null,
 };
 
-const LABEL = "block text-xs font-mono uppercase tracking-wide text-muted mb-2";
+// One typographic family for the whole page (default sans). The label
+// styles below intentionally avoid the all-caps font-mono used on
+// table headers — that style fights the form inputs. Hints are a
+// small muted line in the same family.
+const LABEL = "block text-sm font-medium text-text mb-1.5";
+const SUBLABEL = "text-xs text-muted leading-relaxed";
 const INPUT =
-  "w-full bg-card border border-border rounded px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent";
+  "w-full bg-card border border-border rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent transition-colors";
 const TEXTAREA = `${INPUT} font-mono text-xs leading-relaxed`;
-const HINT = "text-xs text-muted mt-1 font-serif italic";
-const SECTION = "space-y-4";
-const SECTION_TITLE = "text-base font-semibold border-b border-border pb-2";
 
 function arrayToLines(arr: string[] | null | undefined): string {
   return (arr ?? []).join("\n");
@@ -60,6 +61,71 @@ function linesToArray(text: string): string[] {
     .split("\n")
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
+}
+
+// Section wrapper — single source of truth for spacing + card chrome.
+// Title is a clear sans-serif heading; the optional `description` slot
+// holds at most one short line. Anything longer goes inline next to
+// the field it describes.
+function Section({
+  title,
+  description,
+  children,
+}: {
+  title: string;
+  description?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <Card className="p-6 space-y-5">
+      <div>
+        <h2 className="text-base font-semibold text-text">{title}</h2>
+        {description && (
+          <p className="text-xs text-muted mt-1">{description}</p>
+        )}
+      </div>
+      {children}
+    </Card>
+  );
+}
+
+// Inline toggle row used for the two boolean settings. Reads
+// left-to-right like a sentence; checkbox stays on the left so the
+// click target is wide and obvious.
+function ToggleRow({
+  checked,
+  onChange,
+  label,
+  hint,
+  tone = "default",
+}: {
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  label: string;
+  hint: string;
+  tone?: "default" | "danger";
+}) {
+  return (
+    <label className="flex items-start gap-3 cursor-pointer group">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="mt-0.5 h-4 w-4 accent-accent cursor-pointer"
+      />
+      <div className="flex-1 min-w-0">
+        <div
+          className="text-sm font-medium text-text"
+          style={
+            tone === "danger" && checked ? { color: "#dc2626" } : undefined
+          }
+        >
+          {label}
+        </div>
+        <div className={`${SUBLABEL} mt-0.5`}>{hint}</div>
+      </div>
+    </label>
+  );
 }
 
 export default function RepoSettingsPage({ params }: PageProps) {
@@ -105,7 +171,7 @@ export default function RepoSettingsPage({ params }: PageProps) {
             skip_paths: arrayToLines(r.skip_paths),
             custom_instructions: r.custom_instructions ?? "",
             rules_file_content: r.rules_file_content ?? "",
-            rules_file_name: r.rules_file_content ? "(saved)" : null,
+            rules_file_name: r.rules_file_content ? "saved file" : null,
           });
           setDirectoryTree(r.repo_directory_tree ?? null);
         }
@@ -134,7 +200,7 @@ export default function RepoSettingsPage({ params }: PageProps) {
     if (file.size > 200_000) {
       setToast({
         kind: "error",
-        message: `File ${file.name} is too large (${file.size} bytes; max 200KB).`,
+        message: `${file.name} is too large (${file.size} bytes; max 200KB).`,
       });
       return;
     }
@@ -151,7 +217,6 @@ export default function RepoSettingsPage({ params }: PageProps) {
         message: `Could not read file: ${(err as Error).message}`,
       });
     } finally {
-      // Reset the input so re-selecting the same file fires onChange.
       e.target.value = "";
     }
   }
@@ -166,7 +231,7 @@ export default function RepoSettingsPage({ params }: PageProps) {
         if (!Number.isInteger(n) || n < 1 || n > 10) {
           setToast({
             kind: "error",
-            message: "Severity threshold must be an integer 1-10.",
+            message: "Threshold must be an integer 1–10.",
           });
           setSaving(false);
           return;
@@ -198,7 +263,7 @@ export default function RepoSettingsPage({ params }: PageProps) {
         );
 
       if (error) throw error;
-      setToast({ kind: "success", message: "Saved." });
+      setToast({ kind: "success", message: "Saved" });
     } catch (err) {
       setToast({
         kind: "error",
@@ -211,291 +276,272 @@ export default function RepoSettingsPage({ params }: PageProps) {
 
   if (loading) {
     return (
-      <main className="max-w-3xl mx-auto px-6 py-8">
-        <Card className="p-8 text-center text-muted text-sm">Loading…</Card>
+      <main className="max-w-3xl mx-auto px-6 py-10">
+        <Card className="p-10 text-center text-muted text-sm">Loading…</Card>
       </main>
     );
   }
 
+  // Status pill in the header reflects the live form state, not the
+  // saved state — operators get immediate visual feedback when they
+  // flip the "Enable reviews" toggle.
+  const statusPill = form.enabled
+    ? { bg: "#dcfce7", color: "#15803d", label: "Active" }
+    : { bg: "#fee2e2", color: "#b91c1c", label: "Paused" };
+
   return (
-    <main className="max-w-3xl mx-auto px-6 py-8 space-y-8">
-      <section className="space-y-2">
-        <div className="text-xs font-mono text-muted">
+    <main className="max-w-3xl mx-auto px-6 py-8 pb-24">
+      {/* Header */}
+      <div className="mb-6 space-y-3">
+        <Link
+          href="/repos"
+          className="text-xs text-muted hover:text-text inline-flex items-center gap-1"
+        >
+          ← All repos
+        </Link>
+        <div className="flex items-center justify-between gap-4 flex-wrap">
+          <div className="min-w-0">
+            <h1 className="text-xl font-semibold text-text font-mono truncate">
+              {repo}
+            </h1>
+            <p className="text-xs text-muted mt-1">
+              Per-repo rules · read by the agent before each review.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <span
+              className="px-2 py-0.5 rounded-full text-xs font-medium"
+              style={{
+                backgroundColor: statusPill.bg,
+                color: statusPill.color,
+              }}
+            >
+              {statusPill.label}
+            </span>
+            <a
+              href={`https://github.com/${repo}`}
+              target="_blank"
+              rel="noreferrer"
+              title="Open on GitHub"
+              aria-label={`Open ${repo} on GitHub`}
+              className="text-xs text-muted hover:text-text border border-border rounded-md px-2 py-1"
+            >
+              GitHub ↗
+            </a>
+          </div>
+        </div>
+      </div>
+
+      <div className="space-y-5">
+        {/* Section 1 — Agent behavior */}
+        <Section title="Agent behavior">
+          <ToggleRow
+            checked={form.enabled}
+            onChange={(v) => setForm((f) => ({ ...f, enabled: v }))}
+            label="Enable reviews"
+            hint="When off, the agent skips this repo on every run."
+          />
+          <ToggleRow
+            checked={form.auto_close_all}
+            onChange={(v) => setForm((f) => ({ ...f, auto_close_all: v }))}
+            label="Auto-close all PRs"
+            hint="Bypasses the severity gate. Use only on repos you want to drain."
+            tone="danger"
+          />
+
+          {form.auto_close_all && (
+            <div
+              className="text-xs rounded-md px-3 py-2 border"
+              style={{
+                color: "#991b1b",
+                backgroundColor: "#fef2f2",
+                borderColor: "#fecaca",
+              }}
+              role="alert"
+            >
+              This will close every PR including good ones. Use with caution.
+            </div>
+          )}
+
+          <div className="pt-1">
+            <label className={LABEL} htmlFor="threshold">
+              Auto-close severity threshold
+            </label>
+            <div className="flex items-center gap-3">
+              <input
+                id="threshold"
+                type="number"
+                min={1}
+                max={10}
+                placeholder="9"
+                value={form.auto_close_severity_threshold}
+                onChange={(e) =>
+                  setForm((f) => ({
+                    ...f,
+                    auto_close_severity_threshold: e.target.value,
+                  }))
+                }
+                className={`${INPUT} w-24 text-center`}
+              />
+              <p className={SUBLABEL}>
+                Severity ≥ this triggers auto-close. Blank = global default (9).
+              </p>
+            </div>
+          </div>
+        </Section>
+
+        {/* Section 2 — Path filters */}
+        <Section
+          title="Path filters"
+          description="Scope reviews by file path. Both lists accept one entry per line."
+        >
+          <div>
+            <label className={LABEL} htmlFor="watch_paths">
+              Watch paths
+            </label>
+            <textarea
+              id="watch_paths"
+              rows={3}
+              value={form.watch_paths}
+              onChange={(e) =>
+                setForm((f) => ({ ...f, watch_paths: e.target.value }))
+              }
+              className={TEXTAREA}
+              placeholder="src/&#10;api/"
+            />
+            <p className={`${SUBLABEL} mt-1.5`}>
+              Empty reviews everything. Otherwise only PRs touching these
+              paths are reviewed.
+            </p>
+          </div>
+
+          <div>
+            <label className={LABEL} htmlFor="skip_paths">
+              Skip paths
+            </label>
+            <textarea
+              id="skip_paths"
+              rows={3}
+              value={form.skip_paths}
+              onChange={(e) =>
+                setForm((f) => ({ ...f, skip_paths: e.target.value }))
+              }
+              className={TEXTAREA}
+              placeholder="README.md&#10;docs/"
+            />
+            <p className={`${SUBLABEL} mt-1.5`}>
+              PRs touching only these paths are auto-approved without review.
+            </p>
+          </div>
+        </Section>
+
+        {/* Section 3 — Custom instructions */}
+        <Section
+          title="Custom instructions"
+          description="Free-form rules appended to the reviewer prompt for this repo."
+        >
+          <div>
+            <textarea
+              rows={5}
+              value={form.custom_instructions}
+              onChange={(e) =>
+                setForm((f) => ({
+                  ...f,
+                  custom_instructions: e.target.value,
+                }))
+              }
+              className={TEXTAREA}
+              placeholder="e.g. Flag any PR that modifies authentication logic with severity 9 or higher."
+            />
+          </div>
+
+          <div className="pt-1">
+            <label className={LABEL}>Rules file</label>
+            <div className="flex items-center gap-3 flex-wrap">
+              <label className="inline-flex items-center gap-2 px-3 py-1.5 border border-border rounded-md cursor-pointer hover:bg-bg text-sm transition-colors">
+                <input
+                  type="file"
+                  accept=".txt,.md,text/plain,text/markdown"
+                  onChange={handleFileUpload}
+                  className="hidden"
+                />
+                Choose file
+              </label>
+              {form.rules_file_name && (
+                <div className="flex items-center gap-2 text-xs text-muted">
+                  <span
+                    className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full"
+                    style={{
+                      backgroundColor: "#dcfce7",
+                      color: "#15803d",
+                    }}
+                  >
+                    <span className="font-mono">{form.rules_file_name}</span>
+                    <span>· {form.rules_file_content.length} chars</span>
+                  </span>
+                  <button
+                    type="button"
+                    className="text-muted hover:text-text underline"
+                    onClick={() =>
+                      setForm((f) => ({
+                        ...f,
+                        rules_file_content: "",
+                        rules_file_name: null,
+                      }))
+                    }
+                  >
+                    remove
+                  </button>
+                </div>
+              )}
+            </div>
+            <p className={`${SUBLABEL} mt-1.5`}>
+              Appended to the instructions above. .txt or .md, up to 200KB.
+            </p>
+          </div>
+        </Section>
+
+        {/* Section 4 — Repository structure */}
+        <Section
+          title="Repository structure"
+          description="Read-only · populated by the agent from recent PR diffs."
+        >
+          {directoryTree ? (
+            <pre className="font-mono text-xs leading-relaxed text-muted whitespace-pre-wrap overflow-x-auto bg-bg border border-border rounded-md p-3 max-h-64 overflow-y-auto">
+              {directoryTree}
+            </pre>
+          ) : (
+            <div className="text-sm text-muted bg-bg border border-border rounded-md p-3">
+              Appears after the next agent run.
+            </div>
+          )}
+        </Section>
+      </div>
+
+      {/* Sticky save bar */}
+      <div className="fixed bottom-0 left-0 right-0 bg-card/95 backdrop-blur border-t border-border">
+        <div className="max-w-3xl mx-auto px-6 py-3 flex items-center justify-between gap-4">
           <Link
             href={`/?repo=${encodeURIComponent(repo)}`}
-            className="hover:text-text"
+            className="text-xs text-muted hover:text-text"
           >
             ← Back to reviews
           </Link>
-          {" · "}
-          <Link href="/repos" className="hover:text-text">
-            All repos
-          </Link>
-        </div>
-        <div className="flex items-center gap-2">
-          <h1 className="text-xl font-semibold font-mono">{repo}</h1>
-          <a
-            href={`https://github.com/${repo}`}
-            target="_blank"
-            rel="noreferrer"
-            title="Open on GitHub"
-            className="text-muted hover:text-text"
-            aria-label={`Open ${repo} on GitHub`}
+          <button
+            type="button"
+            disabled={saving}
+            onClick={handleSave}
+            className="px-4 py-2 rounded-md text-sm font-medium text-white disabled:opacity-50 transition-opacity"
+            style={{ backgroundColor: "#4338ca" }}
           >
-            ↗
-          </a>
-          <span className="text-muted">/</span>
-          <span className="text-muted font-mono text-sm">Settings</span>
+            {saving ? "Saving…" : "Save changes"}
+          </button>
         </div>
-        <p className="text-sm text-muted italic font-serif">
-          Per-repo rules — read by the agent before each review.
-        </p>
-      </section>
-
-      {/* Section 1 — Agent behavior */}
-      <section className={SECTION}>
-        <h2 className={SECTION_TITLE}>Agent behavior</h2>
-
-        <label className="flex items-start gap-3 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={form.enabled}
-            onChange={(e) =>
-              setForm((f) => ({ ...f, enabled: e.target.checked }))
-            }
-            className="mt-1"
-          />
-          <span>
-            <span className="font-medium">Enable reviews for this repo</span>
-            <span className={HINT.replace("mt-1 ", "ml-0 block ")}>
-              When off, the agent skips this repo on every run (cron and
-              webhook). Existing reviews stay visible in the dashboard.
-            </span>
-          </span>
-        </label>
-
-        <label className="flex items-start gap-3 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={form.auto_close_all}
-            onChange={(e) =>
-              setForm((f) => ({ ...f, auto_close_all: e.target.checked }))
-            }
-            className="mt-1"
-          />
-          <span>
-            <span className="font-medium">
-              Auto-close ALL PRs regardless of severity
-            </span>
-            <span className={HINT.replace("mt-1 ", "ml-0 block ")}>
-              Overrides the global three-gate check. Use only on moribund
-              repos you want to drain.
-            </span>
-          </span>
-        </label>
-
-        {form.auto_close_all && (
-          <Card
-            className="p-3 border-2 text-sm"
-            style={{ borderColor: "#dc2626", backgroundColor: "#fef2f2" }}
-          >
-            <span style={{ color: "#dc2626", fontWeight: 600 }}>⚠ Warning:</span>{" "}
-            This will close every PR including good ones. Use with caution.
-          </Card>
-        )}
-
-        <div>
-          <label className={LABEL} htmlFor="threshold">
-            Auto-close severity threshold (1-10)
-          </label>
-          <input
-            id="threshold"
-            type="number"
-            min={1}
-            max={10}
-            placeholder="9 (default)"
-            value={form.auto_close_severity_threshold}
-            onChange={(e) =>
-              setForm((f) => ({
-                ...f,
-                auto_close_severity_threshold: e.target.value,
-              }))
-            }
-            className={`${INPUT} w-32`}
-          />
-          <p className={HINT}>
-            Severity ≥ this number triggers auto-close (still requires
-            verdict=request_changes and confidence=high). Leave blank to
-            inherit the global default of 9.
-          </p>
-        </div>
-      </section>
-
-      {/* Section 2 — Path filters */}
-      <section className={SECTION}>
-        <h2 className={SECTION_TITLE}>Path filters</h2>
-
-        <div>
-          <label className={LABEL} htmlFor="watch_paths">
-            Watch paths (one per line)
-          </label>
-          <textarea
-            id="watch_paths"
-            rows={4}
-            value={form.watch_paths}
-            onChange={(e) =>
-              setForm((f) => ({ ...f, watch_paths: e.target.value }))
-            }
-            className={TEXTAREA}
-            placeholder={"src/\napi/"}
-          />
-          <p className={HINT}>
-            Leave empty to review all PRs. Example:{" "}
-            <code className="font-mono">src/ api/</code> to only review PRs
-            touching those directories.
-          </p>
-        </div>
-
-        <div>
-          <label className={LABEL} htmlFor="skip_paths">
-            Skip paths (one per line)
-          </label>
-          <textarea
-            id="skip_paths"
-            rows={4}
-            value={form.skip_paths}
-            onChange={(e) =>
-              setForm((f) => ({ ...f, skip_paths: e.target.value }))
-            }
-            className={TEXTAREA}
-            placeholder={"README.md\ndocs/"}
-          />
-          <p className={HINT}>
-            PRs touching ONLY these paths are auto-approved without review.
-            Example: <code className="font-mono">README.md docs/</code>.
-          </p>
-        </div>
-      </section>
-
-      {/* Section 3 — Custom instructions */}
-      <section className={SECTION}>
-        <h2 className={SECTION_TITLE}>Custom instructions</h2>
-
-        <div>
-          <label className={LABEL} htmlFor="custom_instructions">
-            Custom instructions for the agent
-          </label>
-          <textarea
-            id="custom_instructions"
-            rows={6}
-            value={form.custom_instructions}
-            onChange={(e) =>
-              setForm((f) => ({
-                ...f,
-                custom_instructions: e.target.value,
-              }))
-            }
-            className={TEXTAREA}
-            placeholder={
-              "e.g. Auto-close any PR that adds console.log statements. " +
-              "Flag all PRs that modify authentication logic with severity " +
-              "9 or higher."
-            }
-          />
-          <p className={HINT}>
-            Injected into the reviewer prompt with an{" "}
-            <code className="font-mono">OPERATOR RULES:</code> header before
-            the diff. Plain natural language.
-          </p>
-        </div>
-
-        <div>
-          <label className={LABEL}>Upload rules file (.txt or .md)</label>
-          <div className="flex items-center gap-3">
-            <label
-              className="inline-flex items-center gap-2 px-3 py-1.5 border border-border rounded cursor-pointer hover:bg-bg text-sm"
-            >
-              <input
-                type="file"
-                accept=".txt,.md,text/plain,text/markdown"
-                onChange={handleFileUpload}
-                className="hidden"
-              />
-              Choose file…
-            </label>
-            {form.rules_file_name && (
-              <span className="text-xs font-mono text-muted">
-                <code>{form.rules_file_name}</code>{" "}
-                <span
-                  style={{
-                    color: "#16a34a",
-                    fontWeight: 600,
-                  }}
-                >
-                  uploaded
-                </span>{" "}
-                ({form.rules_file_content.length} chars)
-                <button
-                  type="button"
-                  className="ml-2 text-muted hover:text-text underline"
-                  onClick={() =>
-                    setForm((f) => ({
-                      ...f,
-                      rules_file_content: "",
-                      rules_file_name: null,
-                    }))
-                  }
-                >
-                  remove
-                </button>
-              </span>
-            )}
-          </div>
-          <p className={HINT}>
-            Appended to the custom instructions above when both are set.
-            Max 200KB.
-          </p>
-        </div>
-      </section>
-
-      {/* Section 4 — Repository structure */}
-      <section className={SECTION}>
-        <h2 className={SECTION_TITLE}>Repository structure</h2>
-        {directoryTree ? (
-          <Card className="p-4">
-            <pre className="font-mono text-xs leading-relaxed text-muted whitespace-pre-wrap overflow-x-auto">
-              {directoryTree}
-            </pre>
-          </Card>
-        ) : (
-          <Card className="p-4 text-sm text-muted italic font-serif">
-            Directory structure will appear after the next agent run.
-          </Card>
-        )}
-      </section>
-
-      {/* Save bar */}
-      <section className="flex items-center justify-between sticky bottom-0 bg-bg border-t border-border py-4">
-        <div className="text-xs font-mono text-muted">
-          {saving ? "Saving…" : "Changes save only when you click Save."}
-        </div>
-        <button
-          type="button"
-          disabled={saving}
-          onClick={handleSave}
-          className="px-4 py-2 rounded font-medium text-sm disabled:opacity-50"
-          style={{
-            backgroundColor: "#4338ca",
-            color: "white",
-          }}
-        >
-          {saving ? "Saving…" : "Save"}
-        </button>
-      </section>
+      </div>
 
       {toast && (
         <div
-          className="fixed bottom-6 right-6 px-4 py-2 rounded shadow-lg text-sm font-mono"
+          className="fixed bottom-20 right-6 px-4 py-2 rounded-md shadow-lg text-sm font-medium"
           style={{
             backgroundColor: toast.kind === "success" ? "#16a34a" : "#dc2626",
             color: "white",

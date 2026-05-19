@@ -26,10 +26,11 @@ const LINKS: ReadonlyArray<{ href: string; label: string }> = [
   { href: "/dashboard/overview", label: "overview" },
   { href: "/dashboard/chat", label: "chat" },
   { href: "/dashboard/repos", label: "repos" },
+  { href: "/dashboard/settings", label: "settings" },
   // Cross-link to the public demo pages — same data, no scoping yet
   // (see /dashboard/overview header for the explanation). Keeps the
-  // existing /runs, /benchmark, /learning, /settings reachable from
-  // inside the authed shell without us cloning them.
+  // existing /runs, /benchmark, /learning reachable from inside the
+  // authed shell without us cloning them.
   { href: "/runs", label: "runs" },
   { href: "/learning", label: "learning" },
   { href: "/benchmark", label: "benchmark" },

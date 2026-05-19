@@ -68,25 +68,126 @@ if SUPABASE_URL and SUPABASE_SERVICE_KEY:
         print(f"[ERROR] Failed to initialize Supabase client: {e}", file=sys.stderr)
 
 
-def collect_undigested_reviews() -> list[dict] | None:
+def collect_undigested_reviews(user_id: str | None = None) -> list[dict] | None:
     """Return all `reviews` rows where digested_at IS NULL, ordered by
     severity_score desc so the worst PRs naturally end up at the top of the
     email. Returns None on query failure so the caller can distinguish
-    "DB down" from "zero undigested rows"."""
+    "DB down" from "zero undigested rows".
+
+    When `user_id` is provided, only that user's reviews are returned —
+    the multi-tenant SaaS path uses this to fan out one digest per user.
+    Legacy single-tenant callers pass None and get every undigested row
+    (including SaaS rows that may also be digested separately later)."""
     if supabase is None:
         return None
     try:
-        resp = (
+        q = (
             supabase.table("reviews")
             .select("*")
             .is_("digested_at", "null")
-            .order("severity_score", desc=True)
-            .execute()
         )
+        if user_id:
+            q = q.eq("user_id", user_id)
+        resp = q.order("severity_score", desc=True).execute()
         return resp.data or []
     except Exception as e:
         print(f"[ERROR] Could not query undigested reviews: {e}", file=sys.stderr)
         return None
+
+
+# --- Multi-tenant recipients --------------------------------------------
+# Each digest run fans out: one email per (user_id, email) pair from
+# watched_repos joined with auth.users / user_profiles. The legacy
+# DIGEST_RECIPIENT env var still works as a fallback (returned as a single
+# {user_id: None, email: <env>} entry) so existing single-tenant deploys
+# don't need new config.
+
+def _get_user_email(user_id: str) -> str | None:
+    """Best effort lookup of a user's preferred digest email.
+
+    Resolution order:
+      1. user_profiles.digest_email — only when digest_email_verified is
+         true (otherwise we don't trust the address).
+      2. auth.users.email — the address the user signed in with. Fetched
+         via Supabase's admin auth API (service-role required, which the
+         agent already has).
+    Returns None if neither yields a usable address (the digest for that
+    user is then skipped with a logged WARN — better than silently emailing
+    the wrong inbox)."""
+    if supabase is None:
+        return None
+
+    try:
+        prof_resp = (
+            supabase.table("user_profiles")
+            .select("digest_email, digest_email_verified")
+            .eq("id", user_id)
+            .maybe_single()
+            .execute()
+        )
+        prof = getattr(prof_resp, "data", None) or {}
+    except Exception:
+        prof = {}
+
+    if prof.get("digest_email") and prof.get("digest_email_verified"):
+        return str(prof["digest_email"]).strip() or None
+
+    try:
+        user_resp = supabase.auth.admin.get_user_by_id(user_id)
+        user = getattr(user_resp, "user", None) or getattr(user_resp, "data", None)
+        if user is None:
+            return None
+        email = getattr(user, "email", None) or (
+            isinstance(user, dict) and user.get("email")
+        )
+        if email:
+            return str(email).strip()
+    except Exception as e:
+        print(
+            f"[WARN] could not look up auth.users email for {user_id}: {e}",
+            file=sys.stderr,
+        )
+    return None
+
+
+def get_digest_recipients() -> list[dict]:
+    """Return [{user_id, email}, ...] — one entry per user with at least
+    one enabled watched_repos row. Empty list when no SaaS users exist
+    yet; the caller falls back to the legacy DIGEST_RECIPIENT path."""
+    if supabase is None:
+        return []
+    try:
+        resp = (
+            supabase.table("watched_repos")
+            .select("user_id")
+            .eq("enabled", True)
+            .execute()
+        )
+    except Exception as e:
+        print(
+            f"[WARN] could not query watched_repos for digest recipients: {e}",
+            file=sys.stderr,
+        )
+        return []
+    rows = resp.data or []
+    seen: set[str] = set()
+    out: list[dict] = []
+    for r in rows:
+        uid = r.get("user_id")
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
+        email = _get_user_email(uid)
+        if not email:
+            print(
+                f"[WARN] skipping digest for user_id={uid} — no email on "
+                f"file (set digest_email in /dashboard/settings or sign "
+                f"in with an email-bearing provider)",
+                file=sys.stderr,
+            )
+            continue
+        out.append({"user_id": uid, "email": email})
+    return out
 
 
 def record_digest_sent(
@@ -667,10 +768,15 @@ def build_digest(reviews: list[dict]) -> tuple[str, str, str]:
     return subject, text_body, html_body
 
 
-def send_email(subject: str, text_body: str, html_body: str) -> None:
+def send_email(
+    subject: str, text_body: str, html_body: str, to: str | None = None
+) -> None:
+    """Send the digest. `to` overrides the env-default RECIPIENT — the
+    multi-tenant fan-out passes the per-user address here, single-tenant
+    callers omit it."""
     msg = EmailMessage()
     msg["From"] = GMAIL_USER
-    msg["To"] = RECIPIENT
+    msg["To"] = to or RECIPIENT
     msg["Subject"] = subject
     msg.set_content(text_body)
     msg.add_alternative(html_body, subtype="html")
@@ -678,6 +784,49 @@ def send_email(subject: str, text_body: str, html_body: str) -> None:
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
         s.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         s.send_message(msg)
+
+
+def _send_one_digest(
+    *,
+    user_id: str | None,
+    recipient_email: str,
+    is_daily: bool,
+) -> tuple[bool, int]:
+    """Build and send a digest for one recipient. Returns (sent, n_reviews).
+    `sent=False` means we deliberately skipped (empty + non-daily); errors
+    bubble up so main() can return non-zero for CI visibility."""
+    undigested = collect_undigested_reviews(user_id=user_id)
+    if undigested is None:
+        # Distinct from empty: a hard query failure. Don't send a partial
+        # / fabricated digest.
+        raise RuntimeError("undigested-query-failed")
+
+    if not undigested and not is_daily:
+        scope = f"user_id={user_id}" if user_id else "global"
+        print(f"no new reviews since last digest ({scope}), skipping email")
+        return False, 0
+
+    review_ids = [r["id"] for r in undigested]
+    closed_count = sum(1 for r in undigested if r.get("action") == "closed")
+    review_dicts = [_adapt_review(r) for r in undigested]
+
+    subject, text_body, html_body = build_digest(review_dicts)
+    print(f"[{recipient_email}] Subject: {subject}")
+    send_email(subject, text_body, html_body, to=recipient_email)
+    print(f"✅ Sent digest to {recipient_email} ({len(undigested)} reviews)")
+
+    # Order matters: record the digest first, then mark its reviews. If the
+    # update fails, the digests row still exists for manual reconciliation;
+    # the reverse order would leave reviews silently digested with no record.
+    if review_ids:
+        record_digest_sent(
+            review_ids=review_ids,
+            review_count=len(undigested),
+            closed_count=closed_count,
+            subject=subject,
+        )
+        mark_reviews_digested(review_ids)
+    return True, len(undigested)
 
 
 def main() -> int:
@@ -689,62 +838,51 @@ def main() -> int:
         )
         return 1
 
-    undigested = collect_undigested_reviews()
-    if undigested is None:
-        print(
-            "[ERROR] Could not fetch undigested reviews from Supabase; "
-            "refusing to send a partial digest",
-            file=sys.stderr,
-        )
-        return 1
-
     is_daily = os.environ.get("GITHUB_EVENT_SCHEDULE") == DAILY_SCHEDULE
+    recipients = get_digest_recipients()
 
-    if not undigested and not is_daily:
-        print("no new reviews since last digest, skipping email")
-        return 0
+    # Backward-compat path: no SaaS users yet → send one combined digest
+    # to the env-configured RECIPIENT, exactly as v1 did. The legacy
+    # collect_undigested_reviews() (no user_id filter) picks up
+    # *everything* including v1 rows whose user_id is NULL.
+    if not recipients:
+        try:
+            sent, _ = _send_one_digest(
+                user_id=None,
+                recipient_email=RECIPIENT,
+                is_daily=is_daily,
+            )
+        except RuntimeError as e:
+            print(f"[ERROR] {e}; refusing to send a partial digest", file=sys.stderr)
+            return 1
+        except Exception as e:
+            print(
+                f"[ERROR] Could not send digest: {e} — reviews left "
+                "undigested; next run will re-send",
+                file=sys.stderr,
+            )
+            return 1
+        return 0 if sent or not is_daily else 0
 
-    review_ids = [r["id"] for r in undigested]
-    closed_count = sum(1 for r in undigested if r.get("action") == "closed")
-    review_dicts = [_adapt_review(r) for r in undigested]
-
-    subject, text_body, html_body = build_digest(review_dicts)
-    print(f"Subject: {subject}")
-    print(f"Text body:\n{text_body}")
-
-    send_email(subject, text_body, html_body)
-    print(f"✅ Sent digest to {RECIPIENT}")
-
-    # Order matters: record the digest first, then mark its reviews. If the
-    # update fails, the digests row still exists for manual reconciliation;
-    # the reverse order would leave reviews silently digested with no record.
-    try:
-        record_digest_sent(
-            review_ids=review_ids,
-            review_count=len(undigested),
-            closed_count=closed_count,
-            subject=subject,
-        )
-    except Exception as e:
-        print(
-            f"[ERROR] Could not insert digests row: {e} — "
-            "reviews left undigested; next run will re-send",
-            file=sys.stderr,
-        )
-        return 1
-
-    try:
-        mark_reviews_digested(review_ids)
-    except Exception as e:
-        print(
-            f"[ERROR] Could not stamp digested_at on reviews: {e} — "
-            "digest row exists; reconcile manually with "
-            "UPDATE reviews SET digested_at = now() WHERE id IN (...)",
-            file=sys.stderr,
-        )
-        return 1
-
-    return 0
+    # Multi-tenant path: one email per user. Failures are per-user — a
+    # send error for one user doesn't block the others. We return non-zero
+    # at the end iff at least one user failed.
+    any_failed = False
+    for rcpt in recipients:
+        try:
+            _send_one_digest(
+                user_id=rcpt["user_id"],
+                recipient_email=rcpt["email"],
+                is_daily=is_daily,
+            )
+        except Exception as e:
+            any_failed = True
+            print(
+                f"[ERROR] digest for user_id={rcpt.get('user_id')} "
+                f"({rcpt.get('email')}) failed: {e}",
+                file=sys.stderr,
+            )
+    return 1 if any_failed else 0
 
 
 if __name__ == "__main__":

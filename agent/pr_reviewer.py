@@ -5,12 +5,14 @@ using Claude, posts the review as a PR comment, and logs work for a daily digest
 Runs hourly via GitHub Actions. Idempotent — won't re-review the same PR.
 """
 
+import base64
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -26,8 +28,22 @@ from review_graph import run_review_graph
 # --- Config ---------------------------------------------------------------
 
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-GITHUB_TOKEN = os.environ["GITHUB_TOKEN_PAT"]  # personal PAT, not the default GITHUB_TOKEN
+# Legacy / fallback GitHub PAT. In single-tenant deployments (REPOS env var
+# set) every API call uses this. In multi-tenant deployments (REPOS unset,
+# repos sourced from `watched_repos`) it's only a last-resort fallback when
+# a watched_repos row has neither a PAT nor a GitHub App installation.
+# Made optional at import time so a multi-tenant deploy that never wants
+# to fall back to a shared PAT can simply leave it unset.
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN_PAT", "")
 REPOS = [r.strip() for r in os.environ.get("REPOS", "").split(",") if r.strip()]  # e.g. "user/repo1,user/repo2"
+
+# GitHub App credentials (used when a watched_repos row has
+# token_type='github_app'). Both are optional — if unset, the agent
+# falls through to GITHUB_TOKEN_PAT for app-typed rows and prints a
+# WARN at startup. Mirrors the dashboard's dashboard/lib/github-app.ts
+# JWT signing so both sides authenticate as the same App.
+GITHUB_APP_ID = os.environ.get("GITHUB_APP_ID", "")
+GITHUB_APP_PRIVATE_KEY = os.environ.get("GITHUB_APP_PRIVATE_KEY", "")
 
 # --- Auto-close gates ---
 # All three must be true for the agent to close a PR. Set ALLOW_AUTO_CLOSE=true in
@@ -133,13 +149,195 @@ compact summary (max 500 words) covering:
 Be specific and factual. Do not add opinions or suggestions."""
 
 GITHUB_API = "https://api.github.com"
-GH_HEADERS = {
-    "Authorization": f"Bearer {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-}
+
+
+def gh_headers(token: str = "") -> dict:
+    """Headers for a GitHub API call authenticated as the supplied token.
+
+    Empty string falls back to the module-level GITHUB_TOKEN so legacy
+    single-tenant callers (REPOS env var path, benchmark.py, prompt_tuner.py)
+    that pre-date the multi-tenant token plumbing keep working byte-for-byte.
+    A truly missing token (both arg and module-level empty) still produces a
+    header — the call will just fail with 401 from GitHub, which is the
+    safest failure mode (visible, attributable)."""
+    tok = token or GITHUB_TOKEN
+    return {
+        "Authorization": f"Bearer {tok}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+# Kept as a module-level constant so callers that imported it
+# (benchmark.py, prompt_tuner.py, internal helpers) don't break. New code
+# should use gh_headers(token) instead.
+GH_HEADERS = gh_headers(GITHUB_TOKEN)
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
+# --- Multi-tenant: GitHub App JWT + installation token --------------------
+# Mirrors dashboard/lib/github-app.ts byte-for-byte where it counts:
+#   * RS256 with base64url segments
+#   * iss MUST be a JSON number (GitHub 401s otherwise with "could not be
+#     decoded")
+#   * iat backdated 60s for clock skew, exp 600s in the future
+# We use the `cryptography` package, which `supabase` already pulls in as
+# a transitive dep — so no new requirements entry is needed. If it's
+# missing in some environment, the get_installation_token call fails with
+# a clear ImportError surfaced at first use, not at module load.
+
+# In-memory installation-token cache. Tokens are ~1h-lived; one cron run is
+# minutes. We re-use within a run so a repo with 10 open PRs only mints
+# once. {installation_id: (token, expires_at_epoch_seconds)}.
+_INSTALLATION_TOKEN_CACHE: dict[int, tuple[str, float]] = {}
+
+
+def _b64url(data: bytes) -> str:
+    """RFC 7515 base64url-without-padding. JWT segments use this exact
+    encoding. Stdlib's urlsafe_b64encode gives us URL-safe alphabet but
+    keeps trailing '=' padding — strip it explicitly."""
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _sign_app_jwt() -> str:
+    """Sign a short-lived RS256 App JWT against GITHUB_APP_PRIVATE_KEY.
+
+    Same shape as dashboard/lib/github-app.ts:getAppJWT() — iss is the
+    integer App ID (NOT a string), iat is backdated 60s, exp is +600s.
+    Raises ValueError when env vars are missing or malformed."""
+    if not GITHUB_APP_ID or not GITHUB_APP_PRIVATE_KEY:
+        raise ValueError(
+            "GITHUB_APP_ID / GITHUB_APP_PRIVATE_KEY not set; "
+            "cannot mint installation token"
+        )
+    try:
+        iss = int(GITHUB_APP_ID)
+    except ValueError as e:
+        raise ValueError(
+            f"GITHUB_APP_ID must be an integer, got {GITHUB_APP_ID!r}"
+        ) from e
+
+    # Vercel-style envs store the .pem with literal '\n' between lines.
+    # Both that and the real-newline form must work.
+    key_pem = GITHUB_APP_PRIVATE_KEY
+    if "\\n" in key_pem and "\n" not in key_pem:
+        key_pem = key_pem.replace("\\n", "\n")
+
+    # Local import: cryptography is a transitive dep of supabase; importing
+    # at module top would force every CI job (including ones that never
+    # mint tokens) to install it. Lazy-loading keeps the import surface
+    # minimal and surfaces a precise error if it's somehow missing.
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    private_key = serialization.load_pem_private_key(
+        key_pem.encode("utf-8"), password=None
+    )
+
+    now = int(time.time())
+    header = {"alg": "RS256", "typ": "JWT"}
+    payload = {"iat": now - 60, "exp": now + 600, "iss": iss}
+
+    header_b64 = _b64url(json.dumps(header, separators=(",", ":")).encode())
+    payload_b64 = _b64url(json.dumps(payload, separators=(",", ":")).encode())
+    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+    signature = private_key.sign(  # type: ignore[union-attr]
+        signing_input, padding.PKCS1v15(), hashes.SHA256()
+    )
+    return f"{header_b64}.{payload_b64}.{_b64url(signature)}"
+
+
+def get_installation_token(installation_id: int) -> str:
+    """Mint (or return a cached) installation access token for the given
+    GitHub App installation. Tokens are valid for ~1h; we cache in-process
+    until 60s before expiry.
+
+    Raises on any failure (missing config, bad JWT, GitHub error). Callers
+    fall back to a static PAT on exception."""
+    cached = _INSTALLATION_TOKEN_CACHE.get(installation_id)
+    if cached and cached[1] - 60 > time.time():
+        return cached[0]
+
+    jwt = _sign_app_jwt()
+    r = requests.post(
+        f"{GITHUB_API}/app/installations/{installation_id}/access_tokens",
+        headers={
+            "Authorization": f"Bearer {jwt}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+    token = data["token"]
+    # GitHub returns ISO-8601 with a trailing 'Z'.
+    exp_iso = data.get("expires_at") or ""
+    try:
+        exp_dt = datetime.fromisoformat(exp_iso.replace("Z", "+00:00"))
+        exp_epoch = exp_dt.timestamp()
+    except Exception:
+        # Conservative fallback: 50 minutes from now (GitHub's docs say ~1h).
+        exp_epoch = time.time() + 50 * 60
+    _INSTALLATION_TOKEN_CACHE[installation_id] = (token, exp_epoch)
+    return token
+
+
+# --- Multi-tenant: watched_repos source of truth --------------------------
+
+def get_watched_repos() -> list[dict]:
+    """Return enabled watched_repos rows: [{repo, github_token,
+    github_installation_id, token_type, user_id}, ...].
+
+    Empty list when Supabase is unavailable or no enabled rows exist. The
+    caller (main) is responsible for falling back to the REPOS env var
+    when this returns [] AND REPOS is set.
+
+    The query is service-role (RLS bypassed) — see CLAUDE.md: the agent
+    runs with SUPABASE_SERVICE_KEY and is authorized to see every row."""
+    if supabase is None:
+        return []
+    try:
+        resp = (
+            supabase.table("watched_repos")
+            .select(
+                "repo, github_token, github_installation_id, token_type, user_id"
+            )
+            .eq("enabled", True)
+            .execute()
+        )
+    except Exception as e:
+        print(f"[ERROR] Could not query watched_repos: {e}", file=sys.stderr)
+        return []
+    return list(resp.data or [])
+
+
+def resolve_repo_token(row: dict) -> str:
+    """Given one watched_repos row, return the GitHub token to use for
+    this repo. Precedence:
+      1. github_app installation token (minted on demand)
+      2. row's `github_token` (PAT-typed rows)
+      3. module-level GITHUB_TOKEN (last-resort static PAT)
+    Returns "" only when none of the above are available — the caller
+    logs and skips."""
+    token_type = (row.get("token_type") or "pat").lower()
+    if token_type == "github_app":
+        iid = row.get("github_installation_id")
+        if iid:
+            try:
+                return get_installation_token(int(iid))
+            except Exception as e:
+                print(
+                    f"  [{row.get('repo', '?')}] installation token mint failed "
+                    f"(installation_id={iid}): {e}",
+                    file=sys.stderr,
+                )
+        # fall through to PAT-style fallbacks
+    pat = (row.get("github_token") or "").strip()
+    if pat:
+        return pat
+    return GITHUB_TOKEN
 
 
 # --- Supabase state -------------------------------------------------------
@@ -220,10 +418,15 @@ def upsert_review(
     review: dict,
     action: str,
     gate_reason: str,
+    user_id: str | None = None,
 ) -> None:
     """Upsert one row in `reviews`. Re-reviews of the same (repo, pr_number)
     overwrite cleanly via the unique index. Raises on failure — the caller
-    decides how to handle (the GitHub comment has already been posted)."""
+    decides how to handle (the GitHub comment has already been posted).
+
+    `user_id` is the watched_repos.user_id that owns this repo (multi-tenant
+    path). NULL for legacy REPOS-env-var runs; the dashboard's user-scoped
+    views explicitly include `user_id IS NULL` so those rows stay visible."""
     if supabase is None:
         return
     # Phase 3: persist enough metadata for the digest to render the new
@@ -259,16 +462,21 @@ def upsert_review(
         "arbiter_output": review.get("_arbiter_output"),
         "escalated": bool(review.get("_escalated", False)),
     }
+    # Only include user_id when we actually have one. Setting it to NULL
+    # explicitly on a re-review of a legacy row would clobber a previous
+    # SaaS-aware write — leave it out and let the existing value stand.
+    if user_id:
+        payload["user_id"] = user_id
     supabase.table("reviews").upsert(payload, on_conflict="repo,pr_number").execute()
 
 
 # --- GitHub helpers -------------------------------------------------------
 
-def list_open_prs(repo: str) -> list[dict]:
+def list_open_prs(repo: str, token: str = "") -> list[dict]:
     """Return list of open PRs (excluding drafts) for a repo."""
     r = requests.get(
         f"{GITHUB_API}/repos/{repo}/pulls",
-        headers=GH_HEADERS,
+        headers=gh_headers(token),
         params={"state": "open", "per_page": 30},
         timeout=30,
     )
@@ -276,7 +484,7 @@ def list_open_prs(repo: str) -> list[dict]:
     return [pr for pr in r.json() if not pr.get("draft")]
 
 
-def get_pr(repo: str, pr_number: int) -> dict:
+def get_pr(repo: str, pr_number: int, token: str = "") -> dict:
     """Fetch a single PR by number. Used by the webhook-triggered path
     (agent/webhook_handler.py) when PR_FILTER_REPO + PR_FILTER_NUMBER
     scope this invocation to one specific PR — we don't need the full
@@ -286,18 +494,18 @@ def get_pr(repo: str, pr_number: int) -> dict:
     asks us to review a draft we honor that."""
     r = requests.get(
         f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}",
-        headers=GH_HEADERS,
+        headers=gh_headers(token),
         timeout=30,
     )
     r.raise_for_status()
     return r.json()
 
 
-def already_reviewed(repo: str, pr_number: int) -> bool:
+def already_reviewed(repo: str, pr_number: int, token: str = "") -> bool:
     """Check if we've already touched this PR (review or close marker)."""
     r = requests.get(
         f"{GITHUB_API}/repos/{repo}/issues/{pr_number}/comments",
-        headers=GH_HEADERS,
+        headers=gh_headers(token),
         params={"per_page": 100},
         timeout=30,
     )
@@ -308,35 +516,37 @@ def already_reviewed(repo: str, pr_number: int) -> bool:
     )
 
 
-def get_pr_diff(repo: str, pr_number: int) -> str:
+def get_pr_diff(repo: str, pr_number: int, token: str = "") -> str:
     """Fetch the raw unified diff for a PR."""
+    headers = gh_headers(token)
+    headers["Accept"] = "application/vnd.github.v3.diff"
     r = requests.get(
         f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}",
-        headers={**GH_HEADERS, "Accept": "application/vnd.github.v3.diff"},
+        headers=headers,
         timeout=30,
     )
     r.raise_for_status()
     return r.text
 
 
-def post_review_comment(repo: str, pr_number: int, body: str) -> None:
+def post_review_comment(repo: str, pr_number: int, body: str, token: str = "") -> None:
     """Post the review as a regular PR comment."""
     r = requests.post(
         f"{GITHUB_API}/repos/{repo}/issues/{pr_number}/comments",
-        headers=GH_HEADERS,
+        headers=gh_headers(token),
         json={"body": body},
         timeout=30,
     )
     r.raise_for_status()
 
 
-def close_pr(repo: str, pr_number: int, reason_comment: str) -> None:
+def close_pr(repo: str, pr_number: int, reason_comment: str, token: str = "") -> None:
     """Post a reason comment, then close the PR. Order matters — comment first
     so the author sees the explanation when they get the close notification."""
-    post_review_comment(repo, pr_number, reason_comment)
+    post_review_comment(repo, pr_number, reason_comment, token=token)
     r = requests.patch(
         f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}",
-        headers=GH_HEADERS,
+        headers=gh_headers(token),
         json={"state": "closed"},
         timeout=30,
     )
@@ -687,7 +897,9 @@ def _summarize_repo_with_claude(readme: str, deps: str, dir_listing: str) -> str
     return response.content[0].text.strip()
 
 
-def get_or_refresh_fingerprint(repo: str) -> tuple[str | None, str]:
+def get_or_refresh_fingerprint(
+    repo: str, token: str = ""
+) -> tuple[str | None, str]:
     """Return ``(fingerprint, status)`` for the repo. Regenerates via shallow
     clone if the cached row is missing or older than FINGERPRINT_TTL_DAYS.
 
@@ -711,9 +923,10 @@ def get_or_refresh_fingerprint(repo: str) -> tuple[str | None, str]:
         print(f"  [fingerprint:{repo}] using cached fingerprint ({len(cached.split())} words)")
         return cached, "cached"
 
-    if not GITHUB_TOKEN:
+    clone_token = token or GITHUB_TOKEN
+    if not clone_token:
         print(
-            f"  [fingerprint:{repo}] no GITHUB_TOKEN_PAT — cannot clone, "
+            f"  [fingerprint:{repo}] no repo token — cannot clone, "
             f"proceeding without repo context",
             file=sys.stderr,
         )
@@ -723,10 +936,10 @@ def get_or_refresh_fingerprint(repo: str) -> tuple[str | None, str]:
     clone_dir = Path(tempfile.mkdtemp(prefix=f"fp-{slug}-"))
 
     try:
-        # x-access-token is the documented basic-auth username for PAT-auth
-        # clones; the PAT itself is the password. This works for both
-        # classic and fine-grained PATs scoped to the target repo.
-        clone_url = f"https://x-access-token:{GITHUB_TOKEN}@github.com/{repo}.git"
+        # x-access-token is the documented basic-auth username for token-auth
+        # clones (works for classic PATs, fine-grained PATs, AND GitHub App
+        # installation tokens). The token itself is the password.
+        clone_url = f"https://x-access-token:{clone_token}@github.com/{repo}.git"
         print(f"  [fingerprint:{repo}] cache miss/stale — shallow cloning...")
         try:
             subprocess.run(
@@ -1234,20 +1447,59 @@ def main() -> int:
         filter_repo = None
 
     filter_active = bool(filter_repo and filter_pr_number is not None)
-    repos_to_scan = [filter_repo] if filter_active else REPOS  # type: ignore[list-item]
+
+    # Source-of-truth resolution for what to scan + which token to use:
+    #
+    #   1. REPOS env var set → legacy single-tenant mode. Every repo uses
+    #      the module-level GITHUB_TOKEN. No user_id stamping (user_id stays
+    #      NULL on review rows, which the dashboard's user-scoped views
+    #      explicitly include).
+    #   2. REPOS unset → SaaS mode. Query watched_repos for enabled rows;
+    #      each row carries its own credential (PAT or installation token)
+    #      and user_id. Empty result falls through to REPOS (which is also
+    #      empty) for a clean no-op run.
+    #
+    # The webhook path (PR_FILTER_REPO/NUMBER) wraps either source —
+    # if the filtered repo is in watched_repos we use the per-row
+    # credential; otherwise we fall back to GITHUB_TOKEN.
+    watched_index: dict[str, dict] = {}
+    if not REPOS:
+        for row in get_watched_repos():
+            r = (row.get("repo") or "").strip()
+            if r:
+                watched_index[r] = row
+        if watched_index:
+            print(
+                f"[startup] multi-tenant mode: {len(watched_index)} watched "
+                f"repo(s) from Supabase"
+            )
+
     if filter_active:
+        scan_specs: list[tuple[str, str, str | None]] = []
+        row = watched_index.get(filter_repo)  # type: ignore[arg-type]
+        token = resolve_repo_token(row) if row else GITHUB_TOKEN
+        user_id = row.get("user_id") if row else None
+        scan_specs.append((filter_repo, token, user_id))  # type: ignore[arg-type]
         print(
             f"[startup] filter active: reviewing only "
             f"{filter_repo}#{filter_pr_number}"
         )
+    elif REPOS:
+        scan_specs = [(r, GITHUB_TOKEN, None) for r in REPOS]
+    else:
+        scan_specs = [
+            (r, resolve_repo_token(row), row.get("user_id"))
+            for r, row in watched_index.items()
+        ]
 
+    repos_to_scan = [s[0] for s in scan_specs]
     run_id = insert_run(repos_to_scan)
     reviewed_count = 0          # PRs the agent acted on via GitHub this run
     reviews_created = 0         # rows successfully written to `reviews` table
     skipped = 0
     errors: list[dict] = []
 
-    for repo in repos_to_scan:
+    for repo, repo_token, repo_user_id in scan_specs:
         # Phase 9: dashboard-configured per-repo rules. Loaded once per
         # repo per run; the same dict is reused for every PR in this
         # repo so we don't pay a Supabase round-trip per PR.
@@ -1257,11 +1509,21 @@ def main() -> int:
             skipped += 1
             continue
 
+        if not repo_token:
+            print(
+                f"[{repo}] no GitHub token resolved (watched_repos row has "
+                f"no PAT / installation, and GITHUB_TOKEN_PAT is unset); "
+                f"skipping",
+                file=sys.stderr,
+            )
+            errors.append({"repo": repo, "error": "no_github_token"})
+            continue
+
         try:
             if filter_active:
-                prs = [get_pr(repo, filter_pr_number)]  # type: ignore[arg-type]
+                prs = [get_pr(repo, filter_pr_number, token=repo_token)]  # type: ignore[arg-type]
             else:
-                prs = list_open_prs(repo)
+                prs = list_open_prs(repo, token=repo_token)
         except Exception as e:
             print(f"[ERROR] Could not list PRs for {repo}: {e}", file=sys.stderr)
             errors.append({"repo": repo, "error": str(e)})
@@ -1275,7 +1537,9 @@ def main() -> int:
         # returns (None, "unavailable") and the per-PR review proceeds
         # without repo context.
         if prs:
-            repo_fingerprint, fingerprint_status = get_or_refresh_fingerprint(repo)
+            repo_fingerprint, fingerprint_status = get_or_refresh_fingerprint(
+                repo, token=repo_token
+            )
         else:
             repo_fingerprint, fingerprint_status = None, "unavailable"
 
@@ -1284,13 +1548,13 @@ def main() -> int:
             tag = f"{repo}#{num}"
 
             try:
-                if already_reviewed(repo, num):
+                if already_reviewed(repo, num, token=repo_token):
                     print(f"  [{tag}] already reviewed, skipping")
                     skipped += 1
                     continue
 
                 print(f"  [{tag}] fetching diff...")
-                diff = get_pr_diff(repo, num)
+                diff = get_pr_diff(repo, num, token=repo_token)
 
                 # Phase 9: apply path filters before doing any review work.
                 # File list comes from the diff itself rather than a separate
@@ -1366,11 +1630,11 @@ def main() -> int:
                           f"(severity={review['severity_score']}, verdict={review['verdict']}, "
                           f"confidence={review['confidence']})")
                     close_comment = format_close_comment(review)
-                    close_pr(repo, num, close_comment)
+                    close_pr(repo, num, close_comment, token=repo_token)
                     action = "closed"
                 else:
                     comment = format_review_comment(review)
-                    post_review_comment(repo, num, comment)
+                    post_review_comment(repo, num, comment, token=repo_token)
                     print(f"  [{tag}] ✅ posted ({review['verdict']}, {review['confidence']} "
                           f"confidence, severity {review.get('severity_score', '?')}) "
                           f"— close gates not met: {gate_reason}")
@@ -1386,6 +1650,7 @@ def main() -> int:
                         review=review,
                         action=action,
                         gate_reason=gate_reason,
+                        user_id=repo_user_id,
                     )
                     reviews_created += 1
                 except Exception as db_e:

@@ -2,3 +2,8 @@ anthropic>=0.40.0
 requests>=2.31.0
 supabase>=2.0.0
 langgraph>=0.2.0
+# Used by pr_reviewer.py to sign GitHub App JWTs (multi-tenant
+# installation-token minting). Often pulled in transitively by other
+# deps, but pinned explicitly so a fresh install never lands on a
+# version without the public-key primitives we need.
+cryptography>=42.0

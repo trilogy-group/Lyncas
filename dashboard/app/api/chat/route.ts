@@ -3,30 +3,33 @@ import {
   createSupabaseServerClient,
   getUser,
 } from "@/lib/supabase/server";
+import { createInstallationToken } from "@/lib/github-app";
 
 // POST /api/chat — server-sent-events endpoint backing the
 // /dashboard/chat UI.
 //
 // Flow:
-//   1. AuthN: must be a logged-in dashboard user. Without this any
-//      caller could burn our Anthropic + GitHub quota.
+//   1. AuthN: must be a logged-in dashboard user.
 //   2. AuthZ: the requested `repo` must be in the caller's
-//      watched_repos. Avoids leaking arbitrary repo metadata to a
-//      user who hasn't connected the repo.
-//   3. Pre-fetch GitHub context based on simple keyword routing.
-//      Each fetch is independently best-effort — a 404 / 500 on one
-//      doesn't take the rest down.
-//   4. Build a compact context blob, send it + the user message to
-//      Claude Sonnet 4.5 with streaming enabled.
-//   5. Re-emit Claude's `content_block_delta` text events on the wire
-//      as `data: <text>\n\n` SSE frames, terminated by `data: [DONE]`.
-//      The client decodes one frame at a time and appends to the
-//      in-flight assistant message — see /dashboard/chat/page.tsx.
+//      watched_repos. RLS enforces ownership.
+//   3. Pick the right GitHub token for this repo. Multi-tenant:
+//      watched_repos may carry a PAT or a GitHub App installation;
+//      we mint an installation token on the fly for the app case.
+//      Final fallback is the deploy-wide PR_REVIEWER_PAT for legacy
+//      / public-read flows.
+//   4. Pre-fetch GitHub context based on keyword routing. Each fetch
+//      is best-effort.
+//   5. Send context + message to Claude Sonnet 4.5 with streaming.
+//      The system prompt teaches Claude to emit `ACTION: ...` blocks
+//      at the END of its response when the user asks for write
+//      operations. We strip those blocks from what we forward to the
+//      client and execute them server-side, then append a clean
+//      confirmation line.
 //
-// Why not @anthropic-ai/sdk: the SDK is not installed in this project
-// (and the spec says "no new packages"). The Messages API speaks
-// SSE natively when `stream: true`, so a plain fetch + ReadableStream
-// pipe is sufficient and keeps the bundle thin.
+// "Research briefing" mode (isResearchBriefing=true) overrides the
+// system prompt and pre-fetches a specific bundle of repo metadata
+// instead of doing keyword routing. The chat page renders the
+// response as a special "Research Briefing" card.
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -35,21 +38,20 @@ const CHAT_MODEL = "claude-sonnet-4-5";
 const MAX_TOKENS = 1024;
 const HISTORY_LIMIT = 10;
 
-// Cap each GitHub payload so we don't blow Claude's context window
-// when a repo has hundreds of branches / PRs. The numbers below are
-// soft caps; the GitHub queries already use `per_page` to limit the
-// upstream side.
+// Cap each GitHub payload so we don't blow Claude's context window.
 const TRUNC = {
   prs: 20,
   branches: 30,
   collaborators: 30,
-  commits: 10,
+  commits: 30,
   files: 30,
   patchChars: 6000,
   reviewRowsFromDB: 10,
+  contributors: 20,
 };
 
-const SYSTEM_PROMPT = (repo: string) => `\
+function systemPromptChat(repo: string): string {
+  return `\
 You are a GitHub repository assistant for Night PR Reviewer.
 You help developers understand their repositories, review pull requests, and manage their codebase.
 Current repository: ${repo}
@@ -57,9 +59,41 @@ You have access to real GitHub data fetched before this conversation.
 Answer questions about PRs, branches, collaborators, diffs, and recent activity based on the data provided.
 Be concise and specific. Format lists with bullet points.
 For code diffs, use markdown code blocks.
-When asked to review a PR, give a structured review:
-verdict (approve/request changes), severity (1-10), key bugs found, and a recommendation.
-If the relevant data isn't in the REPOSITORY DATA block, say so plainly rather than guessing.`;
+When asked to review a PR, give a structured review: verdict (approve/request changes), severity (1-10), key bugs found, and a recommendation.
+If the relevant data isn't in the REPOSITORY DATA block, say so plainly rather than guessing.
+
+WRITE OPERATIONS — when the user asks you to close, reopen, comment on, or merge a PR, include the appropriate ACTION block at the END of your response on its own line. The user does not see the ACTION line — it is parsed server-side and the platform executes the action for you, then appends a confirmation message.
+
+Supported actions (one per response, exactly):
+  ACTION: CLOSE_PR {number}
+  ACTION: OPEN_PR {number}
+  ACTION: COMMENT_PR {number} {your comment text on one line}
+  ACTION: MERGE_PR {number}
+
+Rules:
+- Use ACTION blocks ONLY when the user explicitly requests the action ("close pr 42", "merge this pr", etc.). Do not invent actions.
+- Always confirm BEFORE merging. For "merge pr 42" requests, first reply with "Are you sure you want to merge PR #42? Reply 'yes, merge' to proceed." and DO NOT include ACTION: MERGE_PR. Only include ACTION: MERGE_PR after the user explicitly confirms ("yes, merge", "confirmed", etc.).
+- For COMMENT_PR, the comment text follows the number on the SAME line. Keep it under 1000 characters and use plain text (no triple backticks — they break the parser). Markdown without code fences is fine.
+- One ACTION per response, max.
+- The user sees only your prose. Do not refer to "the ACTION block" in your prose.`;
+}
+
+const RESEARCH_BRIEFING_PROMPT = `\
+You are generating a Research Briefing for a GitHub repository room. Be structured and crisp — this renders as a small reference card, not a chat response.
+
+Use exactly four sections with the headings shown below. Do NOT include any other prose, greetings, or sign-off. Do NOT use ACTION blocks here.
+
+### What this repo does
+Two sentences max, grounded in the data provided (languages, recent commits, README signals).
+
+### Current focus areas
+Two or three bullets inferred from the most recent PRs and commits. Each bullet: one line.
+
+### Suggested research topics
+Three bullets. Each: a topic + one short clause explaining why it matters for this repo.
+
+### Resources to check
+Two or three bullets pointing at concrete docs/files (e.g. "README", "docs/architecture.md", "package.json"). Only mention files that appear in the data — do not invent paths.`;
 
 interface HistoryEntry {
   role: "user" | "assistant";
@@ -70,6 +104,7 @@ interface RequestBody {
   message?: unknown;
   repo?: unknown;
   history?: unknown;
+  isResearchBriefing?: unknown;
 }
 
 function jsonError(message: string, status: number) {
@@ -81,8 +116,6 @@ const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 // --- GitHub helpers ------------------------------------------------------
 
 interface GhFetchOpts {
-  // Truncate to this many top-level array entries after the response
-  // is parsed. Saves us from threading a per-call slice() everywhere.
   trunc?: number;
 }
 
@@ -108,15 +141,13 @@ async function ghJSON<T = unknown>(
     }
     return data;
   } catch {
-    // Per the spec: a failed fetch is logged-and-continue, not fatal.
     return null;
   }
 }
 
-// Per-keyword routing. We do simple includes() rather than NLP because
-// (a) it's predictable, (b) Claude itself fills the gap when the
-// keyword routing misses — it just answers from whatever data we
-// happened to attach.
+// Per-keyword routing. Includes write-action intents (close/open/merge/
+// comment) so the right context is loaded BEFORE Claude generates a
+// response — Claude can't post a comment about a PR it didn't see.
 function classifyMessage(message: string): {
   prs: boolean;
   branches: boolean;
@@ -124,12 +155,14 @@ function classifyMessage(message: string): {
   commits: boolean;
   reviewPR: number | null;
   stats: boolean;
+  closePR: number | null;
+  openPR: number | null;
+  mergePR: number | null;
+  commentPR: number | null;
 } {
   const m = message.toLowerCase();
   const reviewIntent =
     m.includes("review") || m.includes("diff") || m.includes("changes");
-  // Pull a #-prefixed or bare PR number out of the message when the
-  // user asks for a review. "review pr 42" / "diff for #42" both work.
   let reviewPR: number | null = null;
   if (reviewIntent) {
     const match =
@@ -137,6 +170,26 @@ function classifyMessage(message: string): {
       /\b(?:pr|pull request)\s*#?(\d{1,6})/i.exec(message);
     if (match) reviewPR = Number(match[1]);
   }
+
+  // Action intent extractors. Each looks for a verb + a PR number.
+  // The verbs are deliberately restrictive ("close pr 42", not "I think
+  // they should close 42") so we don't accidentally pre-fetch on every
+  // mention of "close".
+  function pick(re: RegExp): number | null {
+    const x = re.exec(message);
+    return x ? Number(x[1]) : null;
+  }
+  const closePR = pick(
+    /\bclose(?:\s+pr|\s+pull\s+request)?\s+#?(\d{1,6})/i,
+  );
+  const openPR =
+    pick(/\b(?:open|reopen)\s+(?:pr|pull\s+request)\s+#?(\d{1,6})/i) ||
+    pick(/\breopen\s+#?(\d{1,6})/i);
+  const mergePR = pick(/\bmerge(?:\s+pr|\s+pull\s+request)?\s+#?(\d{1,6})/i);
+  const commentPR = pick(
+    /\bcomment(?:\s+on)?\s+(?:pr|pull\s+request)\s+#?(\d{1,6})/i,
+  );
+
   return {
     prs: m.includes("pr") || m.includes("pull request"),
     branches: m.includes("branch"),
@@ -144,9 +197,17 @@ function classifyMessage(message: string): {
     commits:
       m.includes("recent") ||
       m.includes("activity") ||
-      m.includes("commit"),
+      m.includes("commit") ||
+      m.includes("latest"),
     reviewPR,
-    stats: m.includes("stats") || m.includes("overview"),
+    stats:
+      m.includes("stats") ||
+      m.includes("overview") ||
+      m.includes("repo stats"),
+    closePR,
+    openPR,
+    mergePR,
+    commentPR,
   };
 }
 
@@ -155,19 +216,154 @@ interface FetchedContext {
   errors: string[];
 }
 
+async function fetchPRDetail(
+  base: string,
+  pat: string | undefined,
+  n: number,
+  ctx: Record<string, unknown>,
+  errors: string[],
+  key: string,
+): Promise<void> {
+  const [pr, files] = await Promise.all([
+    ghJSON<Record<string, unknown>>(`${base}/pulls/${n}`, pat),
+    ghJSON<Array<Record<string, unknown>>>(
+      `${base}/pulls/${n}/files?per_page=${TRUNC.files}`,
+      pat,
+      { trunc: TRUNC.files },
+    ),
+  ]);
+  if (!pr && !files) {
+    errors.push(`Could not fetch PR #${n}`);
+    return;
+  }
+  ctx[key] = pr
+    ? {
+        number: pr.number,
+        title: pr.title,
+        body: typeof pr.body === "string" ? pr.body.slice(0, 1500) : null,
+        user: (pr.user as { login?: string } | null)?.login,
+        state: pr.state,
+        merged: pr.merged,
+        mergeable: pr.mergeable,
+        additions: pr.additions,
+        deletions: pr.deletions,
+        changed_files: pr.changed_files,
+        url: pr.html_url,
+      }
+    : { error: "pr not found" };
+  if (files) {
+    let budget = TRUNC.patchChars;
+    ctx[`${key}_files`] = files.map((f) => {
+      const patch = typeof f.patch === "string" ? (f.patch as string) : "";
+      const allowed = Math.max(0, Math.min(patch.length, budget));
+      budget -= allowed;
+      return {
+        filename: f.filename,
+        status: f.status,
+        additions: f.additions,
+        deletions: f.deletions,
+        patch: patch.slice(0, allowed) || undefined,
+        patch_truncated: patch.length > allowed,
+      };
+    });
+  }
+}
+
 async function fetchGitHubContext(
   repo: string,
   message: string,
   pat: string | undefined,
+  isResearchBriefing: boolean,
 ): Promise<FetchedContext> {
-  const intent = classifyMessage(message);
   const ctx: Record<string, unknown> = {};
   const errors: string[] = [];
-
   const base = `https://api.github.com/repos/${repo}`;
   const jobs: Array<Promise<void>> = [];
 
-  if (intent.prs || intent.reviewPR !== null) {
+  if (isResearchBriefing) {
+    // Briefing bundle: fixed, repo-scoped. Recent commits + open PRs +
+    // languages + contributors. Languages and contributors are what
+    // tell Claude "this is a Python data repo" vs "this is a TS frontend".
+    jobs.push(
+      ghJSON<Record<string, unknown>>(`${base}`, pat).then((data) => {
+        if (data) {
+          ctx.repo_meta = {
+            name: data.full_name,
+            description: data.description,
+            primary_language: data.language,
+            default_branch: data.default_branch,
+            stars: data.stargazers_count,
+            forks: data.forks_count,
+            open_issues: data.open_issues_count,
+            pushed_at: data.pushed_at,
+          };
+        } else {
+          errors.push("Could not fetch repo metadata");
+        }
+      }),
+      ghJSON<Array<Record<string, unknown>>>(
+        `${base}/pulls?state=open&per_page=20`,
+        pat,
+        { trunc: TRUNC.prs },
+      ).then((data) => {
+        if (data) {
+          ctx.open_pull_requests = data.map((p) => ({
+            number: p.number,
+            title: p.title,
+            user: (p.user as { login?: string } | null)?.login,
+            url: p.html_url,
+          }));
+        } else {
+          errors.push("Could not fetch open PRs");
+        }
+      }),
+      ghJSON<Array<Record<string, unknown>>>(
+        `${base}/commits?per_page=20`,
+        pat,
+        { trunc: TRUNC.commits },
+      ).then((data) => {
+        if (data) {
+          ctx.recent_commits = data.map((c) => {
+            const commit = c.commit as
+              | { message?: string; author?: { name?: string; date?: string } }
+              | null;
+            return {
+              sha: (c.sha as string | undefined)?.slice(0, 7),
+              author: commit?.author?.name,
+              date: commit?.author?.date,
+              message: commit?.message?.split("\n")[0],
+            };
+          });
+        } else {
+          errors.push("Could not fetch commits");
+        }
+      }),
+      ghJSON<Record<string, number>>(`${base}/languages`, pat).then((data) => {
+        if (data) ctx.languages = data;
+      }),
+      ghJSON<Array<Record<string, unknown>>>(
+        `${base}/contributors?per_page=${TRUNC.contributors}`,
+        pat,
+        { trunc: TRUNC.contributors },
+      ).then((data) => {
+        if (data) {
+          ctx.contributors = data.map((c) => ({
+            login: c.login,
+            contributions: c.contributions,
+          }));
+        }
+      }),
+    );
+    await Promise.all(jobs);
+    return { fetched: ctx, errors };
+  }
+
+  const intent = classifyMessage(message);
+
+  // PRs list — pulled when the user mentions PRs, asks to review, or
+  // asks for an action that targets a specific number we haven't yet
+  // identified (so Claude has something to anchor "the latest PR" on).
+  if (intent.prs || intent.reviewPR !== null || intent.mergePR !== null) {
     jobs.push(
       ghJSON<Array<Record<string, unknown>>>(
         `${base}/pulls?state=open&per_page=20`,
@@ -226,7 +422,7 @@ async function fetchGitHubContext(
           }));
         } else {
           errors.push(
-            "Could not fetch collaborators (PAT may lack admin scope)",
+            "Could not fetch collaborators (token may lack admin scope)",
           );
         }
       }),
@@ -236,17 +432,14 @@ async function fetchGitHubContext(
   if (intent.commits) {
     jobs.push(
       ghJSON<Array<Record<string, unknown>>>(
-        `${base}/commits?per_page=10`,
+        `${base}/commits?per_page=30`,
         pat,
         { trunc: TRUNC.commits },
       ).then((data) => {
         if (data) {
           ctx.recent_commits = data.map((c) => {
             const commit = c.commit as
-              | {
-                  message?: string;
-                  author?: { name?: string; date?: string };
-                }
+              | { message?: string; author?: { name?: string; date?: string } }
               | null;
             return {
               sha: (c.sha as string | undefined)?.slice(0, 7),
@@ -262,69 +455,72 @@ async function fetchGitHubContext(
     );
   }
 
-  if (intent.reviewPR !== null) {
-    // PR review path. Fetch the PR + its file list in parallel; we
-    // intentionally don't pull `.patch` for the whole PR because the
-    // files endpoint already includes per-file patches that are
-    // easier to truncate.
-    const n = intent.reviewPR;
-    jobs.push(
-      Promise.all([
-        ghJSON<Record<string, unknown>>(`${base}/pulls/${n}`, pat),
-        ghJSON<Array<Record<string, unknown>>>(
-          `${base}/pulls/${n}/files?per_page=${TRUNC.files}`,
-          pat,
-          { trunc: TRUNC.files },
-        ),
-      ]).then(([pr, files]) => {
-        if (!pr && !files) {
-          errors.push(`Could not fetch PR #${n}`);
-          return;
-        }
-        ctx.target_pr = pr
-          ? {
-              number: pr.number,
-              title: pr.title,
-              body:
-                typeof pr.body === "string"
-                  ? pr.body.slice(0, 1500)
-                  : null,
-              user: (pr.user as { login?: string } | null)?.login,
-              state: pr.state,
-              merged: pr.merged,
-              additions: pr.additions,
-              deletions: pr.deletions,
-              changed_files: pr.changed_files,
-              url: pr.html_url,
-            }
-          : { error: "pr not found" };
-        if (files) {
-          // Keep filenames + truncated patches; this is what Claude
-          // actually needs to assess severity / suggest changes.
-          let budget = TRUNC.patchChars;
-          ctx.target_pr_files = files.map((f) => {
-            const patch =
-              typeof f.patch === "string" ? (f.patch as string) : "";
-            const allowed = Math.max(0, Math.min(patch.length, budget));
-            budget -= allowed;
-            return {
-              filename: f.filename,
-              status: f.status,
-              additions: f.additions,
-              deletions: f.deletions,
-              patch: patch.slice(0, allowed) || undefined,
-              patch_truncated: patch.length > allowed,
-            };
-          });
-        }
-      }),
-    );
+  // Each "target PR" intent (review, close, open, merge, comment) pulls
+  // the PR + its files once. Different keys keep Claude's view sharp:
+  // "the user wants to close PR 42 (target_close_pr)" reads cleaner than
+  // a shared "target_pr".
+  const targets: Array<{ n: number; key: string }> = [];
+  if (intent.reviewPR !== null)
+    targets.push({ n: intent.reviewPR, key: "target_pr" });
+  if (intent.closePR !== null)
+    targets.push({ n: intent.closePR, key: "target_close_pr" });
+  if (intent.openPR !== null)
+    targets.push({ n: intent.openPR, key: "target_open_pr" });
+  if (intent.mergePR !== null)
+    targets.push({ n: intent.mergePR, key: "target_merge_pr" });
+  if (intent.commentPR !== null)
+    targets.push({ n: intent.commentPR, key: "target_comment_pr" });
+  // Dedupe by (n, key) — a single "review and close pr 42" command
+  // could otherwise fetch the same PR twice.
+  const seen = new Set<string>();
+  for (const t of targets) {
+    const k = `${t.n}:${t.key}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    jobs.push(fetchPRDetail(base, pat, t.n, ctx, errors, t.key));
   }
 
   if (intent.stats) {
+    jobs.push(
+      ghJSON<Record<string, number>>(`${base}/languages`, pat).then(
+        (data) => {
+          if (data) ctx.languages = data;
+        },
+      ),
+      ghJSON<Array<Record<string, unknown>>>(
+        `${base}/contributors?per_page=${TRUNC.contributors}`,
+        pat,
+        { trunc: TRUNC.contributors },
+      ).then((data) => {
+        if (data) {
+          ctx.contributors = data.map((c) => ({
+            login: c.login,
+            contributions: c.contributions,
+          }));
+        }
+      }),
+      // Closed PR count (last 30d) — list endpoint with state=closed,
+      // sliced. /search/issues would be exact but burns more rate
+      // limit; the list endpoint is good enough for "rough volume".
+      ghJSON<Array<Record<string, unknown>>>(
+        `${base}/pulls?state=closed&per_page=30&sort=updated&direction=desc`,
+        pat,
+        { trunc: 30 },
+      ).then((data) => {
+        if (data) {
+          const since = Date.now() - 30 * 86_400_000;
+          const recent = data.filter((p) => {
+            const updated = p.updated_at as string | undefined;
+            return updated ? Date.parse(updated) >= since : false;
+          });
+          ctx.closed_prs_recent_count = recent.length;
+        }
+      }),
+    );
+
     // Supabase-side stats — the agent's prior review history for this
-    // repo. We use the request-scoped Supabase client so RLS applies
-    // (no cross-tenant leakage even if the input were tampered).
+    // repo. Server client carries the user's session; RLS keeps it
+    // owner-scoped.
     jobs.push(
       (async () => {
         try {
@@ -349,6 +545,133 @@ async function fetchGitHubContext(
   return { fetched: ctx, errors };
 }
 
+// --- Token resolution for write operations -------------------------------
+// "use the authenticated user's token not a shared PAT where possible":
+// look up the user's watched_repos row for this repo, then prefer (in
+// order) installation token (github_app) → PAT (github_token) → the
+// deploy-wide PR_REVIEWER_PAT.
+
+interface WriteTokenLookup {
+  github_token: string | null;
+  github_installation_id: number | null;
+  token_type: "pat" | "github_app" | null;
+}
+
+async function resolveWriteToken(
+  supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>,
+  repo: string,
+  fallbackPat: string | undefined,
+): Promise<string | null> {
+  const { data } = await supabase
+    .from("watched_repos")
+    .select("github_token, github_installation_id, token_type")
+    .eq("repo", repo)
+    .maybeSingle<WriteTokenLookup>();
+
+  if (data?.token_type === "github_app" && data.github_installation_id) {
+    try {
+      const t = await createInstallationToken(data.github_installation_id);
+      return t.token;
+    } catch {
+      // fall through to PAT / fallback
+    }
+  }
+  if (data?.github_token) return data.github_token;
+  return fallbackPat ?? null;
+}
+
+// --- Action execution ----------------------------------------------------
+// Parses + executes ONE ACTION block, returns a confirmation string that
+// the streaming layer appends to the assistant's response. Failures are
+// surfaced as user-visible warnings instead of swallowing — the user
+// asked for this action and deserves to know if GitHub rejected it.
+
+type ActionKind = "CLOSE_PR" | "OPEN_PR" | "COMMENT_PR" | "MERGE_PR";
+
+interface ParsedAction {
+  kind: ActionKind;
+  number: number;
+  comment?: string;
+}
+
+function parseAction(line: string): ParsedAction | null {
+  // Strip any leading whitespace + the "ACTION:" prefix.
+  const m = /^ACTION:\s*(CLOSE_PR|OPEN_PR|COMMENT_PR|MERGE_PR)\s+(\d{1,6})(?:\s+([\s\S]*))?$/.exec(
+    line.trim(),
+  );
+  if (!m) return null;
+  const kind = m[1] as ActionKind;
+  const number = Number(m[2]);
+  const comment = m[3]?.trim() || undefined;
+  if (kind === "COMMENT_PR" && !comment) return null;
+  return { kind, number, comment };
+}
+
+async function executeAction(
+  repo: string,
+  token: string,
+  action: ParsedAction,
+): Promise<string> {
+  const base = `https://api.github.com/repos/${repo}`;
+  const headers = {
+    Accept: "application/vnd.github+json",
+    Authorization: `token ${token}`,
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "night-pr-reviewer-chat",
+  } as const;
+
+  try {
+    if (action.kind === "CLOSE_PR") {
+      const res = await fetch(`${base}/pulls/${action.number}`, {
+        method: "PATCH",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ state: "closed" }),
+      });
+      if (!res.ok) throw new Error(`GitHub returned HTTP ${res.status}`);
+      return `**PR #${action.number} closed.**`;
+    }
+    if (action.kind === "OPEN_PR") {
+      const res = await fetch(`${base}/pulls/${action.number}`, {
+        method: "PATCH",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ state: "open" }),
+      });
+      if (!res.ok) throw new Error(`GitHub returned HTTP ${res.status}`);
+      return `**PR #${action.number} reopened.**`;
+    }
+    if (action.kind === "MERGE_PR") {
+      const res = await fetch(`${base}/pulls/${action.number}/merge`, {
+        method: "PUT",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ merge_method: "merge" }),
+      });
+      if (!res.ok) {
+        let detail = `HTTP ${res.status}`;
+        try {
+          const j = (await res.json()) as { message?: string };
+          if (j.message) detail = j.message;
+        } catch {
+          // non-json
+        }
+        throw new Error(detail);
+      }
+      return `**PR #${action.number} merged.**`;
+    }
+    if (action.kind === "COMMENT_PR") {
+      const res = await fetch(`${base}/issues/${action.number}/comments`, {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ body: action.comment }),
+      });
+      if (!res.ok) throw new Error(`GitHub returned HTTP ${res.status}`);
+      return `**Comment posted on PR #${action.number}.**`;
+    }
+  } catch (e) {
+    return `**Action failed (${action.kind} #${action.number}):** ${(e as Error).message}`;
+  }
+  return "";
+}
+
 // --- Anthropic streaming -------------------------------------------------
 
 interface AnthropicMessageContent {
@@ -362,32 +685,49 @@ interface AnthropicSSEEvent {
   message?: { content?: AnthropicMessageContent[] };
 }
 
-async function streamFromAnthropic(
-  apiKey: string,
-  systemPrompt: string,
-  history: HistoryEntry[],
-  userMessage: string,
-): Promise<Response> {
+// Action stripping: Claude is instructed to put the ACTION line at the
+// END. We can't simply emit text as it arrives or the user will briefly
+// see "ACTION: CLOSE_PR 42" flash on screen before we'd otherwise hide
+// it. Instead we keep a small trailing window (LOOKAHEAD chars) buffered
+// at all times — when an ACTION marker appears in that window, we know
+// to stop emitting before it. After the upstream finishes, we parse the
+// captured ACTION line, execute it, and emit a confirmation as a final
+// SSE frame.
+const LOOKAHEAD = 32;
+
+async function streamFromAnthropic(opts: {
+  apiKey: string;
+  systemPrompt: string;
+  history: HistoryEntry[];
+  userMessage: string;
+  // When set, we'll parse ACTION blocks from the full response and run
+  // them with this token. When null, we still strip ACTION blocks (so
+  // the user never sees them) but never execute — used for the research
+  // briefing path where actions are nonsensical.
+  writeToken: string | null;
+  repo: string;
+  allowActions: boolean;
+}): Promise<Response> {
   const messages = [
-    ...history.slice(-HISTORY_LIMIT).map((h) => ({
+    ...opts.history.slice(-HISTORY_LIMIT).map((h) => ({
       role: h.role,
       content: h.content,
     })),
-    { role: "user", content: userMessage },
+    { role: "user", content: opts.userMessage },
   ];
 
   const upstream = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-api-key": apiKey,
+      "x-api-key": opts.apiKey,
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
       model: CHAT_MODEL,
       max_tokens: MAX_TOKENS,
       stream: true,
-      system: systemPrompt,
+      system: opts.systemPrompt,
       messages,
     }),
   });
@@ -398,21 +738,130 @@ async function streamFromAnthropic(
       const j = (await upstream.json()) as { error?: { message?: string } };
       if (j.error?.message) detail = j.error.message;
     } catch {
-      // non-json body
+      // non-json
     }
     return NextResponse.json({ error: detail }, { status: 502 });
   }
 
-  // Re-emit the Anthropic SSE stream as our own simpler SSE format:
-  // every `content_block_delta` of type `text_delta` becomes a single
-  // `data: <text>\n\n` frame; a `[DONE]` sentinel marks completion.
-  // Anything else (ping, message_start, etc.) is dropped.
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   const reader = upstream.body.getReader();
 
+  const writeToken = opts.writeToken;
+  const repo = opts.repo;
+  const allowActions = opts.allowActions;
+
   const stream = new ReadableStream<Uint8Array>({
     async pull(controller) {
+      // Full accumulated assistant text (unmodified). Used for action
+      // parsing at end-of-stream.
+      let accum = "";
+      // Index into `accum` of the next char NOT yet emitted to the
+      // client. Always <= accum.length.
+      let emitted = 0;
+      // Once we've locked onto an ACTION block in the stream we stop
+      // emitting forward — `actionStart` is the char index in accum
+      // where the ACTION line begins (right after the newline, or 0
+      // if it starts at the very top).
+      let actionStart = -1;
+
+      function tryFindAction(): void {
+        if (actionStart !== -1) return;
+        // Search the unemitted portion (minus the LOOKAHEAD tail —
+        // the action marker might be straddling the next chunk).
+        // For simplicity we search the entire accum window, since
+        // ACTION: is meant to appear once at the END.
+        const tail = accum.slice(emitted);
+        const idx = tail.search(/(^|\n)ACTION:/);
+        if (idx === -1) return;
+        // Compute the absolute start position. If the match was on
+        // a \n, skip it so actionStart points at "ACTION:" itself.
+        const matchedNewline = tail[idx] === "\n";
+        actionStart = emitted + idx + (matchedNewline ? 1 : 0);
+      }
+
+      function flushSafe(controller_: ReadableStreamDefaultController<Uint8Array>): void {
+        if (actionStart !== -1) {
+          // Emit everything before the ACTION marker, then stop.
+          // The marker line itself (and anything after) is captured
+          // silently for parsing.
+          if (actionStart > emitted) {
+            const chunk = accum.slice(emitted, actionStart);
+            // Strip the trailing newline directly before ACTION:
+            // for a cleaner visual hand-off to the confirmation.
+            const trimmed = chunk.replace(/\n+$/, "");
+            if (trimmed) {
+              controller_.enqueue(
+                encoder.encode(`data: ${trimmed}\n\n`),
+              );
+            }
+            emitted = accum.length; // skip past the captured action region
+          }
+          return;
+        }
+        // No action detected yet — hold back the trailing LOOKAHEAD
+        // chars in case "ACTION:" is forming there. Emit the rest.
+        const safeEnd = Math.max(emitted, accum.length - LOOKAHEAD);
+        if (safeEnd > emitted) {
+          const chunk = accum.slice(emitted, safeEnd);
+          controller_.enqueue(encoder.encode(`data: ${chunk}\n\n`));
+          emitted = safeEnd;
+        }
+      }
+
+      function flushFinal(controller_: ReadableStreamDefaultController<Uint8Array>): void {
+        tryFindAction();
+        if (actionStart !== -1) {
+          // Emit pre-action text. Skip the rest.
+          if (actionStart > emitted) {
+            const chunk = accum.slice(emitted, actionStart);
+            const trimmed = chunk.replace(/\n+$/, "");
+            if (trimmed) {
+              controller_.enqueue(
+                encoder.encode(`data: ${trimmed}\n\n`),
+              );
+            }
+            emitted = accum.length;
+          }
+        } else {
+          // No action — emit everything that's left.
+          if (emitted < accum.length) {
+            const chunk = accum.slice(emitted);
+            controller_.enqueue(encoder.encode(`data: ${chunk}\n\n`));
+            emitted = accum.length;
+          }
+        }
+      }
+
+      async function maybeExecuteAction(
+        controller_: ReadableStreamDefaultController<Uint8Array>,
+      ): Promise<void> {
+        if (actionStart === -1) return;
+        const actionRegion = accum.slice(actionStart).trim();
+        // Take just the first line (everything up to the next newline)
+        // — Claude is instructed to put one ACTION per response with
+        // the body inline; multi-line would be a malformed action.
+        const firstLine = actionRegion.split("\n")[0];
+        const parsed = parseAction(firstLine);
+        if (!parsed) return;
+        if (!allowActions || !writeToken) {
+          // Action stripped but not executed — leave a discreet hint
+          // so the user knows their request didn't run.
+          controller_.enqueue(
+            encoder.encode(
+              `data: \n\n_(${parsed.kind} #${parsed.number} not executed — no write token for this repo.)_\n\n`,
+            ),
+          );
+          return;
+        }
+        const result = await executeAction(repo, writeToken, parsed);
+        if (result) {
+          // Two-line break before the confirmation so it visually
+          // separates from the response prose.
+          controller_.enqueue(encoder.encode(`data: \n\n${result}\n\n`));
+        }
+      }
+
       try {
         let buf = "";
         for (;;) {
@@ -420,8 +869,6 @@ async function streamFromAnthropic(
           if (done) break;
           buf += decoder.decode(value, { stream: true });
 
-          // Anthropic frames are `event: <name>\ndata: <json>\n\n`.
-          // Split on \n\n, keep partial trailing frame in buf.
           const frames = buf.split("\n\n");
           buf = frames.pop() ?? "";
           for (const frame of frames) {
@@ -438,10 +885,12 @@ async function streamFromAnthropic(
                 evt.delta?.type === "text_delta" &&
                 typeof evt.delta.text === "string"
               ) {
-                controller.enqueue(
-                  encoder.encode(`data: ${evt.delta.text}\n\n`),
-                );
+                accum += evt.delta.text;
+                tryFindAction();
+                flushSafe(controller);
               } else if (evt.type === "message_stop") {
+                flushFinal(controller);
+                await maybeExecuteAction(controller);
                 controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
                 controller.close();
                 return;
@@ -451,6 +900,8 @@ async function streamFromAnthropic(
             }
           }
         }
+        flushFinal(controller);
+        await maybeExecuteAction(controller);
         controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
         controller.close();
       } catch (e) {
@@ -485,7 +936,7 @@ export async function POST(request: NextRequest) {
   const user = await getUser().catch(() => null);
   if (!user) return jsonError("Not authenticated", 401);
 
-  // 2. Body parse + light validation
+  // 2. Body parse
   let body: RequestBody;
   try {
     body = (await request.json()) as RequestBody;
@@ -494,6 +945,7 @@ export async function POST(request: NextRequest) {
   }
   const message = typeof body.message === "string" ? body.message.trim() : "";
   const repo = typeof body.repo === "string" ? body.repo.trim() : "";
+  const isResearchBriefing = body.isResearchBriefing === true;
   if (!message) return jsonError("`message` is required", 400);
   if (!repo || !REPO_PATTERN.test(repo)) {
     return jsonError("`repo` must look like owner/name", 400);
@@ -510,9 +962,7 @@ export async function POST(request: NextRequest) {
     )
     .slice(-HISTORY_LIMIT);
 
-  // 3. AuthZ — repo must be in the caller's watched_repos. RLS on
-  // watched_repos enforces auth.uid()=user_id, so a missing row here
-  // is indistinguishable from "this repo belongs to someone else".
+  // 3. AuthZ — repo must be in the caller's watched_repos.
   const supabase = await createSupabaseServerClient();
   const { data: ownership } = await supabase
     .from("watched_repos")
@@ -526,18 +976,25 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  // 4. Anthropic API key required to actually answer
+  // 4. Anthropic
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
   if (!anthropicKey) {
     return jsonError("ANTHROPIC_API_KEY is not configured on this deploy", 503);
   }
 
-  // 5. Pre-fetch GitHub context. PR_REVIEWER_PAT is optional for
-  // public-repo queries but private repos won't return anything
-  // without it — surface that clearly via the errors[] field in the
-  // context blob so Claude can mention it instead of hallucinating.
-  const pat = process.env.PR_REVIEWER_PAT;
-  const { fetched, errors } = await fetchGitHubContext(repo, message, pat);
+  // 5. Pre-fetch GitHub context.
+  const fallbackPat = process.env.PR_REVIEWER_PAT;
+  const writeToken = await resolveWriteToken(supabase, repo, fallbackPat);
+  // Read-side token: same precedence, but the resolveWriteToken result
+  // is the right credential for both read and write paths.
+  const readPat = writeToken ?? fallbackPat;
+
+  const { fetched, errors } = await fetchGitHubContext(
+    repo,
+    message,
+    readPat ?? undefined,
+    isResearchBriefing,
+  );
 
   const repoDataJSON = JSON.stringify(
     {
@@ -552,10 +1009,15 @@ export async function POST(request: NextRequest) {
     `REPOSITORY DATA:\n${repoDataJSON}\n\nUSER QUESTION:\n${message}`;
 
   // 6. Stream
-  return streamFromAnthropic(
-    anthropicKey,
-    SYSTEM_PROMPT(repo),
-    history,
-    userPayload,
-  );
+  return streamFromAnthropic({
+    apiKey: anthropicKey,
+    systemPrompt: isResearchBriefing
+      ? RESEARCH_BRIEFING_PROMPT
+      : systemPromptChat(repo),
+    history: isResearchBriefing ? [] : history,
+    userMessage: userPayload,
+    writeToken,
+    repo,
+    allowActions: !isResearchBriefing,
+  });
 }

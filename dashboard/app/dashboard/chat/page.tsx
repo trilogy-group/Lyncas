@@ -105,6 +105,12 @@ interface InstallStatusState {
   loaded: boolean;
 }
 
+interface DirectoryTreeState {
+  repo: string;
+  text: string | null;
+  loading: boolean;
+}
+
 const MAX_INPUT_CHARS = 2000;
 const QUICK_ACTIONS: ReadonlyArray<{ label: string; prompt: string }> = [
   { label: "Recent PRs", prompt: "Show me the open pull requests." },
@@ -316,6 +322,8 @@ function ChatPageInner() {
     loaded: false,
   });
   const [showInstallModal, setShowInstallModal] = useState(false);
+  const [tree, setTree] = useState<DirectoryTreeState | null>(null);
+  const [treePanelOpen, setTreePanelOpen] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -323,64 +331,76 @@ function ChatPageInner() {
   const statsAbortRef = useRef<AbortController | null>(null);
   const researchAbortRef = useRef<AbortController | null>(null);
 
-  // --- mount: fetch watched repos -----------------------------------------
+  // Single helper for "read watched_repos for the signed-in user". We
+  // call it on mount AND again after /api/github-app/status runs
+  // reconciliation, because that endpoint may have deleted rows the
+  // first read picked up (stale rows from a prior install).
+  const refreshRepos = useCallback(async (): Promise<void> => {
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) {
+      router.replace("/login");
+      return;
+    }
+    const { data } = await supabase
+      .from("watched_repos")
+      .select("repo")
+      .eq("user_id", user.id)
+      .order("created_at", { ascending: false });
+    // If the currently selected repo got reconciled away the parent
+    // bootstrap effect handles clearing it via `removed_repos`. Here
+    // we just replace the list — the visual "active repo no longer
+    // appears" is enough to nudge the user to pick again.
+    setRepos((data ?? []) as WatchedRepoLite[]);
+  }, [router, supabase]);
+
+  // --- mount: fetch watched repos + probe install status -----------------
+  // Order matters: probe runs reconciliation server-side; once that
+  // finishes we re-read the repo list so the UI never displays a
+  // count that disagrees with what's in the DB.
   useEffect(() => {
     let cancelled = false;
-    async function load() {
+    async function bootstrap() {
       try {
-        const {
-          data: { user },
-        } = await supabase.auth.getUser();
-        if (!user) {
-          if (!cancelled) router.replace("/login");
-          return;
-        }
-        const { data } = await supabase
-          .from("watched_repos")
-          .select("repo")
-          .eq("user_id", user.id)
-          .order("created_at", { ascending: false });
-        if (cancelled) return;
-        setRepos((data ?? []) as WatchedRepoLite[]);
+        await refreshRepos();
       } finally {
         if (!cancelled) setLoading(false);
       }
-    }
-    void load();
-    return () => {
-      cancelled = true;
-      abortRef.current?.abort();
-      briefingAbortRef.current?.abort();
-      statsAbortRef.current?.abort();
-      researchAbortRef.current?.abort();
-    };
-  }, [router, supabase]);
 
-  // --- mount: probe live GitHub App installation status ------------------
-  useEffect(() => {
-    let cancelled = false;
-    async function probe() {
+      // Probe live GitHub App installation status. The route does a
+      // full reconcile as a side effect — when it returns we re-read
+      // watched_repos so any deleted rows disappear from the sidebar.
       try {
         const res = await fetch("/api/github-app/status");
-        if (!res.ok || cancelled) return;
+        if (cancelled) return;
+        if (!res.ok) {
+          setInstallStatus((s) => ({ ...s, loaded: true }));
+          return;
+        }
         const data = (await res.json()) as {
           healthy: number;
           stale: number;
+          removed_repos?: string[];
           install_url: string | null;
         };
-        if (cancelled) return;
         setInstallStatus({
           healthy: data.healthy ?? 0,
           stale: data.stale ?? 0,
           installUrl: data.install_url ?? null,
           loaded: true,
         });
-        // Auto-pop the modal when:
-        //   * no healthy installs and no cached watched_repos rows
-        //     (first-time onboarding) — modal IS the page
-        //   * no healthy installs but rows exist (stale install — user
-        //     uninstalled on GitHub; we have to ask them to re-install
-        //     for any write operations to work)
+        // Reconciliation either kept the row list intact or trimmed
+        // it. Re-read either way; cheap select.
+        await refreshRepos();
+        // If selectedRepo got removed by reconciliation, clear it so
+        // the room doesn't 403 silently when the user types.
+        if (cancelled) return;
+        if ((data.removed_repos ?? []).length > 0) {
+          setSelectedRepo((cur) =>
+            cur && (data.removed_repos ?? []).includes(cur) ? "" : cur,
+          );
+        }
         if ((data.healthy ?? 0) === 0) {
           setShowInstallModal(true);
         }
@@ -388,11 +408,15 @@ function ChatPageInner() {
         if (!cancelled) setInstallStatus((s) => ({ ...s, loaded: true }));
       }
     }
-    void probe();
+    void bootstrap();
     return () => {
       cancelled = true;
+      abortRef.current?.abort();
+      briefingAbortRef.current?.abort();
+      statsAbortRef.current?.abort();
+      researchAbortRef.current?.abort();
     };
-  }, []);
+  }, [refreshRepos]);
 
   // --- query-string hand-offs from /auth/github-app/callback -------------
   useEffect(() => {
@@ -403,23 +427,61 @@ function ChatPageInner() {
       setShowInstallModal(true);
     }
     if (connected) {
-      // Successful install — auto-refresh status so the modal goes
-      // away even before the user does anything.
-      void fetch("/api/github-app/status")
-        .then((r) => (r.ok ? r.json() : null))
-        .then((data) => {
-          if (!data) return;
+      // Successful install — auto-refresh status (also reconciles) and
+      // pick up the new repo list. We re-read watched_repos so the
+      // sidebar shows the freshly-selected repos.
+      void (async () => {
+        try {
+          const r = await fetch("/api/github-app/status");
+          if (!r.ok) return;
+          const data = (await r.json()) as {
+            healthy: number;
+            stale: number;
+            install_url: string | null;
+          };
           setInstallStatus({
             healthy: data.healthy ?? 0,
             stale: data.stale ?? 0,
             installUrl: data.install_url ?? null,
             loaded: true,
           });
+          await refreshRepos();
           if ((data.healthy ?? 0) > 0) setShowInstallModal(false);
-        })
-        .catch(() => {});
+        } catch {
+          // Best effort. The empty-room state handles missing repos.
+        }
+      })();
     }
-  }, [searchParams]);
+  }, [searchParams, refreshRepos]);
+
+  // --- fetch directory tree when selected repo changes -------------------
+  // Read from repo_rules.repo_directory_tree (anon-readable per
+  // migration 009). The agent writes this column each time it runs;
+  // when it's blank we show a hint inviting the user to wait for the
+  // first review to populate the tree.
+  useEffect(() => {
+    if (!selectedRepo) {
+      setTree(null);
+      return;
+    }
+    let cancelled = false;
+    setTree({ repo: selectedRepo, text: null, loading: true });
+    void (async () => {
+      const { data } = await supabase
+        .from("repo_rules")
+        .select("repo_directory_tree")
+        .eq("repo", selectedRepo)
+        .maybeSingle();
+      if (cancelled) return;
+      const text =
+        (data as { repo_directory_tree: string | null } | null)
+          ?.repo_directory_tree ?? null;
+      setTree({ repo: selectedRepo, text, loading: false });
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedRepo, supabase]);
 
   // Initialize right-sidebar collapse defaults from viewport once.
   useEffect(() => {
@@ -858,6 +920,13 @@ function ChatPageInner() {
             />
           </Card>
 
+          <ProjectStructureCard
+            tree={tree}
+            hasRepo={hasRepo}
+            open={treePanelOpen}
+            onToggle={() => setTreePanelOpen((v) => !v)}
+          />
+
           <Card className="p-3" flush>
             <div className="px-1 pb-2 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
               Quick actions
@@ -1108,9 +1177,6 @@ function ChatPageInner() {
       {showInstallModal && (
         <InstallAppModal
           installUrl={installStatus.installUrl}
-          healthy={installStatus.healthy}
-          stale={installStatus.stale}
-          repoCount={repos.length}
           installError={installError}
           onClose={() => setShowInstallModal(false)}
         />
@@ -1274,6 +1340,83 @@ function RepoDropdown({
 }
 
 // =========================================================================
+// Project structure card — left sidebar, above Quick actions.
+// Reads repo_rules.repo_directory_tree (anon-select per migration 009).
+// =========================================================================
+
+function ProjectStructureCard({
+  tree,
+  hasRepo,
+  open,
+  onToggle,
+}: {
+  tree: DirectoryTreeState | null;
+  hasRepo: boolean;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const empty = !hasRepo;
+  const ready = !!(tree && !tree.loading && tree.text && tree.text.trim());
+  const lineCount = ready ? (tree!.text as string).split("\n").length : 0;
+  return (
+    <Card flush>
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex w-full items-center justify-between gap-2 border-b border-border px-3 py-2 text-left transition-colors hover:bg-bg-elev"
+        aria-expanded={open}
+      >
+        <span className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="10"
+            height="10"
+            viewBox="0 0 16 16"
+            fill="currentColor"
+            className={
+              "transition-transform " + (open ? "rotate-90" : "rotate-0")
+            }
+          >
+            <path d="M5 3l6 5-6 5V3z" />
+          </svg>
+          Project structure
+        </span>
+        {ready && (
+          <span className="font-mono text-[9px] text-muted">
+            {lineCount} line{lineCount === 1 ? "" : "s"}
+          </span>
+        )}
+      </button>
+      {open && (
+        <div className="p-2 text-[11px]">
+          {empty ? (
+            <p className="px-1 py-2 text-[11px] text-muted">
+              Select a repository to see its tree.
+            </p>
+          ) : tree?.loading ? (
+            <div className="animate-pulse space-y-1.5 px-1 py-1">
+              <div className="h-2 w-3/4 rounded bg-border/50" />
+              <div className="h-2 w-2/3 rounded bg-border/50" />
+              <div className="h-2 w-5/6 rounded bg-border/50" />
+              <div className="h-2 w-1/2 rounded bg-border/50" />
+            </div>
+          ) : ready ? (
+            <pre className="max-h-72 overflow-auto whitespace-pre rounded-sm bg-bg-elev px-2 py-2 font-mono text-[10.5px] leading-relaxed text-text">
+              {tree!.text}
+            </pre>
+          ) : (
+            <p className="px-1 py-2 text-[11px] text-muted">
+              No tree yet — the agent will populate this when it runs
+              its next review.
+            </p>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+// =========================================================================
 // Empty room state — shown in the middle pane when no repo is selected.
 // Doesn't include a picker any more (the user picks from the sidebar).
 // =========================================================================
@@ -1356,16 +1499,10 @@ function NoRoomState({
 
 function InstallAppModal({
   installUrl,
-  healthy,
-  stale,
-  repoCount,
   installError,
   onClose,
 }: {
   installUrl: string | null;
-  healthy: number;
-  stale: number;
-  repoCount: number;
   installError: string | null;
   onClose: () => void;
 }) {
@@ -1386,15 +1523,15 @@ function InstallAppModal({
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  // Heuristic for the title — "first time install" vs "reinstall" vs
-  // a flat-out "GitHub returned an error" state. The body of the
-  // modal explains each.
-  const isReinstall = repoCount > 0 && healthy === 0 && stale > 0;
+  // Copy is intentionally neutral. We don't reference the number of
+  // repos in the user's stale watched_repos cache — that count
+  // confused early testers ("why does it say 51 when I'm trying to
+  // install fresh?"). The reconciliation step on the server takes
+  // care of cleaning that up; the UI just needs to ask for a fresh
+  // install.
   const title = installError
     ? "Couldn't finish installing"
-    : isReinstall
-      ? "Reinstall the GitHub App"
-      : "Install the GitHub App";
+    : "Connect GitHub to continue";
 
   return (
     <div
@@ -1403,7 +1540,6 @@ function InstallAppModal({
       aria-labelledby="install-modal-title"
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm px-4"
       onClick={(e) => {
-        // Backdrop click → close. Inner clicks shouldn't propagate.
         if (e.target === e.currentTarget) onClose();
       }}
     >
@@ -1437,62 +1573,29 @@ function InstallAppModal({
             </div>
           ) : null}
 
-          {isReinstall ? (
-            <div className="space-y-2 text-sm">
-              <p>
-                We can see {repoCount} repositor
-                {repoCount === 1 ? "y" : "ies"} you previously connected,
-                but GitHub no longer reports a working installation on
-                your account. This usually means the app was uninstalled
-                from{" "}
-                <a
-                  href="https://github.com/settings/installations"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="underline hover:text-text"
-                >
-                  GitHub → Settings → Applications
-                </a>
-                .
-              </p>
-              <p className="text-xs text-muted">
-                Re-installing reconnects the same repos automatically.
-                Pick &ldquo;All repositories&rdquo; on the install screen
-                if you want every repo watched.
-              </p>
-            </div>
-          ) : (
-            <div className="space-y-2 text-sm">
-              <p>
-                Night PR Reviewer needs a GitHub App installation to read
-                pull requests, post review comments, and (when you ask
-                it to) close or merge PRs.
-              </p>
-              <p className="text-xs text-muted">
-                You choose which repos to grant access to. There&apos;s
-                no limit — pick one, several, or all of them.
-              </p>
-            </div>
-          )}
+          <div className="space-y-2 text-sm leading-relaxed">
+            <p>
+              Install the Night PR Reviewer GitHub App to start reading
+              your pull requests. If you&apos;ve installed it before but
+              recently changed it on GitHub, re-install here to refresh
+              the connection.
+            </p>
+            <p className="text-xs text-muted">
+              GitHub will ask which repositories to grant access to — pick
+              any subset you&apos;d like reviewed. You can adjust the
+              selection any time.
+            </p>
+          </div>
 
           <div className="flex flex-col gap-2">
             {installUrl ? (
-              <>
-                <a
-                  href={installUrl}
-                  className="inline-flex h-10 w-full items-center justify-center gap-2 bg-white font-mono text-sm uppercase tracking-[0.08em] text-black hover:bg-white/90"
-                >
-                  <GitHubGlyph />
-                  {isReinstall ? "Reinstall on GitHub" : "Install on GitHub"}
-                </a>
-                <a
-                  href={`${installUrl}?repository_target=all`}
-                  className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-sm border border-border bg-transparent font-mono text-sm text-muted hover:border-border-strong hover:text-text"
-                  title="Same install flow with 'All repositories' preselected on GitHub"
-                >
-                  Install on all my repos
-                </a>
-              </>
+              <a
+                href={installUrl}
+                className="inline-flex h-10 w-full items-center justify-center gap-2 bg-white font-mono text-sm uppercase tracking-[0.08em] text-black hover:bg-white/90"
+              >
+                <GitHubGlyph />
+                Continue with GitHub
+              </a>
             ) : (
               <div className="rounded-sm border border-[#ff5252]/40 bg-[#ff5252]/10 px-3 py-2 text-xs text-[#ff5252]">
                 The GitHub App slug isn&apos;t configured on this deploy
@@ -1502,7 +1605,15 @@ function InstallAppModal({
             )}
           </div>
 
-          <div className="flex justify-end border-t border-border pt-3">
+          <div className="flex items-center justify-between border-t border-border pt-3">
+            <a
+              href="https://github.com/settings/installations"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-[11px] font-mono uppercase tracking-[0.14em] text-muted hover:text-text"
+            >
+              Manage on GitHub →
+            </a>
             <button
               type="button"
               onClick={onClose}

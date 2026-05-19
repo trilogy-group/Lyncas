@@ -5,11 +5,9 @@ import {
   probeAppJWT,
   type Installation,
 } from "@/lib/github-app";
+import { reconcileUserInstallations } from "@/lib/github-app-reconcile";
 import { upsertInstallation } from "@/lib/queries";
-import {
-  createSupabaseServerClient,
-  getUser,
-} from "@/lib/supabase/server";
+import { getUser } from "@/lib/supabase/server";
 
 // /auth/github-app/callback — landing page after a user installs (or
 // re-configures) the Night PR Reviewer GitHub App.
@@ -142,38 +140,31 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  // Provision one watched_repos row per selected repo. We upsert on
-  // (user_id, repo) so re-installs and selection changes are
-  // idempotent. github_token is intentionally NULLed for App-backed
-  // rows — credentials come from minting an installation token on
-  // demand (see /api/github-app/installation-token).
-  const supabase = await createSupabaseServerClient();
-  const rows = repos.map((repo) => ({
-    user_id: user.id,
-    repo,
-    github_installation_id: installation.id,
-    token_type: "github_app" as const,
-    github_token: null,
-    enabled: true,
-  }));
-
-  if (rows.length > 0) {
-    const { error: upsertErr } = await supabase
-      .from("watched_repos")
-      .upsert(rows, { onConflict: "user_id,repo" });
-    if (upsertErr) {
-      return backToConnect(
-        request,
-        `Installation saved, but provisioning repos failed: ${upsertErr.message}`,
-      );
-    }
+  // Provision watched_repos via full reconciliation. The helper:
+  //   * upserts one row per (live install, selected repo),
+  //   * probes any other installations recorded for this user and
+  //     deletes the stale ones, and
+  //   * deletes watched_repos rows that no live install reports.
+  //
+  // This is what fixes "I reinstalled with 4 repos but the dashboard
+  // still shows 51" — the old rows pointed at a now-stale install_id,
+  // reconciliation drops them. Idempotent: a no-op when the DB
+  // already matches GitHub.
+  const summary = await reconcileUserInstallations(user.id);
+  if (summary.warnings.length > 0) {
+    // Don't fail the redirect — surface non-fatal issues in logs.
+    console.warn(
+      "[github-app/callback] reconcile warnings:",
+      summary.warnings.join("; "),
+    );
   }
 
   const u = request.nextUrl.clone();
   u.pathname = "/dashboard/chat";
-  // Pass a one-shot flag the chat page (or a future toast) can show.
-  // Even if the page ignores it, it disambiguates the redirect in the
-  // browser history.
-  u.search = `?connected=${repos.length}`;
+  // The browser receives the count GitHub *currently* reports — not
+  // the count from the URL — so a re-selection from 51 → 4 actually
+  // shows as 4.
+  const finalCount = repos.length;
+  u.search = `?connected=${finalCount}`;
   return NextResponse.redirect(u);
 }

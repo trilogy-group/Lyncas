@@ -3,7 +3,7 @@ import {
   createSupabaseServerClient,
   getUser,
 } from "@/lib/supabase/server";
-import { createInstallationToken, getInstallation } from "@/lib/github-app";
+import { reconcileUserInstallations } from "@/lib/github-app-reconcile";
 
 // GET /api/github-app/status
 //
@@ -12,33 +12,30 @@ import { createInstallationToken, getInstallation } from "@/lib/github-app";
 //
 //   {
 //     healthy: number,                    // live installations on GitHub
-//     stale:   number,                    // rows we have but GitHub no
-//                                         // longer recognizes (user
-//                                         // uninstalled the App without
-//                                         // us hearing about it)
+//     stale:   number,                    // rows we removed in this call
+//                                         // (zero on the steady state)
 //     accounts: { login, installation_id }[],
 //     install_url: string | null,         // null when no app slug configured
 //   }
 //
-// Why this exists: every other surface in the dashboard reads from
-// Supabase's watched_repos / github_app_installations cache, which is
-// not updated when the user uninstalls the App on GitHub (we don't
-// subscribe to the `installation.deleted` webhook yet). The chat page
-// uses this route on mount to decide whether to show a "Please install"
-// modal — if every recorded installation comes back stale we know the
-// cache is lying.
+// Side effect: this endpoint RECONCILES on every call. We don't have
+// the `installation.deleted` webhook subscribed yet, so the next-best
+// thing is "re-derive truth from GitHub whenever the user looks at
+// the chat page". The reconcile helper:
+//   * probes every installation row for this user,
+//   * deletes the ones GitHub no longer recognizes,
+//   * removes watched_repos rows whose installation is dead OR whose
+//     repo isn't in the live install's current selection, and
+//   * upserts whatever GitHub does report so newly-selected repos
+//     show up immediately.
 //
-// We deliberately do NOT delete stale rows here. A reconcile sweep is
-// safer to do once, server-side, with full visibility — and an
-// authenticated GET route is the wrong place to mutate state.
+// Why on the read endpoint and not a separate POST: every other
+// surface is read-only-from-the-client. Putting reconciliation here
+// means the user never has to "remember to clean up" — opening chat
+// is enough.
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-
-interface InstallationRow {
-  installation_id: number;
-  account_login: string | null;
-}
 
 function buildInstallUrl(): string | null {
   const slug = process.env.NEXT_PUBLIC_GITHUB_APP_SLUG;
@@ -52,6 +49,18 @@ export async function GET() {
     return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
   }
 
+  // Reconcile first — afterwards `github_app_installations` only
+  // contains live rows, so the lookup below is straightforward.
+  const summary = await reconcileUserInstallations(user.id).catch(
+    (e): null => {
+      console.error("[github-app/status] reconcile failed:", e);
+      return null;
+    },
+  );
+
+  // Re-read the (now-clean) install rows to surface account logins to
+  // the UI. We don't trust the reconcile summary alone here because it
+  // doesn't carry account_login — that's a separate select.
   const supabase = await createSupabaseServerClient();
   const { data, error } = await supabase
     .from("github_app_installations")
@@ -63,50 +72,22 @@ export async function GET() {
     // install" so the UI prompts to install) rather than 500.
     return NextResponse.json({
       healthy: 0,
-      stale: 0,
+      stale: summary?.stale_installation_ids.length ?? 0,
       accounts: [],
       install_url: buildInstallUrl(),
       degraded: true,
     });
   }
 
-  const rows = (data ?? []) as InstallationRow[];
-
-  // Probe each installation in parallel. A 404 from
-  // GET /app/installations/{id} (or any thrown error from the helper)
-  // means GitHub no longer recognizes the installation — the user
-  // uninstalled, was removed from the org, or the App was rotated.
-  const results = await Promise.all(
-    rows.map(async (row) => {
-      try {
-        const inst = await getInstallation(row.installation_id);
-        // Also confirm we can actually mint a token. /app/installations
-        // returning data without /access_tokens working has been
-        // observed when the install is suspended; treat that as stale.
-        await createInstallationToken(row.installation_id);
-        return {
-          ok: true as const,
-          installation_id: row.installation_id,
-          account_login: inst.account.login,
-        };
-      } catch {
-        return { ok: false as const, installation_id: row.installation_id };
-      }
-    }),
-  );
-
-  const accounts = results
-    .filter((r): r is { ok: true; installation_id: number; account_login: string } => r.ok)
-    .map((r) => ({
-      login: r.account_login,
-      installation_id: r.installation_id,
-    }));
-  const healthy = accounts.length;
-  const stale = results.length - healthy;
+  const accounts = (data ?? []).map((r) => ({
+    login: (r as { account_login: string | null }).account_login ?? "?",
+    installation_id: (r as { installation_id: number }).installation_id,
+  }));
 
   return NextResponse.json({
-    healthy,
-    stale,
+    healthy: accounts.length,
+    stale: summary?.stale_installation_ids.length ?? 0,
+    removed_repos: summary?.removed_repos ?? [],
     accounts,
     install_url: buildInstallUrl(),
   });

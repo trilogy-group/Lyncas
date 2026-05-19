@@ -33,6 +33,33 @@ done
 
 mkdir -p "$INSTALL_DIR"
 
+# Install cloudflared if not present
+if ! command -v cloudflared &>/dev/null; then
+  echo "📦 Installing cloudflared..."
+  ARCH=$(uname -m)
+  if [ "$ARCH" = "x86_64" ]; then
+    CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+  elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+    CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
+  else
+    echo "⚠️  Unknown architecture: $ARCH — install cloudflared manually"
+    CF_URL=""
+  fi
+
+  if [ -n "$CF_URL" ]; then
+    if command -v sudo &>/dev/null; then
+      sudo curl -L "$CF_URL" -o /usr/local/bin/cloudflared
+      sudo chmod +x /usr/local/bin/cloudflared
+    else
+      curl -L "$CF_URL" -o "$INSTALL_DIR/cloudflared"
+      chmod +x "$INSTALL_DIR/cloudflared"
+      # Add to PATH if not already there
+      export PATH="$INSTALL_DIR:$PATH"
+    fi
+    echo "✅ cloudflared installed"
+  fi
+fi
+
 echo "📦 Downloading MCP server..."
 curl -fsSL "$DASHBOARD_URL/api/devpod/mcp-server" \\
   -o "$INSTALL_DIR/mcp_server.py"

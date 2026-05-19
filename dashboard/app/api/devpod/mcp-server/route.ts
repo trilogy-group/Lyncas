@@ -40,9 +40,18 @@ from pathlib import Path
 DASHBOARD_URL = "https://night-pr-reviewer-v2-saas.vercel.app"
 
 def get_tunnel_url(port):
-    import re
+    import re, shutil
+    # Prefer a system-installed cloudflared; fall back to the
+    # bundled copy that devpod-connect.sh drops into INSTALL_DIR
+    # when sudo wasn't available at install time. Returning
+    # (None, None) here lets main() print a useful error instead
+    # of leaving a dead Popen handle hanging around.
+    cf_path = shutil.which("cloudflared") or \\
+              os.path.expanduser("~/.night-pr-reviewer/cloudflared")
+    if not os.path.exists(cf_path):
+        return None, None
     proc = subprocess.Popen(
-        ["cloudflared", "tunnel", "--url", f"http://localhost:{port}"],
+        [cf_path, "tunnel", "--url", f"http://localhost:{port}"],
         stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True
     )
     for line in proc.stderr:
@@ -165,9 +174,20 @@ class MCPHandler(BaseHTTPRequestHandler):
 
             elif cmd_type == "expose_port":
                 port = body.get("port", 3000)
-                import re
+                import re, shutil
+                # Same lookup rule as get_tunnel_url — system PATH
+                # first, then the no-sudo install-dir fallback.
+                cf_path = shutil.which("cloudflared") or \\
+                          os.path.expanduser("~/.night-pr-reviewer/cloudflared")
+                if not os.path.exists(cf_path):
+                    self._json(500, {
+                        "error": "cloudflared not found. Re-run the install script.",
+                        "port": port,
+                        "success": False,
+                    })
+                    return
                 proc = subprocess.Popen(
-                    ["cloudflared", "tunnel", "--url", f"http://localhost:{port}"],
+                    [cf_path, "tunnel", "--url", f"http://localhost:{port}"],
                     stderr=subprocess.PIPE, text=True
                 )
                 url = None

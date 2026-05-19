@@ -29,9 +29,12 @@ const COLUMNS: FooterColumn[] = [
     heading: "Resources",
     links: [
       { label: "Documentation", href: "/landing#docs" },
-      { label: "Benchmarks", href: "/benchmark" },
       { label: "Changelog", href: "/landing#changelog" },
-      { label: "Learning report", href: "/learning" },
+      {
+        label: "GitHub",
+        href: "https://github.com/HarshBti1805/night-pr-reviewer",
+        external: true,
+      },
     ],
   },
   {

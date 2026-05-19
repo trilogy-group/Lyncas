@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import { Card } from "@/components/ui/card";
 import { Container } from "@/components/ui/container";
 import { SectionHeading } from "@/components/ui/section-heading";
@@ -9,7 +10,8 @@ import {
   severityColor,
   severityColors,
 } from "@/lib/design";
-import { getRepoStats } from "@/lib/queries";
+import { getRepoStats, getWatchedRepos } from "@/lib/queries";
+import { getUser } from "@/lib/supabase/server";
 import type { RepoRulesStatus } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -32,16 +34,31 @@ const DOT: Record<RepoRulesStatus, { color: string; title: string }> = {
 };
 
 export default async function ReposPage() {
-  const repos = await getRepoStats();
+  // Auth boundary: the legacy /repos page used to render every row in
+  // `reviews` regardless of who created it. On a shared deployment that
+  // leaked review history across accounts, so the route is now
+  // auth-gated and filtered to the caller's own watched_repos.
+  const user = await getUser().catch(() => null);
+  if (!user) {
+    redirect("/login?next=%2Frepos");
+  }
+
+  const [allStats, watched] = await Promise.all([
+    getRepoStats(),
+    getWatchedRepos(user.id),
+  ]);
+  const owned = new Set(watched.map((w) => w.repo));
+  const repos = allStats.filter((r) => owned.has(r.repo));
 
   return (
     <Container className="py-10 space-y-6">
       <SectionHeading
-        eyebrow="Repos"
-        title="All watched repositories"
+        eyebrow="Your repos"
+        title="Repositories you've connected"
         subtitle={
           <>
-            One row per watched repo · totals are all-time · cost window is{" "}
+            One row per repo you've connected via the GitHub App ·
+            totals are all-time · cost window is{" "}
             <span className="text-white">30d</span>.
           </>
         }
@@ -49,8 +66,24 @@ export default async function ReposPage() {
 
       {repos.length === 0 ? (
         <Card className="p-8 text-center text-sm text-muted">
-          No reviews recorded yet. Once the agent reviews a PR, that repo
-          will appear here.
+          {watched.length === 0 ? (
+            <>
+              No repos connected yet. Head to{" "}
+              <Link
+                href="/dashboard/repos"
+                className="text-white hover:underline underline-offset-4"
+              >
+                Repos
+              </Link>{" "}
+              to install the GitHub App and pick which repositories the
+              agent should watch.
+            </>
+          ) : (
+            <>
+              The agent hasn&apos;t reviewed a PR on your connected repos
+              yet. Once it runs, that repo will appear here.
+            </>
+          )}
         </Card>
       ) : (
         <Table>

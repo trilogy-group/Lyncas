@@ -1,86 +1,14 @@
-import { Card } from "@/components/ui/card";
-import { Container } from "@/components/ui/container";
-import { SectionHeading } from "@/components/ui/section-heading";
-import { Table, TableBody, TableHeader, Td, Th } from "@/components/ui/table";
-import { formatDuration, formatRelativeTime } from "@/lib/design";
-import { getRuns } from "@/lib/queries";
+import { notFound } from "next/navigation";
 
 export const dynamic = "force-dynamic";
 
-export default async function RunsPage() {
-  const runs = await getRuns(50);
-  return (
-    <Container className="py-10 space-y-6">
-      <SectionHeading
-        eyebrow="Runs"
-        title="Agent runs"
-        subtitle={
-          <>
-            Last <span className="text-white font-medium">50</span> invocations
-            of the cron-driven reviewer.
-          </>
-        }
-      />
-
-      {runs.length === 0 ? (
-        <Card className="p-8 text-center text-sm text-muted">
-          No runs recorded yet.
-        </Card>
-      ) : (
-        <Table>
-          <TableHeader>
-            <tr>
-              <Th>Started</Th>
-              <Th>Duration</Th>
-              <Th>Repos scanned</Th>
-              <Th>Reviews</Th>
-              <Th>Skipped</Th>
-              <Th>Errors</Th>
-              <Th>Trigger</Th>
-            </tr>
-          </TableHeader>
-          <TableBody>
-            {runs.map((r) => {
-              const errCount = r.errors?.length ?? 0;
-              const hasErr = errCount > 0;
-              return (
-                <tr key={r.id} className="hover:bg-bg-elev transition-colors">
-                  <Td
-                    className="whitespace-nowrap font-mono text-xs"
-                    style={
-                      hasErr
-                        ? { borderLeft: "3px solid #ff5252" }
-                        : undefined
-                    }
-                  >
-                    {formatRelativeTime(r.started_at)}
-                  </Td>
-                  <Td className="font-mono text-xs">
-                    {formatDuration(r.started_at, r.finished_at)}
-                  </Td>
-                  <Td className="font-mono text-xs text-muted">
-                    {(r.repos_scanned ?? []).join(", ") || "—"}
-                  </Td>
-                  <Td className="font-mono text-xs">{r.reviews_created}</Td>
-                  <Td className="font-mono text-xs text-muted">{r.skipped}</Td>
-                  <Td
-                    className="font-mono text-xs"
-                    style={{
-                      color: hasErr ? "#ff5252" : "#8a8a8a",
-                      fontWeight: hasErr ? 600 : 400,
-                    }}
-                  >
-                    {errCount}
-                  </Td>
-                  <Td className="font-mono text-xs text-muted">
-                    {r.trigger_source ?? "—"}
-                  </Td>
-                </tr>
-              );
-            })}
-          </TableBody>
-        </Table>
-      )}
-    </Container>
-  );
+// Legacy v1 demo route — disabled.
+//
+// The Runs page used to read the global `runs` table, which logs every
+// agent invocation across all users with no per-user scope. Exposing
+// that on a multi-tenant deployment leaked activity across accounts,
+// so the route is 404'd until `runs` gets a `user_id` column + RLS.
+// The directory is kept so a future re-enable is a one-file change.
+export default function RunsPage(): never {
+  notFound();
 }

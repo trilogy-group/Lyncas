@@ -14,8 +14,9 @@ import { getUserProfile } from "@/lib/queries";
 //   /login, /auth/callback         — auth-only screens
 //   /dashboard/*                   — AuthedNav from dashboard/layout
 //
-// Everything else (the v1 demo: /, /repos, /runs, /benchmark, /settings,
-// /learning, /pr/[id]) renders this bar.
+// Everything else (the v1 demo: /, /repos, /settings, /pr/[id])
+// renders this bar. /runs, /learning, /benchmark are 404'd at the
+// route level so they never reach the nav anyway.
 
 const HIDDEN_PREFIXES = [
   "/login",
@@ -25,23 +26,23 @@ const HIDDEN_PREFIXES = [
   "/auth/github-app",
 ];
 
+// /runs, /learning, /benchmark are intentionally absent on both axes.
+// They still exist on disk but their pages 404 so logged-out tire
+// kickers and logged-in users alike see nothing — that data was global
+// (no per-user filter) and shouldn't leak across accounts.
+//
+// /repos in the logged-out list points to a page that now auth-gates
+// itself; clicking through bounces to /login with the right `next`.
 const LOGGED_IN_LINKS: NavLinkSpec[] = [
   { href: "/dashboard/chat", label: "Chat" },
   { href: "/dashboard/overview", label: "Overview" },
   { href: "/dashboard/repos", label: "Repos" },
-  { href: "/runs", label: "Runs" },
-  { href: "/learning", label: "Learning" },
-  { href: "/benchmark", label: "Benchmark" },
   { href: "/dashboard/settings", label: "Settings" },
 ];
 
 const LOGGED_OUT_LINKS: NavLinkSpec[] = [
   { href: "/", label: "Overview" },
   { href: "/repos", label: "Repos" },
-  { href: "/runs", label: "Runs" },
-  { href: "/learning", label: "Learning" },
-  { href: "/benchmark", label: "Benchmark" },
-  { href: "/settings", label: "Settings" },
 ];
 
 async function readPathname(): Promise<string> {

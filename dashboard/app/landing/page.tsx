@@ -191,8 +191,8 @@ export default function LandingPage() {
               Read about how teams ship Night PR Reviewer
             </h3>
             <div className="flex flex-wrap items-center justify-center gap-3">
-              <LinkButton href="/benchmark" size="md" variant="primary">
-                See benchmarks
+              <LinkButton href="/login" size="md" variant="primary">
+                Try it on your repo
               </LinkButton>
               <Link
                 href="https://github.com/HarshBti1805/night-pr-reviewer"

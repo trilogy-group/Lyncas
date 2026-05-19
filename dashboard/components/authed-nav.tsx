@@ -14,13 +14,14 @@ interface AuthedNavProps {
   avatarUrl: string | null;
 }
 
+// Pared down to the surfaces a logged-in user can actually use. /runs,
+// /learning, /benchmark are legacy demo pages — kept on disk but hidden
+// from the nav and 404'd at the route level so a friend handed the
+// deployed URL never lands on someone else's data.
 const LINKS: NavLinkSpec[] = [
   { href: "/dashboard/chat", label: "Chat" },
   { href: "/dashboard/overview", label: "Overview" },
   { href: "/dashboard/repos", label: "Repos" },
-  { href: "/runs", label: "Runs" },
-  { href: "/learning", label: "Learning" },
-  { href: "/benchmark", label: "Benchmark" },
   { href: "/dashboard/settings", label: "Settings" },
 ];
 

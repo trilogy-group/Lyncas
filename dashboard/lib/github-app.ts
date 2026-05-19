@@ -40,21 +40,32 @@ interface AppConfig {
 //
 // Vercel accepts the private key in either shape:
 //   * Single-line with literal `\n` between PEM lines — common when
-//     pasted via the CLI / API or copied from a `.env.local`.
+//     pasted via the CLI / API or copied from a `.env.local`. We
+//     have to decode these or node-jsonwebtoken sees a one-line
+//     PEM and rejects it.
 //   * Multi-line with actual newlines — what Vercel's web UI
-//     produces when you paste the raw .pem contents into the
-//     multiline textarea.
-// Replacing `\\n` first is a no-op on the multi-line variant (it
-// has no literal backslash-n sequences), then `.trim()` strips any
-// trailing newline the UI tends to add. Either path yields a PEM
-// that node-jsonwebtoken accepts.
+//     produces when you paste the raw .pem contents. These already
+//     parse, so we leave them untouched (a blind replace would be a
+//     no-op anyway, but the conditional makes the intent obvious
+//     when reading logs).
 function appConfig(): AppConfig {
   const appId = process.env.GITHUB_APP_ID;
   if (!appId) throw new Error("GITHUB_APP_ID env var is not set");
-  const privateKey = (process.env.GITHUB_APP_PRIVATE_KEY || "")
-    .replace(/\\n/g, "\n")
-    .trim();
+  const rawKey = process.env.GITHUB_APP_PRIVATE_KEY || "";
+  const privateKey = rawKey.includes("\\n")
+    ? rawKey.replace(/\\n/g, "\n")
+    : rawKey;
   if (!privateKey) throw new Error("GITHUB_APP_PRIVATE_KEY env var is not set");
+
+  // TEMP debug — remove once the App JWT is confirmed working in prod.
+  // Expected output:
+  //   Key starts with: -----BEGIN RSA PRIVATE KEY
+  //   Key ends with:   END RSA PRIVATE KEY-----
+  // Safe to log because the markers are not secret; the entire key
+  // body is NOT logged.
+  console.log("Key starts with:", privateKey.substring(0, 27));
+  console.log("Key ends with:", privateKey.slice(-25));
+
   return { appId, privateKey };
 }
 

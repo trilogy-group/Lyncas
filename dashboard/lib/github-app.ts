@@ -300,23 +300,31 @@ export interface InstallationRepoList {
 
 /**
  * Lists repos the user picked during install. Paginated — GitHub
- * defaults to 30 per page and caps at 100. We follow the `next`
- * Link header so an org with hundreds of selected repos still
- * surfaces every one.
+ * caps at 100 per page; we loop pages until a short page is
+ * returned. Hard-capped at 10 pages (1000 repos) as a runaway guard.
+ *
+ * NB on auth: the canonical "list repos for this installation"
+ * endpoint is `GET /installation/repositories`, and it requires an
+ * **installation access token** — NOT the App JWT. (Earlier we hit
+ * `/app/installations/{id}/repositories` with the App JWT; that
+ * path does not exist on GitHub's API and returns 404.) So we mint
+ * an installation token first, then page through `/installation/
+ * repositories` with it.
  */
 export async function listInstallationRepos(
   installationId: number | string,
 ): Promise<string[]> {
-  const token = getAppJWT();
+  const installationToken = (
+    await createInstallationToken(installationId)
+  ).token;
+
   const collected: string[] = [];
   let page = 1;
   const perPage = 100;
-  // Cap at 10 pages (1000 repos) as a runaway-loop guard — well
-  // beyond anything a single user will plausibly install on.
   for (let i = 0; i < 10; i++) {
     const data = await ghFetch<InstallationRepoList>(
-      `/app/installations/${installationId}/repositories?per_page=${perPage}&page=${page}`,
-      token,
+      `/installation/repositories?per_page=${perPage}&page=${page}`,
+      installationToken,
     );
     for (const r of data.repositories) {
       collected.push(r.full_name);

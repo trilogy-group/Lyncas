@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Container } from "@/components/ui/container";
 import { SectionHeading } from "@/components/ui/section-heading";
+import { DevPodSettingsPanel } from "@/components/devpod-settings-panel";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 
 // /dashboard/settings — per-user account preferences. Currently scoped
@@ -256,6 +257,8 @@ export default function DashboardSettingsPage() {
           </div>
         )}
       </Card>
+
+      <DevPodSettingsPanel />
 
       <Card className="p-6 space-y-3">
         <h2 className="text-base font-semibold">Other settings</h2>

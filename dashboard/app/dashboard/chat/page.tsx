@@ -13,6 +13,7 @@ import { motion } from "framer-motion";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Container } from "@/components/ui/container";
+import { DevPodPanel } from "@/components/devpod-panel";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 
 // /dashboard/chat — three-column repo chat workspace.
@@ -325,6 +326,10 @@ function ChatPageInner() {
   const [showInstallModal, setShowInstallModal] = useState(false);
   const [tree, setTree] = useState<DirectoryTreeState | null>(null);
   const [treePanelOpen, setTreePanelOpen] = useState(false);
+  // GitHub login for the signed-in user (Supabase OAuth metadata).
+  // The DevPod panel polls /api/devpod/status?username=… so we need
+  // to surface it here rather than re-querying auth on every poll.
+  const [githubUsername, setGithubUsername] = useState<string | null>(null);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -344,6 +349,19 @@ function ChatPageInner() {
       router.replace("/login");
       return;
     }
+    // Capture the GitHub login on every refresh — it's the lookup
+    // key for /api/devpod/status. Falls back through the common
+    // metadata fields different OAuth providers use.
+    const meta = (user.user_metadata ?? {}) as Record<string, unknown>;
+    const gh =
+      typeof meta.user_name === "string" && meta.user_name.trim()
+        ? meta.user_name.trim()
+        : typeof meta.preferred_username === "string" &&
+            meta.preferred_username.trim()
+          ? meta.preferred_username.trim()
+          : null;
+    setGithubUsername(gh);
+
     const { data } = await supabase
       .from("watched_repos")
       .select("repo")
@@ -954,6 +972,8 @@ function ChatPageInner() {
               ))}
             </div>
           </Card>
+
+          {githubUsername && <DevPodPanel githubUsername={githubUsername} />}
         </aside>
 
         {/* === MIDDLE: chat pane === */}

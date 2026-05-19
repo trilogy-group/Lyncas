@@ -393,3 +393,65 @@ export interface BenchmarkStats {
   mean_bug_overlap_pct: number; // 0..100, average per-row bug overlap
   cost_ratio: number; // sum(opus_cost) / sum(sonnet_cost), 0 if no Sonnet cost
 }
+
+// --- Migration 014: DevPod MCP connect layer -----------------------------
+// Mirrors agent/migrations/014_devpod_sessions.sql. One row per running
+// DevPod CLI agent; the dashboard chat sidebar polls /api/devpod/status
+// against this table to render live/offline state.
+
+export type DevpodSessionStatus = "active" | "inactive";
+
+export interface DevpodCapabilities {
+  run_command: boolean;
+  run_tests: boolean;
+  start_app: boolean;
+  expose_port: boolean;
+}
+
+export interface DevpodSession {
+  id: string;
+  user_id: string | null;
+  github_username: string;
+  // The HTTPS Cloudflare tunnel URL the user's mcp_server.py is
+  // reachable at. We do NOT expose this to anonymous status callers —
+  // /api/devpod/status omits it for unauthenticated requests in case
+  // we ever need to lock it back down. (Currently it does serve it
+  // for the chat sidebar polling case; see route.ts for the rule.)
+  tunnel_url: string;
+  workspace_id: string | null;
+  status: DevpodSessionStatus;
+  connected_at: string;
+  last_ping: string;
+  expires_at: string;
+  openclaw_session_id: string | null;
+  capabilities: DevpodCapabilities;
+}
+
+export type DevpodExecutionType =
+  | "run_command"
+  | "run_tests"
+  | "start_app"
+  | "expose_port";
+
+export interface DevpodExecution {
+  id: string;
+  session_id: string;
+  command: string;
+  type: DevpodExecutionType;
+  output: string | null;
+  exit_code: number | null;
+  started_at: string;
+  finished_at: string | null;
+  duration_ms: number | null;
+}
+
+// Shape returned by GET /api/devpod/status. `connected: false` is
+// always returned on miss; fields below it are only populated on hit.
+export interface DevpodStatusResponse {
+  connected: boolean;
+  tunnel_url?: string;
+  workspace_id?: string | null;
+  last_ping?: string;
+  capabilities?: DevpodCapabilities;
+  expires_at?: string;
+}

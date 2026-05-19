@@ -16,6 +16,15 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+# Auto-load .env for local/EC2 runs (no-op in GitHub Actions/systemd
+# where env vars are injected externally).
+try:
+    from pathlib import Path as _Path
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(_Path(__file__).parent / ".env", override=False)
+except ImportError:
+    pass
+
 import requests
 from anthropic import Anthropic
 from supabase import Client, create_client

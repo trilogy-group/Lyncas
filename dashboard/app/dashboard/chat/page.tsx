@@ -456,33 +456,40 @@ function ChatPageInner() {
   }, [searchParams, refreshRepos]);
 
   // --- fetch directory tree when selected repo changes -------------------
-  // Read from repo_rules.repo_directory_tree (anon-readable per
-  // migration 009). The agent writes this column each time it runs;
-  // when it's blank we show a hint inviting the user to wait for the
-  // first review to populate the tree.
+  // Hit /api/repo-tree which calls GitHub's /contents endpoint server-
+  // side. This replaces the old behaviour that pulled
+  // repo_rules.repo_directory_tree (a per-PR snapshot that frequently
+  // contained nothing more than "./" when the most recent reviewed PR
+  // touched only root files).
   useEffect(() => {
     if (!selectedRepo) {
       setTree(null);
       return;
     }
-    let cancelled = false;
+    const ac = new AbortController();
     setTree({ repo: selectedRepo, text: null, loading: true });
     void (async () => {
-      const { data } = await supabase
-        .from("repo_rules")
-        .select("repo_directory_tree")
-        .eq("repo", selectedRepo)
-        .maybeSingle();
-      if (cancelled) return;
-      const text =
-        (data as { repo_directory_tree: string | null } | null)
-          ?.repo_directory_tree ?? null;
-      setTree({ repo: selectedRepo, text, loading: false });
+      try {
+        const res = await fetch(
+          `/api/repo-tree?repo=${encodeURIComponent(selectedRepo)}`,
+          { signal: ac.signal },
+        );
+        let text: string | null = null;
+        if (res.ok) {
+          const body = (await res.json()) as { tree?: string | null };
+          text = body.tree ?? null;
+        }
+        if (ac.signal.aborted) return;
+        setTree({ repo: selectedRepo, text, loading: false });
+      } catch (err) {
+        if ((err as Error)?.name === "AbortError") return;
+        setTree({ repo: selectedRepo, text: null, loading: false });
+      }
     })();
     return () => {
-      cancelled = true;
+      ac.abort();
     };
-  }, [selectedRepo, supabase]);
+  }, [selectedRepo]);
 
   // Initialize right-sidebar collapse defaults from viewport once.
   useEffect(() => {
@@ -1228,7 +1235,18 @@ function RepoDropdown({
   }, [open]);
 
   const empty = repos.length === 0;
-  const label = value || (empty ? "No repos connected" : "Select a repo");
+  // Show only the repo name (everything after the last "/") to keep
+  // the dropdown readable in a 220px sidebar. Full owner/name is in
+  // the tooltip + the chat header for context.
+  function shortName(full: string): string {
+    const slash = full.lastIndexOf("/");
+    return slash >= 0 ? full.slice(slash + 1) : full;
+  }
+  const label = value
+    ? shortName(value)
+    : empty
+      ? "No repos connected"
+      : "Select a repo";
 
   return (
     <div ref={containerRef} className="relative">
@@ -1313,7 +1331,7 @@ function RepoDropdown({
                   alt=""
                   className="h-5 w-5 shrink-0 rounded-full border border-border bg-card"
                 />
-                <span className="truncate font-mono">{r.repo}</span>
+                <span className="truncate font-mono">{shortName(r.repo)}</span>
                 {active && (
                   <span className="ml-auto text-[9px] font-mono uppercase tracking-[0.14em] text-muted">
                     active

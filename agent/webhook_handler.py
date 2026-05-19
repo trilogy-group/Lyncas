@@ -72,6 +72,7 @@ REVIEWABLE_ACTIONS = {"opened", "synchronize"}
 AGENT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = AGENT_DIR.parent
 PR_REVIEWER_SCRIPT = AGENT_DIR / "pr_reviewer.py"
+DEVPOD_TESTER_SCRIPT = AGENT_DIR / "devpod_tester.py"
 VENV_PYTHON = AGENT_DIR / ".venv" / "bin" / "python"
 
 
@@ -105,16 +106,94 @@ def verify_signature(raw_body: bytes, signature_header: str | None) -> bool:
     return hmac.compare_digest(expected, signature_header)
 
 
-# --- Reviewer dispatch ----------------------------------------------------
+# --- DevPod session lookup -----------------------------------------------
+
+def get_active_devpod_session(repo: str) -> dict | None:
+    """Return the live DevPod session for the user who owns `repo`,
+    or None if there is no such session.
+
+    Best-effort: any failure (Supabase down, schema mismatch, no
+    SUPABASE_SERVICE_KEY in this environment) returns None so the
+    review path proceeds unaffected. The whole point of the check
+    is "speculatively dispatch a sandbox test if and only if it can
+    plausibly succeed"; never let it block the review.
+
+    Performs two cheap RPC calls:
+      1. watched_repos for the repo → user_id (the row inserted by
+         the dashboard's connect-repo flow).
+      2. devpod_sessions for that user_id → tunnel_url + workspace_id,
+         filtered to status='active' AND expires_at > now() so a
+         crashed CLI's stale row doesn't dispatch a tester that
+         immediately times out."""
+    supabase_url = os.environ.get("SUPABASE_URL")
+    supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
+    if not supabase_url or not supabase_key:
+        return None
+    try:
+        # Imported lazily so the webhook starts up cleanly on hosts
+        # where supabase-py isn't installed (e.g. a webhook-only
+        # systemd unit). The reviewer process imports it normally.
+        from supabase import create_client  # type: ignore[import-not-found]
+
+        sb = create_client(supabase_url, supabase_key)
+
+        repo_row = (
+            sb.table("watched_repos")
+            .select("user_id")
+            .eq("repo", repo)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(repo_row, "data", None) or []
+        if not rows:
+            return None
+        user_id = rows[0].get("user_id")
+        if not user_id:
+            return None
+
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        session_row = (
+            sb.table("devpod_sessions")
+            .select("id, tunnel_url, workspace_id")
+            .eq("user_id", user_id)
+            .eq("status", "active")
+            .gt("expires_at", now_iso)
+            .limit(1)
+            .execute()
+        )
+        srows = getattr(session_row, "data", None) or []
+        return srows[0] if srows else None
+    except Exception as e:
+        # Wide except by design — a malformed supabase response or a
+        # missing devpod_sessions table (migration not applied yet)
+        # must NOT take down the webhook.
+        print(
+            f"[webhook] devpod session lookup failed: "
+            f"{type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+        return None
+
+
+# --- Reviewer + sandbox dispatch -----------------------------------------
 
 def dispatch_review(repo: str, pr_number: int) -> int:
     """Spawn pr_reviewer.py scoped to one PR. Returns the child PID.
 
-    Popen is intentionally fire-and-forget — the child outlives the
-    HTTP response, GitHub gets its 200 immediately, and the spawned
-    process inherits our stdout/stderr so its log lines flow into the
-    same systemd journal as our own webhook lines. The parent does NOT
-    wait() on the child; orphan reaping is systemd's job."""
+    If the PR-owning user has an active DevPod session, ALSO spawn
+    devpod_tester.py with the tunnel URL pre-filled. Both children
+    run in parallel — the reviewer's LangGraph review and the
+    sandbox's clone-install-test sequence have no shared state and
+    write to different Supabase tables. Either may finish first; the
+    dashboard renders whichever rows are present.
+
+    Popen is intentionally fire-and-forget — both children outlive
+    the HTTP response, GitHub gets its 200 immediately, and they
+    inherit our stdout/stderr so their log lines flow into the same
+    systemd journal as our own webhook lines. The parent does NOT
+    wait() on either; orphan reaping is systemd's job."""
     env = os.environ.copy()
     env["PR_FILTER_REPO"] = repo
     env["PR_FILTER_NUMBER"] = str(pr_number)
@@ -129,6 +208,37 @@ def dispatch_review(repo: str, pr_number: int) -> int:
         stdout=sys.stdout,
         stderr=sys.stderr,
     )
+
+    # Speculative sandbox dispatch. Run AFTER the reviewer Popen so a
+    # slow Supabase lookup never delays the review's start.
+    devpod_session = get_active_devpod_session(repo)
+    if devpod_session and DEVPOD_TESTER_SCRIPT.exists():
+        sandbox_env = {
+            **env,
+            "DEVPOD_TUNNEL_URL": devpod_session.get("tunnel_url", ""),
+            "DEVPOD_SESSION_ID": str(devpod_session.get("id", "")),
+        }
+        try:
+            sandbox_proc = subprocess.Popen(
+                [str(VENV_PYTHON), str(DEVPOD_TESTER_SCRIPT)],
+                cwd=str(REPO_ROOT),
+                env=sandbox_env,
+                stdout=sys.stdout,
+                stderr=sys.stderr,
+            )
+            print(
+                f"[webhook] dispatched sandbox test for {repo}#{pr_number} "
+                f"(DevPod: {devpod_session.get('workspace_id', 'unknown')}, "
+                f"sandbox_pid={sandbox_proc.pid})"
+            )
+        except Exception as e:
+            # Don't fail the response if the sandbox script can't be
+            # exec'd — review still succeeds.
+            print(
+                f"[webhook] sandbox dispatch failed: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
     return proc.pid
 
 

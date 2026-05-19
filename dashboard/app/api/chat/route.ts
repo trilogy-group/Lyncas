@@ -4,6 +4,12 @@ import {
   getUser,
 } from "@/lib/supabase/server";
 import { resolveGithubToken } from "@/lib/github-token";
+import {
+  normalizeGithubUsername,
+  resolveUserIdByUsername,
+  verifyConnectToken,
+} from "@/lib/devpod";
+import { getSandboxResultsForRepo } from "@/lib/queries";
 
 // POST /api/chat — server-sent-events endpoint backing the
 // /dashboard/chat UI.
@@ -132,6 +138,9 @@ Three to five concrete bugs / smells the reviewer has flagged across the most re
 
 ## Recommendations
 Three to five actionable items, each one line. Use imperative voice ("Add CI lint…", "Reduce…").
+
+## Sandbox Test Results
+If the REPOSITORY DATA block contains a \`sandbox_results\` array, summarize the latest 5–10 entries: pass/fail counts, any PRs whose tests are currently failing, and any live preview URLs that were captured. If \`sandbox_results\` is empty or absent, write "No sandbox runs recorded — connect a DevPod from the dashboard chat to enable live PR testing." (verbatim) and move on.
 
 ## Risk Assessment
 One of: Low / Medium / High. One paragraph of justification grounded in the data.
@@ -418,6 +427,27 @@ async function fetchGitHubContext(
           if (data) ctx.recent_reviews = data;
         } catch {
           errors.push("Could not fetch review history");
+        }
+      })(),
+      // Sandbox runs (migration 015). RLS-scoped to the caller's
+      // user_id, so an unowned repo returns []. The report prompt
+      // explicitly handles the empty case.
+      (async () => {
+        try {
+          const rows = await getSandboxResultsForRepo(repo, 20);
+          ctx.sandbox_results = rows.map((r) => ({
+            pr_number: r.pr_number,
+            overall: r.overall,
+            tests_passed: r.tests_passed,
+            tests_failed: r.tests_failed,
+            app_url: r.app_url,
+            created_at: r.created_at,
+          }));
+        } catch {
+          // Soft-fail: missing migration or transient DB error. The
+          // report prompt's "if sandbox_results is empty" branch
+          // handles this gracefully.
+          ctx.sandbox_results = [];
         }
       })(),
     );
@@ -1044,10 +1074,58 @@ async function streamFromAnthropic(opts: {
 
 // --- Route handler -------------------------------------------------------
 
+// Authenticated principal for downstream code. We support two auth
+// modes: the standard Supabase JWT (cookie-based) AND an
+// X-DevPod-Token header that the in-DevPod `npr` CLI sends. Only the
+// `.id` field is read downstream; using a narrow shape keeps both
+// paths pluggable without leaking JWT-specific fields into the
+// DevPod path's principal.
+interface AuthedPrincipal {
+  id: string;
+  // "jwt" or "devpod" — included in observability logs so an
+  // operator can see which auth mode served a given request.
+  source: "jwt" | "devpod";
+}
+
+// Resolve the X-DevPod-Token header into a user_id, or null if the
+// header is absent/invalid. The token is the same composite the
+// /api/devpod/token route hands out:
+//   <github_username>:<DEVPOD_CONNECT_SECRET>
+// We lower-case the username, then look up the matching
+// user_profiles row via the security-definer RPC from migration 014.
+async function resolveDevpodAuth(
+  request: NextRequest,
+): Promise<AuthedPrincipal | null> {
+  const headerValue =
+    request.headers.get("x-devpod-token") ??
+    request.headers.get("X-DevPod-Token");
+  if (!headerValue) return null;
+  const idx = headerValue.indexOf(":");
+  if (idx <= 0) return null;
+  const claimedUsername = normalizeGithubUsername(headerValue.slice(0, idx));
+  if (!claimedUsername) return null;
+  const serverSecret = process.env.DEVPOD_CONNECT_SECRET;
+  if (!verifyConnectToken(headerValue, claimedUsername, serverSecret)) {
+    return null;
+  }
+  const userId = await resolveUserIdByUsername(claimedUsername);
+  if (!userId) return null;
+  return { id: userId, source: "devpod" };
+}
+
 export async function POST(request: NextRequest) {
-  // 1. AuthN
-  const user = await getUser().catch(() => null);
-  if (!user) return jsonError("Not authenticated", 401);
+  // 1. AuthN — try DevPod-token first, then Supabase JWT. The order
+  // matters only for observability: an in-DevPod CLI that ALSO has a
+  // dashboard cookie (rare) gets logged as the more specific source.
+  let principal: AuthedPrincipal | null = await resolveDevpodAuth(
+    request,
+  ).catch(() => null);
+  if (!principal) {
+    const jwtUser = await getUser().catch(() => null);
+    if (jwtUser) principal = { id: jwtUser.id, source: "jwt" };
+  }
+  if (!principal) return jsonError("Not authenticated", 401);
+  const user = principal;
 
   // 2. Body parse
   let body: RequestBody;
@@ -1129,7 +1207,7 @@ export async function POST(request: NextRequest) {
   // glance which auth flow served this request without leaking the
   // token. Keep this terse — it fires on every chat message.
   console.log(
-    `[chat] repo=${repo} user=${user.id} token_source=${resolved.source}`,
+    `[chat] repo=${repo} user=${user.id} auth=${user.source} token_source=${resolved.source}`,
   );
 
   const { fetched, errors } = await fetchGitHubContext(

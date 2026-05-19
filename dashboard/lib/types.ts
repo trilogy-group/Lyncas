@@ -455,3 +455,53 @@ export interface DevpodStatusResponse {
   capabilities?: DevpodCapabilities;
   expires_at?: string;
 }
+
+// --- Migration 015: PR sandbox results -----------------------------------
+// One row per (repo, pr_number) — the test outcome of the most recent
+// sandbox run. Written by either agent/devpod_tester.py (webhook-driven)
+// or /api/devpod/run-pr-tests (chat-button-driven), upsert-keyed on
+// (repo, pr_number) so the latest run wins.
+
+export type SandboxOverall = "pass" | "fail" | "no_tests" | "error";
+
+export interface SandboxResult {
+  id: string;
+  repo: string;
+  pr_number: number;
+  user_id: string | null;
+  session_id: string | null;
+  tests_passed: number;
+  tests_failed: number;
+  test_output: string | null;
+  app_url: string | null;
+  app_started: boolean;
+  clone_success: boolean;
+  install_success: boolean;
+  overall: SandboxOverall | null;
+  created_at: string;
+  duration_ms: number | null;
+}
+
+// SSE event shape emitted by /api/devpod/run-pr-tests. Each step
+// emits at least a "running" event before the corresponding "done"
+// event so the UI can flip a per-step spinner on / off.
+export type SandboxStep =
+  | "clone"
+  | "install"
+  | "tests"
+  | "app"
+  | "expose"
+  | "complete";
+
+export interface SandboxProgressEvent {
+  step: SandboxStep;
+  status: "running" | "done" | "error";
+  // Filled in on the matching "done" event for the relevant step.
+  success?: boolean;
+  passed?: number;
+  failed?: number;
+  url?: string | null;
+  overall?: SandboxOverall;
+  duration_ms?: number;
+  error?: string;
+}

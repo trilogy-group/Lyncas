@@ -20,6 +20,7 @@ import type {
   RepoStat,
   Review,
   Run,
+  SandboxResult,
   SeverityBucket,
   SeverityBucketLabel,
   UserProfile,
@@ -810,4 +811,40 @@ export async function upsertInstallation(
     .from("github_app_installations")
     .upsert(data, { onConflict: "installation_id" });
   if (error) throw error;
+}
+
+// --- Migration 015: PR sandbox results -----------------------------------
+// Read by /api/chat (when isReport=true) and by the chat page's sandbox
+// card. RLS scopes by user_id, so an unauthenticated caller sees []. The
+// caller decides whether to fall back to "no sandbox runs" or hide the
+// section entirely.
+
+export async function getSandboxResultsForRepo(
+  repo: string,
+  limit = 20,
+): Promise<SandboxResult[]> {
+  const supabase = await createSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("pr_sandbox_results")
+    .select("*")
+    .eq("repo", repo)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+  if (error) return [];
+  return (data ?? []) as unknown as SandboxResult[];
+}
+
+export async function getSandboxResultForPR(
+  repo: string,
+  prNumber: number,
+): Promise<SandboxResult | null> {
+  const supabase = await createSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("pr_sandbox_results")
+    .select("*")
+    .eq("repo", repo)
+    .eq("pr_number", prNumber)
+    .maybeSingle();
+  if (error) return null;
+  return (data ?? null) as unknown as SandboxResult | null;
 }

@@ -14,6 +14,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Container } from "@/components/ui/container";
 import { DevPodPanel } from "@/components/devpod-panel";
+import { SandboxTestCard } from "@/components/sandbox-test-card";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 
 // /dashboard/chat — three-column repo chat workspace.
@@ -312,6 +313,27 @@ function ChatPageInner() {
 
   const [stats, setStats] = useState<RepoStatsState | null>(null);
   const [research, setResearch] = useState<ResearchState | null>(null);
+
+  // Most recently referenced PR number across the chat history +
+  // the in-progress input. Updates as the conversation moves so the
+  // SandboxTestCard always targets the PR the user is currently
+  // talking about, not the first one mentioned.
+  const activePrNumber = useMemo<number | null>(() => {
+    const sources: string[] = [input];
+    for (let i = messages.length - 1; i >= 0; i--) {
+      sources.push(messages[i].content);
+    }
+    for (const text of sources) {
+      const m =
+        /#(\d{1,6})/.exec(text) ||
+        /\b(?:pr|pull\s+request)\s*#?(\d{1,6})/i.exec(text);
+      if (m) {
+        const n = Number(m[1]);
+        if (n > 0 && n < 1_000_000) return n;
+      }
+    }
+    return null;
+  }, [messages, input]);
   const [repoPanelOpen, setRepoPanelOpen] = useState<boolean | null>(null);
   const [researchPanelOpen, setResearchPanelOpen] = useState<boolean | null>(
     null,
@@ -1073,6 +1095,15 @@ function ChatPageInner() {
                       )
                     }
                     onRefresh={() => void fetchBriefing(selectedRepo)}
+                  />
+                )}
+
+              {hasRepo &&
+                !roomTransition &&
+                activePrNumber !== null && (
+                  <SandboxTestCard
+                    repo={selectedRepo}
+                    prNumber={activePrNumber}
                   />
                 )}
 

@@ -3,7 +3,7 @@ import {
   createSupabaseServerClient,
   getUser,
 } from "@/lib/supabase/server";
-import { createInstallationToken } from "@/lib/github-app";
+import { resolveGithubToken } from "@/lib/github-token";
 
 // POST /api/chat — server-sent-events endpoint backing the
 // /dashboard/chat UI.
@@ -11,12 +11,18 @@ import { createInstallationToken } from "@/lib/github-app";
 // Flow:
 //   1. AuthN: must be a logged-in dashboard user.
 //   2. AuthZ: the requested `repo` must be in the caller's
-//      watched_repos. RLS enforces ownership.
-//   3. Pick the right GitHub token for this repo. Multi-tenant:
-//      watched_repos may carry a PAT or a GitHub App installation;
-//      we mint an installation token on the fly for the app case.
-//      Final fallback is the deploy-wide PR_REVIEWER_PAT for legacy
-//      / public-read flows.
+//      watched_repos. We scope by user_id explicitly (RLS does too,
+//      this is defense-in-depth) and 403 when the row is missing.
+//   3. Pick the right GitHub token for this repo via
+//      lib/github-token.ts. Precedence:
+//        a. watched_repos.token_type='github_app' — mint a fresh
+//           installation token via createInstallationToken().
+//        b. watched_repos.token_type='pat' — use github_token.
+//        c. fallback to PR_REVIEWER_PAT env var (legacy single-tenant).
+//        d. null — public-read; private repos will 404.
+//      The same token is used for both pre-fetch (read) and ACTION
+//      execution (write); installation tokens carry the App-granted
+//      scopes, no read/write split.
 //   4. Pre-fetch GitHub context based on keyword routing. Each fetch
 //      is best-effort.
 //   5. Send context + message to Claude Sonnet 4.5 with streaming.
@@ -684,41 +690,6 @@ async function fetchGitHubContext(
   return { fetched: ctx, errors };
 }
 
-// --- Token resolution for write operations -------------------------------
-// "use the authenticated user's token not a shared PAT where possible":
-// look up the user's watched_repos row for this repo, then prefer (in
-// order) installation token (github_app) → PAT (github_token) → the
-// deploy-wide PR_REVIEWER_PAT.
-
-interface WriteTokenLookup {
-  github_token: string | null;
-  github_installation_id: number | null;
-  token_type: "pat" | "github_app" | null;
-}
-
-async function resolveWriteToken(
-  supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>,
-  repo: string,
-  fallbackPat: string | undefined,
-): Promise<string | null> {
-  const { data } = await supabase
-    .from("watched_repos")
-    .select("github_token, github_installation_id, token_type")
-    .eq("repo", repo)
-    .maybeSingle<WriteTokenLookup>();
-
-  if (data?.token_type === "github_app" && data.github_installation_id) {
-    try {
-      const t = await createInstallationToken(data.github_installation_id);
-      return t.token;
-    } catch {
-      // fall through to PAT / fallback
-    }
-  }
-  if (data?.github_token) return data.github_token;
-  return fallbackPat ?? null;
-}
-
 // --- Action execution ----------------------------------------------------
 // Parses + executes ONE ACTION block, returns a confirmation string that
 // the streaming layer appends to the assistant's response. Failures are
@@ -1113,11 +1084,21 @@ export async function POST(request: NextRequest) {
     )
     .slice(-HISTORY_LIMIT);
 
-  // 3. AuthZ — repo must be in the caller's watched_repos.
+  // 3. AuthZ + token resolution.
+  //
+  // We used to do this in two queries (one to confirm ownership, one
+  // to load the credential). resolveGithubToken does both in a single
+  // user_id-scoped lookup of watched_repos: if the user doesn't own
+  // a row for this repo, the SELECT returns no row, and the helper
+  // lands on `source: "env"` (or `"none"` if PR_REVIEWER_PAT is also
+  // unset). We then check ownership separately so a user without a
+  // connection still sees a 403 instead of silently using the
+  // deploy-wide PAT to read someone else's public repo.
   const supabase = await createSupabaseServerClient();
   const { data: ownership } = await supabase
     .from("watched_repos")
     .select("id")
+    .eq("user_id", user.id)
     .eq("repo", repo)
     .maybeSingle();
   if (!ownership) {
@@ -1133,17 +1114,28 @@ export async function POST(request: NextRequest) {
     return jsonError("ANTHROPIC_API_KEY is not configured on this deploy", 503);
   }
 
-  // 5. Pre-fetch GitHub context.
-  const fallbackPat = process.env.PR_REVIEWER_PAT;
-  const writeToken = await resolveWriteToken(supabase, repo, fallbackPat);
-  // Read-side token: same precedence, but the resolveWriteToken result
-  // is the right credential for both read and write paths.
-  const readPat = writeToken ?? fallbackPat;
+  // 5. Mint the GitHub credential. One token serves both the pre-fetch
+  // (read) phase and the ACTION-block (write) phase — installation
+  // tokens carry the contents/metadata/PR write scopes the App was
+  // granted at install time, so there's no read-vs-write split to
+  // make here.
+  const resolved = await resolveGithubToken({
+    supabase,
+    userId: user.id,
+    repo,
+    fallbackPat: process.env.PR_REVIEWER_PAT,
+  });
+  // Single line, parseable in Vercel logs: tells an operator at a
+  // glance which auth flow served this request without leaking the
+  // token. Keep this terse — it fires on every chat message.
+  console.log(
+    `[chat] repo=${repo} user=${user.id} token_source=${resolved.source}`,
+  );
 
   const { fetched, errors } = await fetchGitHubContext(
     repo,
     message,
-    readPat ?? undefined,
+    resolved.token ?? undefined,
     isResearchBriefing,
     isReport,
   );
@@ -1175,7 +1167,7 @@ export async function POST(request: NextRequest) {
     // from prior chit-chat.
     history: isReport || isResearchBriefing ? [] : history,
     userMessage: userPayload,
-    writeToken,
+    writeToken: resolved.token,
     repo,
     // Reports are pure read-only generation — never execute ACTIONs
     // even if Claude hallucinates one.

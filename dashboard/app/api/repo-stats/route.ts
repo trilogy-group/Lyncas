@@ -3,7 +3,7 @@ import {
   createSupabaseServerClient,
   getUser,
 } from "@/lib/supabase/server";
-import { createInstallationToken } from "@/lib/github-app";
+import { resolveGithubToken } from "@/lib/github-token";
 
 // GET /api/repo-stats?repo=owner/name
 //
@@ -28,36 +28,6 @@ export const runtime = "nodejs";
 
 const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const GITHUB_API = "https://api.github.com";
-
-interface WriteTokenLookup {
-  github_token: string | null;
-  github_installation_id: number | null;
-  token_type: "pat" | "github_app" | null;
-}
-
-async function resolveReadToken(
-  supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>,
-  repo: string,
-  fallbackPat: string | undefined,
-): Promise<string | null> {
-  // Same precedence as /api/chat: per-user installation token →
-  // per-user PAT → deploy-wide PR_REVIEWER_PAT.
-  const { data } = await supabase
-    .from("watched_repos")
-    .select("github_token, github_installation_id, token_type")
-    .eq("repo", repo)
-    .maybeSingle<WriteTokenLookup>();
-  if (data?.token_type === "github_app" && data.github_installation_id) {
-    try {
-      const t = await createInstallationToken(data.github_installation_id);
-      return t.token;
-    } catch {
-      // fall through
-    }
-  }
-  if (data?.github_token) return data.github_token;
-  return fallbackPat ?? null;
-}
 
 async function gh<T>(path: string, token: string | null): Promise<{
   data: T | null;
@@ -125,11 +95,13 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  // AuthZ — must be a connected repo.
+  // AuthZ — must be a connected repo for this user. user_id-scoped so
+  // a future RLS misconfig can't widen the read.
   const supabase = await createSupabaseServerClient();
   const { data: ownership } = await supabase
     .from("watched_repos")
     .select("id")
+    .eq("user_id", user.id)
     .eq("repo", repo)
     .maybeSingle();
   if (!ownership) {
@@ -139,11 +111,16 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  const token = await resolveReadToken(
+  // Resolve the GitHub credential. Same precedence as /api/chat:
+  // per-user GitHub App installation token → per-user PAT →
+  // deploy-wide PR_REVIEWER_PAT → null (public-read fallback).
+  const resolved = await resolveGithubToken({
     supabase,
+    userId: user.id,
     repo,
-    process.env.PR_REVIEWER_PAT,
-  );
+    fallbackPat: process.env.PR_REVIEWER_PAT,
+  });
+  const token = resolved.token;
 
   // Run all five fetches in parallel. Each tolerates a null result.
   const [repoMeta, languages, openPRsHead, contributors] = await Promise.all([

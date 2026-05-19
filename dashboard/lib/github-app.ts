@@ -73,35 +73,44 @@ function appConfig(): AppConfig {
 /**
  * Sign a short-lived App JWT (10 minutes — GitHub's documented max).
  *
- * Hand-rolled with node:crypto rather than node-jsonwebtoken because
- * the latter has bitten us with "A JSON web token could not be
- * decoded" responses from GitHub that point at subtle library /
- * version interactions around RS256 signing on PKCS#1-vs-PKCS#8 PEMs.
- * The crypto.createSign('RSA-SHA256') path is the same primitive
- * GitHub's docs reference, and base64url is the JWT spec encoding —
- * jsonwebtoken's older "base64 + trim padding + url-safe swap"
- * approach is what we used to do manually.
+ * Hand-rolled with node:crypto rather than node-jsonwebtoken: the
+ * primitive is RSA-SHA256, the encoding is base64url, both straight
+ * out of the JWT spec.
  *
- * `iat` is intentionally backdated 60s to cope with mild clock skew
- * between Vercel's serverless runtime and GitHub's API; without this,
- * a request that arrives "before" the iat fails 401 with no useful
- * error message.
+ * Two GitHub-specific gotchas baked in here:
+ *
+ *   1. `iss` MUST be a JSON number. GitHub rejects string `iss`
+ *      values with "A JSON web token could not be decoded" — the
+ *      exact 401 we kept getting before this fix. `Number(appId)`
+ *      coerces; we throw if the env var isn't a positive integer
+ *      because that's an unrecoverable config error.
+ *
+ *   2. `iat` is backdated 60s to cope with mild clock skew between
+ *      Vercel's runtime and GitHub's API; an `iat` in the future
+ *      fails 401 with the same opaque "could not be decoded" error.
  */
 export function getAppJWT(): string {
   const { appId, privateKey } = appConfig();
+  const issAsNumber = Number(appId);
+  if (!Number.isInteger(issAsNumber) || issAsNumber <= 0) {
+    throw new Error(
+      `GITHUB_APP_ID must be a positive integer, got "${appId}"`,
+    );
+  }
   const now = Math.floor(Date.now() / 1000);
 
   const header = Buffer.from(
     JSON.stringify({ alg: "RS256", typ: "JWT" }),
   ).toString("base64url");
 
-  const payload = Buffer.from(
-    JSON.stringify({
-      iat: now - 60,
-      exp: now + 600,
-      iss: appId,
-    }),
-  ).toString("base64url");
+  const payloadObj = {
+    iat: now - 60,
+    exp: now + 600,
+    iss: issAsNumber,
+  };
+  const payload = Buffer.from(JSON.stringify(payloadObj)).toString(
+    "base64url",
+  );
 
   const signingInput = `${header}.${payload}`;
 
@@ -110,8 +119,30 @@ export function getAppJWT(): string {
   sign.end();
 
   const signature = sign.sign(privateKey, "base64url");
+  const token = `${signingInput}.${signature}`;
 
-  return `${signingInput}.${signature}`;
+  // TEMP diagnostic — every field below is intentionally non-secret
+  // (iss is the public App ID, iat/exp are timestamps, sig_len is
+  // the byte count of the signature segment). If GitHub keeps
+  // returning "could not be decoded" after this fix, these logs let
+  // us tell at a glance whether iss is numeric, whether iat is in
+  // the past, whether the signature length is right (~342 chars
+  // base64url for 2048-bit RSA, ~683 for 4096-bit), and that we
+  // produced exactly three dot-separated segments.
+  console.log(
+    "[github-app] jwt:",
+    JSON.stringify({
+      iss: payloadObj.iss,
+      iss_type: typeof payloadObj.iss,
+      iat: payloadObj.iat,
+      exp: payloadObj.exp,
+      now,
+      sig_len: signature.length,
+      segments: token.split(".").length,
+    }),
+  );
+
+  return token;
 }
 
 interface FetchOptions {

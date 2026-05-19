@@ -1122,7 +1122,7 @@ export async function POST(request: NextRequest) {
     .maybeSingle();
   if (!ownership) {
     return jsonError(
-      "You haven't connected this repo. Visit /dashboard/connect-repo first.",
+      "You haven't connected this repo. Install the GitHub App from the chat page first.",
       403,
     );
   }

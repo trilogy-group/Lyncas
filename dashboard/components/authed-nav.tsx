@@ -11,13 +11,16 @@ import { signOut } from "@/lib/supabase/client";
 // Post-login the user lands on /dashboard/chat (the v3 default), so
 // chat sits first in the nav and the underlines highlight it as the
 // active surface on /dashboard root.
+//
+// The "X/Y repos" pill that linked to /dashboard/connect-repo is gone
+// along with the connect-repo page itself: there is no longer a free-
+// plan limit to display, and adding repos happens via the GitHub App
+// install link surfaced inside the chat page's modal.
 
 interface AuthedNavProps {
   email: string | null;
   displayName: string | null;
   avatarUrl: string | null;
-  repoCount: number;
-  repoLimit: number;
 }
 
 const LINKS: ReadonlyArray<{ href: string; label: string }> = [
@@ -37,15 +40,9 @@ export function AuthedNav({
   email,
   displayName,
   avatarUrl,
-  repoCount,
-  repoLimit,
 }: AuthedNavProps) {
   const pathname = usePathname() ?? "";
   const display = displayName ?? email ?? "Account";
-
-  const limitDisplay =
-    repoLimit >= 9999 ? `${repoCount}` : `${repoCount}/${repoLimit}`;
-  const overLimit = repoLimit < 9999 && repoCount >= repoLimit;
 
   return (
     <nav className="border-b border-border bg-bg">
@@ -75,22 +72,6 @@ export function AuthedNav({
         </div>
 
         <div className="flex items-center gap-3">
-          <Link
-            href="/dashboard/connect-repo"
-            className={
-              "hidden sm:inline-flex items-center gap-1.5 rounded-sm border px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.14em] transition-colors " +
-              (overLimit
-                ? "border-[#ff9d4d]/60 text-[#ff9d4d] hover:bg-[#ff9d4d]/10"
-                : "border-border text-muted hover:text-text hover:border-border-strong")
-            }
-            title={
-              overLimit
-                ? "Repo limit reached — upgrade to add more"
-                : "Add another repository"
-            }
-          >
-            {limitDisplay} repos
-          </Link>
           <div className="flex items-center gap-2">
             {avatarUrl ? (
               // eslint-disable-next-line @next/next/no-img-element

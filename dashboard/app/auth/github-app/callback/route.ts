@@ -30,17 +30,19 @@ import {
 //      token_type='github_app'; this is the safest behavior —
 //      operators rarely want to keep a stale PAT around once they've
 //      installed the App on the same repo.
-//   5. Redirect to /dashboard/repos so the new connections show up.
+//   5. Redirect to /dashboard/chat so the new connections show up in
+//      the room dropdown (the connect-repo page no longer exists).
 //
-// On any failure we bounce to /dashboard/connect-repo?error=... so the
-// page can surface the message inline (next to the App install button).
+// On any failure we bounce to /dashboard/chat?install_error=... so the
+// chat page can surface the message inline (it owns the install modal
+// now that the dedicated connect-repo page is gone).
 
 export const dynamic = "force-dynamic";
 
 function backToConnect(request: NextRequest, message: string) {
   const u = request.nextUrl.clone();
-  u.pathname = "/dashboard/connect-repo";
-  u.search = `?error=${encodeURIComponent(message)}`;
+  u.pathname = "/dashboard/chat";
+  u.search = `?install_error=${encodeURIComponent(message)}`;
   return NextResponse.redirect(u);
 }
 
@@ -168,8 +170,8 @@ export async function GET(request: NextRequest) {
   }
 
   const u = request.nextUrl.clone();
-  u.pathname = "/dashboard/repos";
-  // Pass a one-shot flag the repos page (or a future toast) can show.
+  u.pathname = "/dashboard/chat";
+  // Pass a one-shot flag the chat page (or a future toast) can show.
   // Even if the page ignores it, it disambiguates the redirect in the
   // browser history.
   u.search = `?connected=${repos.length}`;

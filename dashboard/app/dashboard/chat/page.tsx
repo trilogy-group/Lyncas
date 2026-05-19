@@ -1,14 +1,14 @@
 "use client";
 
-import Link from "next/link";
 import {
+  Suspense,
   useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Container } from "@/components/ui/container";
@@ -18,27 +18,28 @@ import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 //
 // Columns:
 //   ┌─ 220px left ─┬─ flex chat ─────────────────────┬─ 280px right ─┐
-//   │ repo rooms   │ briefing + messages + composer  │ Repository    │
-//   │ quick acts   │                                 │ Research      │
+//   │ repo picker  │ briefing + messages + composer  │ Repository    │
+//   │ (dropdown)   │                                 │ Research      │
+//   │ quick acts   │                                 │               │
 //   └──────────────┴─────────────────────────────────┴───────────────┘
 //
 // Responsive:
 //   * < 768px (mobile)    : left sidebar collapses into a dropdown at
 //                            the top of the chat pane. Right sidebar
-//                            is hidden entirely (low information value
-//                            vs vertical space cost on phones).
+//                            is hidden entirely.
 //   * 768–1023px (tablet) : both side panels visible, right sidebar
 //                            sections start collapsed.
 //   * >= 1024px (desktop) : both panels visible, both right-sidebar
 //                            sections start expanded.
 //
-// Repo selection:
-//   * No auto-selection on load — the user MUST pick a room. The chat
-//     pane shows a large empty state with a dropdown (avatars + names)
-//     and clicking a row in the left sidebar achieves the same thing.
-//   * On selection: messages reset, the research briefing fires, the
-//     right-sidebar stats fire, the right-sidebar research panel
-//     fetches its cached articles.
+// Repo connection model: there is no /dashboard/connect-repo page any
+// more. On mount we ping /api/github-app/status — if the user has zero
+// healthy installations on GitHub, we surface a modal pointing to the
+// App install URL. The modal is also shown when GitHub bounces back
+// with an install error (?install_error=…).
+//
+// Repo selection: handled by a single dropdown in the left sidebar
+// (desktop) or at the top of the chat pane (mobile). No auto-select.
 
 interface ChatMessage {
   id: string;
@@ -97,12 +98,27 @@ interface ResearchState {
   error: string | null;
 }
 
+interface InstallStatusState {
+  healthy: number;
+  stale: number;
+  installUrl: string | null;
+  loaded: boolean;
+}
+
 const MAX_INPUT_CHARS = 2000;
 const QUICK_ACTIONS: ReadonlyArray<{ label: string; prompt: string }> = [
   { label: "Recent PRs", prompt: "Show me the open pull requests." },
-  { label: "Recent activity", prompt: "Summarize recent activity (commits, PRs, contributors) in the last 30 days." },
+  {
+    label: "Recent activity",
+    prompt:
+      "Summarize recent activity (commits, PRs, contributors) in the last 30 days.",
+  },
   { label: "Merge latest PR", prompt: "Merge the most recent open PR." },
-  { label: "Show repo stats", prompt: "Show repository statistics: open PRs, contributors, languages." },
+  {
+    label: "Show repo stats",
+    prompt:
+      "Show repository statistics: open PRs, contributors, languages.",
+  },
 ];
 
 // --- Tiny markdown subset -------------------------------------------------
@@ -210,9 +226,6 @@ function formatAgo(iso: string | null): string {
   return `${Math.floor(mo / 12)}y ago`;
 }
 
-// Per-language colors mirroring GitHub's linguist palette. Anything not
-// in here falls back to neutral grey — Linguist's full list is huge and
-// we'd rather underclaim color than mis-color.
 const LANG_COLORS: Record<string, string> = {
   TypeScript: "#3178c6",
   JavaScript: "#f1e05a",
@@ -258,12 +271,28 @@ function faviconUrl(url: string): string | null {
 // =========================================================================
 
 export default function ChatPage() {
+  // useSearchParams must be wrapped in <Suspense>. Splitting into an
+  // inner component keeps the Next.js build happy.
+  return (
+    <Suspense
+      fallback={
+        <Container className="py-10">
+          <Card className="p-10 text-center text-muted text-sm">Loading…</Card>
+        </Container>
+      }
+    >
+      <ChatPageInner />
+    </Suspense>
+  );
+}
+
+function ChatPageInner() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const supabase = useMemo(() => createSupabaseBrowserClient(), []);
 
   const [loading, setLoading] = useState(true);
   const [repos, setRepos] = useState<WatchedRepoLite[]>([]);
-  // CRITICAL: starts empty. No auto-selection on mount.
   const [selectedRepo, setSelectedRepo] = useState<string>("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -271,16 +300,22 @@ export default function ChatPage() {
   const [briefing, setBriefing] = useState<BriefingState | null>(null);
   const [roomTransition, setRoomTransition] = useState(false);
   const [globalError, setGlobalError] = useState<string | null>(null);
+  const [installError, setInstallError] = useState<string | null>(null);
 
   const [stats, setStats] = useState<RepoStatsState | null>(null);
   const [research, setResearch] = useState<ResearchState | null>(null);
-  // Per-section collapse state. Default is "open on desktop, collapsed
-  // on tablet" — we initialise to `null` (lit by an effect) so SSR
-  // doesn't mismatch.
   const [repoPanelOpen, setRepoPanelOpen] = useState<boolean | null>(null);
   const [researchPanelOpen, setResearchPanelOpen] = useState<boolean | null>(
     null,
   );
+
+  const [installStatus, setInstallStatus] = useState<InstallStatusState>({
+    healthy: 0,
+    stale: 0,
+    installUrl: null,
+    loaded: false,
+  });
+  const [showInstallModal, setShowInstallModal] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -307,8 +342,6 @@ export default function ChatPage() {
           .order("created_at", { ascending: false });
         if (cancelled) return;
         setRepos((data ?? []) as WatchedRepoLite[]);
-        // NOTE: we deliberately do NOT auto-select repos[0]. The empty
-        // state below shows a picker.
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -323,15 +356,76 @@ export default function ChatPage() {
     };
   }, [router, supabase]);
 
-  // Initialize right-sidebar collapse defaults from viewport once on
-  // mount. We re-listen via matchMedia so resizing across the lg
-  // breakpoint feels natural.
+  // --- mount: probe live GitHub App installation status ------------------
+  useEffect(() => {
+    let cancelled = false;
+    async function probe() {
+      try {
+        const res = await fetch("/api/github-app/status");
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as {
+          healthy: number;
+          stale: number;
+          install_url: string | null;
+        };
+        if (cancelled) return;
+        setInstallStatus({
+          healthy: data.healthy ?? 0,
+          stale: data.stale ?? 0,
+          installUrl: data.install_url ?? null,
+          loaded: true,
+        });
+        // Auto-pop the modal when:
+        //   * no healthy installs and no cached watched_repos rows
+        //     (first-time onboarding) — modal IS the page
+        //   * no healthy installs but rows exist (stale install — user
+        //     uninstalled on GitHub; we have to ask them to re-install
+        //     for any write operations to work)
+        if ((data.healthy ?? 0) === 0) {
+          setShowInstallModal(true);
+        }
+      } catch {
+        if (!cancelled) setInstallStatus((s) => ({ ...s, loaded: true }));
+      }
+    }
+    void probe();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // --- query-string hand-offs from /auth/github-app/callback -------------
+  useEffect(() => {
+    const err = searchParams.get("install_error");
+    const connected = searchParams.get("connected");
+    if (err) {
+      setInstallError(err);
+      setShowInstallModal(true);
+    }
+    if (connected) {
+      // Successful install — auto-refresh status so the modal goes
+      // away even before the user does anything.
+      void fetch("/api/github-app/status")
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => {
+          if (!data) return;
+          setInstallStatus({
+            healthy: data.healthy ?? 0,
+            stale: data.stale ?? 0,
+            installUrl: data.install_url ?? null,
+            loaded: true,
+          });
+          if ((data.healthy ?? 0) > 0) setShowInstallModal(false);
+        })
+        .catch(() => {});
+    }
+  }, [searchParams]);
+
+  // Initialize right-sidebar collapse defaults from viewport once.
   useEffect(() => {
     if (typeof window === "undefined") return;
     const mq = window.matchMedia("(min-width: 1024px)");
     function sync() {
-      // Only set defaults if the user hasn't manually toggled. We
-      // approximate this with "set on initial mount, leave alone after".
       setRepoPanelOpen((v) => (v === null ? mq.matches : v));
       setResearchPanelOpen((v) => (v === null ? mq.matches : v));
     }
@@ -340,7 +434,6 @@ export default function ChatPage() {
     return () => mq.removeEventListener("change", sync);
   }, []);
 
-  // Auto-scroll the message list as new tokens arrive.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -529,9 +622,6 @@ export default function ChatPage() {
     [],
   );
 
-  // When the selected repo changes, fire all three "enter room"
-  // side-effects (briefing, stats, research). When it clears, drop
-  // everything so the empty state is pristine.
   useEffect(() => {
     if (!selectedRepo) {
       setBriefing(null);
@@ -737,34 +827,11 @@ export default function ChatPage() {
     setMessages([]);
   }
 
-  // --- render: loading / empty repo list ----------------------------------
+  // --- render: loading ----------------------------------------------------
   if (loading) {
     return (
       <Container className="py-10">
         <Card className="p-10 text-center text-muted text-sm">Loading…</Card>
-      </Container>
-    );
-  }
-
-  if (repos.length === 0) {
-    return (
-      <Container size="narrow" className="py-10">
-        <Card className="p-8 space-y-4 text-center">
-          <h1 className="text-lg font-semibold">No repositories yet</h1>
-          <p className="text-sm text-muted">
-            Connect a repository and the chat will answer questions about its
-            PRs, branches, and activity — and act on your behalf (close,
-            comment, merge).
-          </p>
-          <div className="flex justify-center">
-            <Link
-              href="/dashboard/connect-repo"
-              className="inline-flex h-10 items-center justify-center bg-white text-black font-mono uppercase tracking-[0.08em] text-sm px-5 hover:bg-white/90 transition-colors"
-            >
-              Connect a repository →
-            </Link>
-          </div>
-        </Card>
       </Container>
     );
   }
@@ -775,40 +842,20 @@ export default function ChatPage() {
   return (
     <Container size="wide" className="py-6">
       <div className="flex flex-col gap-4 md:flex-row md:gap-4 md:h-[calc(100vh-7rem)] md:min-h-[560px]">
-        {/* === LEFT: repo rooms + quick actions === */}
+        {/* === LEFT: repo dropdown + quick actions === */}
         <aside className="hidden w-full shrink-0 flex-col gap-4 overflow-y-auto pr-1 md:flex md:w-[220px]">
           <Card className="p-3" flush>
             <div className="px-1 pb-2 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
-              Repositories
+              Active room
             </div>
-            <div className="flex flex-col gap-1 p-1">
-              {repos.map((r) => {
-                const active = r.repo === selectedRepo;
-                return (
-                  <button
-                    key={r.repo}
-                    type="button"
-                    onClick={() => setSelectedRepo(r.repo)}
-                    disabled={isStreaming}
-                    className={
-                      "flex items-center gap-2 rounded-sm border px-2 py-1.5 text-left text-xs transition-colors disabled:opacity-50 " +
-                      (active
-                        ? "border-border-strong bg-bg-elev"
-                        : "border-transparent hover:bg-bg-elev")
-                    }
-                    title={r.repo}
-                  >
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={repoAvatarUrl(r.repo)}
-                      alt=""
-                      className="h-5 w-5 shrink-0 rounded-full border border-border bg-card"
-                    />
-                    <span className="truncate font-mono">{r.repo}</span>
-                  </button>
-                );
-              })}
-            </div>
+            <RepoDropdown
+              repos={repos}
+              value={selectedRepo}
+              onChange={setSelectedRepo}
+              disabled={isStreaming}
+              installUrl={installStatus.installUrl}
+              onInstallClick={() => setShowInstallModal(true)}
+            />
           </Card>
 
           <Card className="p-3" flush>
@@ -883,11 +930,13 @@ export default function ChatPage() {
             >
               {/* Mobile-only repo picker — sidebar is hidden < md. */}
               <div className="md:hidden mb-2">
-                <RepoSelect
+                <RepoDropdown
                   repos={repos}
                   value={selectedRepo}
                   onChange={setSelectedRepo}
                   disabled={isStreaming}
+                  installUrl={installStatus.installUrl}
+                  onInstallClick={() => setShowInstallModal(true)}
                 />
               </div>
 
@@ -897,7 +946,15 @@ export default function ChatPage() {
                 </div>
               )}
 
-              {!hasRepo && <EmptyRoomState repos={repos} onPick={setSelectedRepo} />}
+              {!hasRepo && (
+                <NoRoomState
+                  repoCount={repos.length}
+                  installLoaded={installStatus.loaded}
+                  healthy={installStatus.healthy}
+                  stale={installStatus.stale}
+                  onInstall={() => setShowInstallModal(true)}
+                />
+              )}
 
               {hasRepo && roomTransition && (
                 <div className="py-6 text-center text-xs italic text-muted">
@@ -1047,52 +1104,193 @@ export default function ChatPage() {
           </CollapsibleCard>
         </aside>
       </div>
+
+      {showInstallModal && (
+        <InstallAppModal
+          installUrl={installStatus.installUrl}
+          healthy={installStatus.healthy}
+          stale={installStatus.stale}
+          repoCount={repos.length}
+          installError={installError}
+          onClose={() => setShowInstallModal(false)}
+        />
+      )}
     </Container>
   );
 }
 
 // =========================================================================
-// Components
+// Repo dropdown — left-sidebar picker (also reused on mobile).
 // =========================================================================
 
-function RepoSelect({
+function RepoDropdown({
   repos,
   value,
   onChange,
   disabled,
+  installUrl,
+  onInstallClick,
 }: {
   repos: WatchedRepoLite[];
   value: string;
   onChange: (v: string) => void;
   disabled: boolean;
+  installUrl: string | null;
+  onInstallClick: () => void;
 }) {
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  // Close on outside click / Escape. We attach the listener only while
+  // open so we don't run a no-op handler on every render of the page.
+  useEffect(() => {
+    if (!open) return;
+    function onDocClick(e: MouseEvent) {
+      if (!containerRef.current) return;
+      if (!containerRef.current.contains(e.target as Node)) setOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("mousedown", onDocClick);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDocClick);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  const empty = repos.length === 0;
+  const label = value || (empty ? "No repos connected" : "Select a repo");
+
   return (
-    <select
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-      disabled={disabled}
-      className="w-full bg-bg border border-border rounded-sm px-2 py-2 text-xs font-mono focus:border-white focus:outline-none"
-    >
-      <option value="">— select a repository —</option>
-      {repos.map((r) => (
-        <option key={r.repo} value={r.repo}>
-          {r.repo}
-        </option>
-      ))}
-    </select>
+    <div ref={containerRef} className="relative">
+      <button
+        type="button"
+        onClick={() => !disabled && !empty && setOpen((v) => !v)}
+        disabled={disabled || empty}
+        className="flex w-full items-center gap-2 rounded-sm border border-border bg-bg px-2.5 py-2 text-left text-xs transition-colors hover:border-border-strong disabled:cursor-not-allowed disabled:opacity-50"
+        title={label}
+      >
+        {value ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={repoAvatarUrl(value)}
+            alt=""
+            className="h-5 w-5 shrink-0 rounded-full border border-border bg-card"
+          />
+        ) : (
+          <span
+            className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-border bg-card text-[10px] text-muted"
+            aria-hidden
+          >
+            ?
+          </span>
+        )}
+        <span className="min-w-0 flex-1 truncate font-mono">{label}</span>
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          width="10"
+          height="10"
+          viewBox="0 0 16 16"
+          fill="currentColor"
+          className={"shrink-0 text-muted transition-transform " + (open ? "rotate-180" : "")}
+        >
+          <path d="M3 6l5 5 5-5H3z" />
+        </svg>
+      </button>
+
+      {empty && (
+        <div className="mt-2 space-y-1 text-[11px] text-muted">
+          <p>No repositories connected.</p>
+          {installUrl ? (
+            <button
+              type="button"
+              onClick={onInstallClick}
+              className="inline-flex items-center gap-1 text-text underline underline-offset-2"
+            >
+              Install GitHub App →
+            </button>
+          ) : null}
+        </div>
+      )}
+
+      {open && (
+        <div
+          role="listbox"
+          className="absolute left-0 right-0 z-30 mt-1 max-h-72 overflow-y-auto rounded-sm border border-border bg-bg shadow-lg"
+        >
+          {repos.map((r) => {
+            const active = r.repo === value;
+            return (
+              <button
+                key={r.repo}
+                type="button"
+                role="option"
+                aria-selected={active}
+                onClick={() => {
+                  onChange(r.repo);
+                  setOpen(false);
+                }}
+                className={
+                  "flex w-full items-center gap-2 px-2.5 py-2 text-left text-xs transition-colors " +
+                  (active
+                    ? "bg-bg-elev text-text"
+                    : "text-muted hover:bg-bg-elev hover:text-text")
+                }
+                title={r.repo}
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={repoAvatarUrl(r.repo)}
+                  alt=""
+                  className="h-5 w-5 shrink-0 rounded-full border border-border bg-card"
+                />
+                <span className="truncate font-mono">{r.repo}</span>
+                {active && (
+                  <span className="ml-auto text-[9px] font-mono uppercase tracking-[0.14em] text-muted">
+                    active
+                  </span>
+                )}
+              </button>
+            );
+          })}
+          {installUrl && (
+            <button
+              type="button"
+              onClick={() => {
+                setOpen(false);
+                onInstallClick();
+              }}
+              className="block w-full border-t border-border px-2.5 py-2 text-left text-xs text-muted hover:bg-bg-elev hover:text-text"
+            >
+              + Add more via GitHub App
+            </button>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
-function EmptyRoomState({
-  repos,
-  onPick,
+// =========================================================================
+// Empty room state — shown in the middle pane when no repo is selected.
+// Doesn't include a picker any more (the user picks from the sidebar).
+// =========================================================================
+
+function NoRoomState({
+  repoCount,
+  installLoaded,
+  healthy,
+  stale,
+  onInstall,
 }: {
-  repos: WatchedRepoLite[];
-  onPick: (repo: string) => void;
+  repoCount: number;
+  installLoaded: boolean;
+  healthy: number;
+  stale: number;
+  onInstall: () => void;
 }) {
-  // Default-open dropdown with avatars beats a native <select> for
-  // discoverability. We keep it keyboard-accessible (Enter / arrow
-  // keys work because we use a <select> element underneath).
   return (
     <div className="flex flex-col items-center justify-center gap-5 py-16 text-center sm:py-24">
       <div
@@ -1112,50 +1310,231 @@ function EmptyRoomState({
           <path d="M3 3h12a3 3 0 0 1 3 3v15l-4-3-4 3-4-3-4 3V3z" />
         </svg>
       </div>
-      <div className="space-y-1">
-        <div className="text-base font-semibold">Select a repository to start</div>
-        <div className="text-xs text-muted">
-          Pick a room from the left sidebar — or use the dropdown below.
+      {repoCount === 0 ? (
+        <div className="space-y-2">
+          <div className="text-base font-semibold">
+            No repositories connected
+          </div>
+          <p className="max-w-sm text-xs text-muted">
+            Install the Night PR Reviewer GitHub App and pick the repos you
+            want reviewed. We&apos;ll bring you back here automatically.
+          </p>
+          <button
+            type="button"
+            onClick={onInstall}
+            className="mt-1 inline-flex items-center gap-2 rounded-sm bg-white px-4 py-2 font-mono text-xs uppercase tracking-[0.14em] text-black hover:bg-white/90"
+          >
+            Install GitHub App →
+          </button>
         </div>
-      </div>
-
-      <div className="w-full max-w-sm space-y-2">
-        <RepoSelect
-          repos={repos}
-          value=""
-          onChange={onPick}
-          disabled={false}
-        />
-        <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
-          {repos.length} watched repo{repos.length === 1 ? "" : "s"}
-        </div>
-      </div>
-
-      {/* Avatar grid: clickable shortcuts to the first ~8 repos. */}
-      {repos.length > 0 && (
-        <div className="flex max-w-md flex-wrap items-center justify-center gap-2">
-          {repos.slice(0, 8).map((r) => (
+      ) : (
+        <div className="space-y-2">
+          <div className="text-base font-semibold">
+            Select a repository to start
+          </div>
+          <p className="text-xs text-muted">
+            Pick a room from the dropdown in the sidebar.
+          </p>
+          {installLoaded && healthy === 0 && stale > 0 && (
             <button
-              key={r.repo}
               type="button"
-              onClick={() => onPick(r.repo)}
-              className="flex items-center gap-1.5 rounded-sm border border-border bg-bg-elev px-2 py-1 text-xs font-mono hover:border-border-strong"
-              title={r.repo}
+              onClick={onInstall}
+              className="mt-1 inline-flex items-center gap-1.5 rounded-sm border border-[#ff9d4d]/40 bg-[#ff9d4d]/10 px-3 py-1 text-[11px] font-mono text-[#ff9d4d]"
             >
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={repoAvatarUrl(r.repo)}
-                alt=""
-                className="h-4 w-4 rounded-full border border-border bg-card"
-              />
-              <span className="truncate max-w-[160px]">{r.repo}</span>
+              GitHub App not detected — reinstall →
             </button>
-          ))}
+          )}
         </div>
       )}
     </div>
   );
 }
+
+// =========================================================================
+// Install-app modal
+// =========================================================================
+
+function InstallAppModal({
+  installUrl,
+  healthy,
+  stale,
+  repoCount,
+  installError,
+  onClose,
+}: {
+  installUrl: string | null;
+  healthy: number;
+  stale: number;
+  repoCount: number;
+  installError: string | null;
+  onClose: () => void;
+}) {
+  // Lock body scroll while the modal is open.
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  }, []);
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") onClose();
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  // Heuristic for the title — "first time install" vs "reinstall" vs
+  // a flat-out "GitHub returned an error" state. The body of the
+  // modal explains each.
+  const isReinstall = repoCount > 0 && healthy === 0 && stale > 0;
+  const title = installError
+    ? "Couldn't finish installing"
+    : isReinstall
+      ? "Reinstall the GitHub App"
+      : "Install the GitHub App";
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="install-modal-title"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm px-4"
+      onClick={(e) => {
+        // Backdrop click → close. Inner clicks shouldn't propagate.
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="w-full max-w-md rounded-md border border-border bg-bg shadow-2xl">
+        <header className="flex items-start justify-between gap-3 border-b border-border px-5 py-4">
+          <div className="min-w-0">
+            <h2
+              id="install-modal-title"
+              className="text-base font-semibold leading-tight"
+            >
+              {title}
+            </h2>
+            <p className="mt-1 text-[11px] font-mono uppercase tracking-[0.14em] text-muted">
+              Night PR Reviewer for GitHub
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-muted hover:text-text"
+            aria-label="Close"
+          >
+            ✕
+          </button>
+        </header>
+
+        <div className="space-y-4 px-5 py-5">
+          {installError ? (
+            <div className="rounded-sm border border-[#ff5252]/40 bg-[#ff5252]/10 px-3 py-2 text-xs text-[#ff5252]">
+              {installError}
+            </div>
+          ) : null}
+
+          {isReinstall ? (
+            <div className="space-y-2 text-sm">
+              <p>
+                We can see {repoCount} repositor
+                {repoCount === 1 ? "y" : "ies"} you previously connected,
+                but GitHub no longer reports a working installation on
+                your account. This usually means the app was uninstalled
+                from{" "}
+                <a
+                  href="https://github.com/settings/installations"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline hover:text-text"
+                >
+                  GitHub → Settings → Applications
+                </a>
+                .
+              </p>
+              <p className="text-xs text-muted">
+                Re-installing reconnects the same repos automatically.
+                Pick &ldquo;All repositories&rdquo; on the install screen
+                if you want every repo watched.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-2 text-sm">
+              <p>
+                Night PR Reviewer needs a GitHub App installation to read
+                pull requests, post review comments, and (when you ask
+                it to) close or merge PRs.
+              </p>
+              <p className="text-xs text-muted">
+                You choose which repos to grant access to. There&apos;s
+                no limit — pick one, several, or all of them.
+              </p>
+            </div>
+          )}
+
+          <div className="flex flex-col gap-2">
+            {installUrl ? (
+              <>
+                <a
+                  href={installUrl}
+                  className="inline-flex h-10 w-full items-center justify-center gap-2 bg-white font-mono text-sm uppercase tracking-[0.08em] text-black hover:bg-white/90"
+                >
+                  <GitHubGlyph />
+                  {isReinstall ? "Reinstall on GitHub" : "Install on GitHub"}
+                </a>
+                <a
+                  href={`${installUrl}?repository_target=all`}
+                  className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-sm border border-border bg-transparent font-mono text-sm text-muted hover:border-border-strong hover:text-text"
+                  title="Same install flow with 'All repositories' preselected on GitHub"
+                >
+                  Install on all my repos
+                </a>
+              </>
+            ) : (
+              <div className="rounded-sm border border-[#ff5252]/40 bg-[#ff5252]/10 px-3 py-2 text-xs text-[#ff5252]">
+                The GitHub App slug isn&apos;t configured on this deploy
+                (set <code>NEXT_PUBLIC_GITHUB_APP_SLUG</code>). Ask your
+                administrator to finish setup.
+              </div>
+            )}
+          </div>
+
+          <div className="flex justify-end border-t border-border pt-3">
+            <button
+              type="button"
+              onClick={onClose}
+              className="text-[11px] font-mono uppercase tracking-[0.14em] text-muted hover:text-text"
+            >
+              Maybe later
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GitHubGlyph() {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      width={16}
+      height={16}
+      fill="currentColor"
+      aria-hidden
+    >
+      <path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.36-3.88-1.36-.52-1.32-1.27-1.67-1.27-1.67-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.02 1.75 2.68 1.24 3.34.95.1-.74.4-1.25.72-1.54-2.55-.29-5.24-1.27-5.24-5.65 0-1.25.45-2.27 1.18-3.07-.12-.29-.51-1.47.11-3.06 0 0 .97-.31 3.18 1.17a11 11 0 0 1 5.78 0c2.21-1.48 3.18-1.17 3.18-1.17.62 1.59.23 2.77.11 3.06.73.8 1.18 1.82 1.18 3.07 0 4.39-2.69 5.36-5.25 5.64.41.36.78 1.05.78 2.13v3.16c0 .31.21.67.8.55C20.21 21.38 23.5 17.08 23.5 12 23.5 5.65 18.35.5 12 .5Z" />
+    </svg>
+  );
+}
+
+// =========================================================================
+// Collapsible card + stats / research panels
+// =========================================================================
 
 function CollapsibleCard({
   title,
@@ -1196,7 +1575,6 @@ function CollapsibleCard({
         {headerExtra && (
           <span
             onClick={(e) => {
-              // Don't toggle the panel when clicking the action button.
               e.stopPropagation();
             }}
             className="flex items-center gap-1"
@@ -1231,18 +1609,12 @@ function RepoStatsPanel({ stats }: { stats: RepoStatsState | null }) {
 
   return (
     <div className="space-y-4">
-      {/* Top-line numbers */}
       <div className="grid grid-cols-3 gap-2">
         <StatTile label="Stars" value={d.stars ?? "—"} />
         <StatTile label="Open PRs" value={d.open_prs ?? "—"} />
-        <StatTile
-          label="Updated"
-          value={formatAgo(d.last_commit)}
-          mono
-        />
+        <StatTile label="Updated" value={formatAgo(d.last_commit)} mono />
       </div>
 
-      {/* Languages */}
       <div className="space-y-2">
         <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
           Languages
@@ -1251,7 +1623,6 @@ function RepoStatsPanel({ stats }: { stats: RepoStatsState | null }) {
           <div className="text-[11px] text-muted">No language data</div>
         ) : (
           <>
-            {/* Stacked progress bar */}
             <div className="flex h-1.5 w-full overflow-hidden rounded-sm bg-border/40">
               {langs.map(([name, n]) => (
                 <div
@@ -1287,7 +1658,6 @@ function RepoStatsPanel({ stats }: { stats: RepoStatsState | null }) {
         )}
       </div>
 
-      {/* Contributors */}
       <div className="space-y-2">
         <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
           Top contributors
@@ -1586,8 +1956,6 @@ function ReportCard({
   }
 
   function download() {
-    // Use a one-shot anchor element. URL.createObjectURL keeps the
-    // blob alive until we revoke it; the next tick is enough.
     const today = new Date().toISOString().slice(0, 10);
     const safeRepo = repo.replace(/[^A-Za-z0-9._-]+/g, "-");
     const filename = `${safeRepo}-health-report-${today}.md`;
@@ -1656,8 +2024,6 @@ function ReportCard({
           />
         )}
       </div>
-      {/* Inline styles to flip the dark-mode markdown defaults to a
-          print-friendly palette without polluting global CSS. */}
       <style jsx>{`
         :global(.report-content .md-h1) {
           font-size: 1.4rem;

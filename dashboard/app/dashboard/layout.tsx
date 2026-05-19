@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation";
 import { AuthedNav } from "@/components/authed-nav";
-import { getUserProfile, getWatchedRepos } from "@/lib/queries";
+import { getUserProfile } from "@/lib/queries";
 import { getUser } from "@/lib/supabase/server";
 
 // /dashboard layout — the authentication boundary. Every page nested
@@ -12,10 +12,10 @@ import { getUser } from "@/lib/supabase/server";
 //      defense for the (rare) case where middleware was bypassed.
 //   2. getUser() verifies the JWT against Supabase Auth (round-trip),
 //      so we're trusting the identity, not a cookie blob.
-//   3. The user_profiles + watched_repos rows are fetched once here
-//      and passed into the AuthedNav as props. Pages further down can
-//      re-query whatever they need; this layout's job is just the
-//      chrome.
+//   3. user_profiles is fetched once here for the nav avatar / display
+//      name. The repo-count pill that used to live here was removed
+//      along with the free-plan limit UI — pages further down can
+//      re-query what they need.
 
 export const dynamic = "force-dynamic";
 
@@ -29,13 +29,10 @@ export default async function DashboardLayout({
     redirect("/login");
   }
 
-  // Parallel-fetch profile and repos; both are user-scoped reads and
-  // independent. If either fails we render with sensible defaults
-  // rather than 500'ing the whole shell.
-  const [profile, watched] = await Promise.all([
-    getUserProfile(user.id),
-    getWatchedRepos(user.id),
-  ]);
+  // Profile is the only nav input now. A null profile (race between
+  // OAuth callback insert and the first dashboard hit) just falls
+  // back to email / "Account".
+  const profile = await getUserProfile(user.id);
 
   return (
     <>
@@ -45,8 +42,6 @@ export default async function DashboardLayout({
           profile?.display_name ?? profile?.github_username ?? null
         }
         avatarUrl={profile?.avatar_url ?? null}
-        repoCount={watched.length}
-        repoLimit={profile?.repo_limit ?? 2}
       />
       {children}
     </>

@@ -1,31 +1,37 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
-import { LinkButton } from "@/components/ui/button";
+import { ExternalLinkButton } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Container } from "@/components/ui/container";
 import { SectionHeading } from "@/components/ui/section-heading";
 import { Table, TableBody, TableHeader, Td, Th } from "@/components/ui/table";
 import { formatRelativeTime } from "@/lib/design";
-import { getUserProfile, getWatchedRepos } from "@/lib/queries";
+import { getWatchedRepos } from "@/lib/queries";
 import { getUser } from "@/lib/supabase/server";
 
 // User-scoped repo list. Shows only watched_repos owned by the logged-
 // in user (RLS enforced in queries.ts → getWatchedRepos). The legacy
 // /repos page stays public and continues to show every repo with
 // reviews — that's the v1 demo route.
+//
+// As of the App-only flow: there is NO repo limit and NO connect-repo
+// page. Adding a repo means installing (or re-configuring) the GitHub
+// App, which is a single button that bounces through GitHub.
 
 export const dynamic = "force-dynamic";
+
+function appInstallUrl(): string | null {
+  const slug = process.env.NEXT_PUBLIC_GITHUB_APP_SLUG;
+  if (!slug) return null;
+  return `https://github.com/apps/${slug}/installations/new`;
+}
 
 export default async function DashboardReposPage() {
   const user = await getUser().catch(() => null);
   if (!user) redirect("/login");
 
-  const [profile, watched] = await Promise.all([
-    getUserProfile(user.id),
-    getWatchedRepos(user.id),
-  ]);
-  const repoLimit = profile?.repo_limit ?? 2;
-  const atLimit = watched.length >= repoLimit;
+  const watched = await getWatchedRepos(user.id);
+  const installUrl = appInstallUrl();
 
   return (
     <Container className="py-10 space-y-8">
@@ -35,33 +41,31 @@ export default async function DashboardReposPage() {
           title="Your repositories"
           subtitle={
             <>
-              {watched.length} of {repoLimit >= 9999 ? "unlimited" : repoLimit}{" "}
-              watched
-              {profile?.plan ? ` · ${profile.plan} plan` : ""}
+              {watched.length} watched · managed via the Night PR Reviewer
+              GitHub App
             </>
           }
         />
-        {atLimit ? (
-          <LinkButton href="/dashboard/connect-repo" variant="default" size="md">
-            Limit reached
-          </LinkButton>
-        ) : (
-          <LinkButton href="/dashboard/connect-repo" variant="primary" size="md">
-            + Connect repo
-          </LinkButton>
-        )}
+        {installUrl ? (
+          <ExternalLinkButton href={installUrl} variant="primary" size="md">
+            + Add repos via GitHub
+          </ExternalLinkButton>
+        ) : null}
       </section>
 
       {watched.length === 0 ? (
         <Card className="p-12 text-center space-y-4">
           <p className="text-sm text-muted">
-            No repositories connected yet.
+            No repositories connected yet. Install the GitHub App and pick
+            the repos you want reviewed — GitHub will bring you back here.
           </p>
-          <div className="flex justify-center">
-            <LinkButton href="/dashboard/connect-repo" variant="primary">
-              Connect your first repo
-            </LinkButton>
-          </div>
+          {installUrl && (
+            <div className="flex justify-center">
+              <ExternalLinkButton href={installUrl} variant="primary">
+                Install Night PR Reviewer →
+              </ExternalLinkButton>
+            </div>
+          )}
         </Card>
       ) : (
         <Table>

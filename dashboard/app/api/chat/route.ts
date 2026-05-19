@@ -95,6 +95,48 @@ Three bullets. Each: a topic + one short clause explaining why it matters for th
 ### Resources to check
 Two or three bullets pointing at concrete docs/files (e.g. "README", "docs/architecture.md", "package.json"). Only mention files that appear in the data — do not invent paths.`;
 
+// "Generate Report" mode: full-page health report rendered in the chat
+// pane as a print-friendly card. The shape is dictated so the user
+// can reliably skim across repos.
+function reportSystemPrompt(repo: string): string {
+  const today = new Date().toISOString().slice(0, 10);
+  return `\
+Generate a comprehensive repository health report in markdown for ${repo}.
+
+Structure (use these exact H1/H2 headings):
+
+# Repository Health Report: ${repo}
+
+## Executive Summary
+3-4 sentences. Plain English, no jargon.
+
+## PR Review Statistics
+- Total reviews, auto-closed count, approval rate
+- Average severity score (1-10)
+- Most common bug types found
+
+## Recent Activity (last 30 days)
+Brief narrative of PR volume, merge frequency, contributor mix. Cite specific numbers from the data.
+
+## Code Quality Trends
+What's improving / regressing. Anchor to the review history when possible.
+
+## Top Issues Found
+Three to five concrete bugs / smells the reviewer has flagged across the most recent reviews. Quote PR numbers.
+
+## Recommendations
+Three to five actionable items, each one line. Use imperative voice ("Add CI lint…", "Reduce…").
+
+## Risk Assessment
+One of: Low / Medium / High. One paragraph of justification grounded in the data.
+
+Rules:
+  * Be specific with numbers — pull them from the REPOSITORY DATA block.
+  * If a section's data is missing, write "Insufficient data" rather than inventing.
+  * No ACTION blocks. No greetings. No closing fluff. Today's date: ${today}.
+  * Do not wrap the whole response in a code fence — it's rendered as markdown.`;
+}
+
 interface HistoryEntry {
   role: "user" | "assistant";
   content: string;
@@ -105,6 +147,7 @@ interface RequestBody {
   repo?: unknown;
   history?: unknown;
   isResearchBriefing?: unknown;
+  isReport?: unknown;
 }
 
 function jsonError(message: string, status: number) {
@@ -274,11 +317,107 @@ async function fetchGitHubContext(
   message: string,
   pat: string | undefined,
   isResearchBriefing: boolean,
+  isReport: boolean = false,
 ): Promise<FetchedContext> {
   const ctx: Record<string, unknown> = {};
   const errors: string[] = [];
   const base = `https://api.github.com/repos/${repo}`;
   const jobs: Array<Promise<void>> = [];
+
+  if (isReport) {
+    // Health-report bundle: last-30-days commits + open PRs +
+    // contributors + languages + the last 30 reviews from Supabase.
+    // The report prompt explicitly tells Claude to ground numbers
+    // here, so we pull more rows than the chat path normally would.
+    jobs.push(
+      ghJSON<Record<string, unknown>>(`${base}`, pat).then((data) => {
+        if (data) {
+          ctx.repo_meta = {
+            name: data.full_name,
+            description: data.description,
+            primary_language: data.language,
+            default_branch: data.default_branch,
+            stars: data.stargazers_count,
+            forks: data.forks_count,
+            open_issues: data.open_issues_count,
+            pushed_at: data.pushed_at,
+          };
+        }
+      }),
+      ghJSON<Array<Record<string, unknown>>>(
+        `${base}/pulls?state=open&per_page=30`,
+        pat,
+        { trunc: 30 },
+      ).then((data) => {
+        if (data) {
+          ctx.open_pull_requests = data.map((p) => ({
+            number: p.number,
+            title: p.title,
+            user: (p.user as { login?: string } | null)?.login,
+            created_at: p.created_at,
+            draft: p.draft,
+          }));
+        }
+      }),
+      ghJSON<Array<Record<string, unknown>>>(
+        // Commits since 30d ago — GitHub takes ISO-8601 in &since=.
+        `${base}/commits?per_page=100&since=${new Date(Date.now() - 30 * 86_400_000).toISOString()}`,
+        pat,
+        { trunc: 100 },
+      ).then((data) => {
+        if (data) {
+          ctx.recent_commits_30d = data.map((c) => {
+            const commit = c.commit as
+              | { message?: string; author?: { name?: string; date?: string } }
+              | null;
+            return {
+              sha: (c.sha as string | undefined)?.slice(0, 7),
+              author: commit?.author?.name,
+              date: commit?.author?.date,
+              message: commit?.message?.split("\n")[0],
+            };
+          });
+          ctx.commit_count_30d = data.length;
+        }
+      }),
+      ghJSON<Record<string, number>>(`${base}/languages`, pat).then((data) => {
+        if (data) ctx.languages = data;
+      }),
+      ghJSON<Array<Record<string, unknown>>>(
+        `${base}/contributors?per_page=10`,
+        pat,
+        { trunc: 10 },
+      ).then((data) => {
+        if (data) {
+          ctx.contributors = data.map((c) => ({
+            login: c.login,
+            contributions: c.contributions,
+          }));
+        }
+      }),
+      // Last 30 reviews from Supabase — the agent's own history is
+      // the meat of the report. Verdict + severity + action lets
+      // Claude compute approval rate, auto-closed count, etc.
+      (async () => {
+        try {
+          const supabase = await createSupabaseServerClient();
+          const { data } = await supabase
+            .from("reviews")
+            .select(
+              "id, created_at, pr_number, pr_title, verdict, severity_score, action, bugs_found",
+            )
+            .eq("repo", repo)
+            .order("created_at", { ascending: false })
+            .limit(30);
+          if (data) ctx.recent_reviews = data;
+        } catch {
+          errors.push("Could not fetch review history");
+        }
+      })(),
+    );
+    await Promise.all(jobs);
+    return { fetched: ctx, errors };
+  }
 
   if (isResearchBriefing) {
     // Briefing bundle: fixed, repo-scoped. Recent commits + open PRs +
@@ -707,6 +846,9 @@ async function streamFromAnthropic(opts: {
   writeToken: string | null;
   repo: string;
   allowActions: boolean;
+  // Optional override — the report path needs ~4x the default to fit
+  // a full markdown document without truncation.
+  maxTokens?: number;
 }): Promise<Response> {
   const messages = [
     ...opts.history.slice(-HISTORY_LIMIT).map((h) => ({
@@ -725,7 +867,7 @@ async function streamFromAnthropic(opts: {
     },
     body: JSON.stringify({
       model: CHAT_MODEL,
-      max_tokens: MAX_TOKENS,
+      max_tokens: opts.maxTokens ?? MAX_TOKENS,
       stream: true,
       system: opts.systemPrompt,
       messages,
@@ -943,9 +1085,18 @@ export async function POST(request: NextRequest) {
   } catch {
     return jsonError("Body must be JSON", 400);
   }
-  const message = typeof body.message === "string" ? body.message.trim() : "";
   const repo = typeof body.repo === "string" ? body.repo.trim() : "";
   const isResearchBriefing = body.isResearchBriefing === true;
+  const isReport = body.isReport === true;
+  // Reports don't need a user prompt — the system prompt is fully
+  // self-contained. Briefings always synthesize a stub prompt
+  // client-side, so they look like a normal message at this layer.
+  const message =
+    typeof body.message === "string"
+      ? body.message.trim()
+      : isReport
+        ? "Generate the report now."
+        : "";
   if (!message) return jsonError("`message` is required", 400);
   if (!repo || !REPO_PATTERN.test(repo)) {
     return jsonError("`repo` must look like owner/name", 400);
@@ -994,6 +1145,7 @@ export async function POST(request: NextRequest) {
     message,
     readPat ?? undefined,
     isResearchBriefing,
+    isReport,
   );
 
   const repoDataJSON = JSON.stringify(
@@ -1005,19 +1157,29 @@ export async function POST(request: NextRequest) {
     2,
   );
 
-  const userPayload =
-    `REPOSITORY DATA:\n${repoDataJSON}\n\nUSER QUESTION:\n${message}`;
+  const userPayload = isReport
+    ? `REPOSITORY DATA:\n${repoDataJSON}\n\nGenerate the report now.`
+    : `REPOSITORY DATA:\n${repoDataJSON}\n\nUSER QUESTION:\n${message}`;
 
   // 6. Stream
+  const systemPrompt = isReport
+    ? reportSystemPrompt(repo)
+    : isResearchBriefing
+      ? RESEARCH_BRIEFING_PROMPT
+      : systemPromptChat(repo);
+
   return streamFromAnthropic({
     apiKey: anthropicKey,
-    systemPrompt: isResearchBriefing
-      ? RESEARCH_BRIEFING_PROMPT
-      : systemPromptChat(repo),
-    history: isResearchBriefing ? [] : history,
+    systemPrompt,
+    // Reports + briefings start a fresh context — neither benefits
+    // from prior chit-chat.
+    history: isReport || isResearchBriefing ? [] : history,
     userMessage: userPayload,
     writeToken,
     repo,
-    allowActions: !isResearchBriefing,
+    // Reports are pure read-only generation — never execute ACTIONs
+    // even if Claude hallucinates one.
+    allowActions: !isResearchBriefing && !isReport,
+    maxTokens: isReport ? 4096 : undefined,
   });
 }

@@ -185,6 +185,33 @@ export interface RepoRule {
   repo_directory_tree: string | null;
 }
 
+// --- Repo research cache (migration 013) ---------------------------------
+// Backs the chat page's right-sidebar "Research" panel. One row per repo,
+// articles is a JSON array. The fingerprint_hash discriminator is what
+// drives the "is this cache stale?" check — when repo_fingerprints
+// changes for this repo, the dashboard asks Claude for a fresh list.
+
+export interface RepoResearchArticle {
+  // Display title. Truncate at render-time, store full text.
+  title: string;
+  // Real URL — we prompt Claude not to invent, but we still validate
+  // shape (URL parsable) before rendering as a link.
+  url: string;
+  // Short source name shown as a badge ("MDN", "dev.to", "GitHub").
+  // Not a domain — Claude picks something readable.
+  source: string;
+  // One-line "why this matters" hook.
+  description: string;
+}
+
+export interface RepoResearch {
+  id: string;
+  repo: string;
+  articles: RepoResearchArticle[];
+  fingerprint_hash: string | null;
+  updated_at: string;
+}
+
 // --- Phase 7: self-learning ----------------------------------------------
 // Match agent/migrations/006_human_actions.sql + 007_agent_alerts.sql. The
 // five-bucket action_type enum is the agent's ground-truth signal: every

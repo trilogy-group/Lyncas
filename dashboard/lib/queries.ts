@@ -12,6 +12,8 @@ import type {
   HumanActionType,
   HumanActionWithReview,
   PromptTunerRun,
+  RepoResearch,
+  RepoResearchArticle,
   RepoRule,
   RepoRulesStatus,
   GitHubAppInstallation,
@@ -354,6 +356,62 @@ export async function getRepoStats(): Promise<RepoStat[]> {
       };
     })
     .sort((a, b) => b.total_reviews - a.total_reviews);
+}
+
+// --- Repo research cache (migration 013) ---------------------------------
+// Backs the chat page's right-sidebar "Research" panel. The /api/repo-research
+// route owns refresh policy; these helpers are pure read / write.
+
+export async function getRepoResearch(
+  repo: string,
+): Promise<RepoResearch | null> {
+  const supabase = await createSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("repo_research")
+    .select("*")
+    .eq("repo", repo)
+    .maybeSingle();
+  // Tolerate the table being absent on a fresh DB — the route layer
+  // recovers by generating fresh on a cache miss.
+  if (error) return null;
+  if (!data) return null;
+  return {
+    ...(data as Omit<RepoResearch, "articles">),
+    articles: Array.isArray((data as { articles: unknown }).articles)
+      ? ((data as { articles: RepoResearchArticle[] }).articles)
+      : [],
+  } as RepoResearch;
+}
+
+export async function upsertRepoResearch(
+  repo: string,
+  articles: RepoResearchArticle[],
+  fingerprintHash: string | null,
+): Promise<void> {
+  const supabase = await createSupabaseServerClient();
+  const { error } = await supabase.from("repo_research").upsert(
+    {
+      repo,
+      articles,
+      fingerprint_hash: fingerprintHash,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "repo" },
+  );
+  if (error) throw error;
+}
+
+export async function getRepoFingerprintText(
+  repo: string,
+): Promise<string | null> {
+  const supabase = await createSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("repo_fingerprints")
+    .select("fingerprint")
+    .eq("repo", repo)
+    .maybeSingle();
+  if (error) return null;
+  return (data as { fingerprint: string } | null)?.fingerprint ?? null;
 }
 
 // --- Phase 9: per-repo rules ---------------------------------------------

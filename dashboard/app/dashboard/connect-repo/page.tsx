@@ -3,33 +3,19 @@
 import Link from "next/link";
 import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { Button, ExternalLinkButton } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { Container } from "@/components/ui/container";
+import { SectionHeading } from "@/components/ui/section-heading";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 
 // Repo connection page — migration 011.
+// (Logic identical to v2; chrome rebuilt for the v3 black-mode design.)
 //
-// Two paths, with the GitHub App promoted as the recommended one:
-//
-//   1. GitHub App install (primary)
-//      One button that links to
+// Two paths, GitHub App promoted as primary:
+//   1. GitHub App install (recommended). One button to
 //      https://github.com/apps/<slug>/installations/new?state=<user_id>.
-//      GitHub asks the user which repos to grant, then redirects them
-//      to /auth/github-app/callback?installation_id=…&state=<user_id>
-//      which provisions the watched_repos rows server-side. The
-//      `state` is a defense-in-depth hint that lets the callback log
-//      a session-mismatch when the redirected browser doesn't carry
-//      the expected user; the callback still requires a real session
-//      so `state` alone is not a credential.
-//
-//   2. PAT (collapsed, "Advanced") — unchanged from the pre-011 flow,
-//      now with a "Fetch my repos" picker that drives the input via
-//      the logged-in user's GitHub OAuth token instead of typing.
-//
-// Free-plan check (repo_limit) gates both paths — at-limit users see
-// the upgrade banner regardless of which method they'd prefer.
-//
-// Wrapped in <Suspense> because useSearchParams() requires it under
-// the App Router's static-bailout rules.
+//   2. PAT (collapsed, advanced). Includes a "Fetch my repos" picker.
 
 interface VerifyState {
   status: "idle" | "checking" | "ok" | "error";
@@ -67,19 +53,8 @@ function ConnectRepoInner() {
     message: null,
   });
   const [saving, setSaving] = useState(false);
-  // Repo picker state — only populated when the user clicks
-  // "Fetch my repos". Falls back to a plain text input when the
-  // OAuth token isn't available (e.g. magic-link login) or when
-  // GitHub returns an error.
-  const [fetchRepos, setFetchRepos] = useState<FetchReposState>({
-    kind: "idle",
-  });
+  const [fetchRepos, setFetchRepos] = useState<FetchReposState>({ kind: "idle" });
   const [repoSearch, setRepoSearch] = useState("");
-  // The callback bounces back here with ?error=… on failure (and to
-  // /dashboard/repos?connected=N on success, which this page never
-  // sees). Surface the inbound error as a toast on first render by
-  // seeding the initial state — doing this in an effect would trip
-  // the project's react-hooks/set-state-in-effect lint rule.
   const [toast, setToast] = useState<
     { kind: "success" | "error"; message: string } | null
   >(() => {
@@ -126,10 +101,6 @@ function ConnectRepoInner() {
   async function handleFetchMyRepos() {
     setFetchRepos({ kind: "loading" });
     try {
-      // Supabase only exposes provider_token via getSession (not
-      // getUser); the token is the GitHub OAuth access token from the
-      // login flow. It has `read:user` scope by default — enough to
-      // call /user/repos for repos the user can see.
       const { data } = await supabase.auth.getSession();
       const providerToken = data.session?.provider_token;
       if (!providerToken) {
@@ -291,17 +262,13 @@ function ConnectRepoInner() {
 
   if (loading) {
     return (
-      <main className="max-w-2xl mx-auto px-6 py-10">
-        <Card className="p-10 text-center text-muted text-sm">Loading…</Card>
-      </main>
+      <Container size="narrow" className="py-10">
+        <Card className="p-10 text-center text-sm text-muted">Loading…</Card>
+      </Container>
     );
   }
 
   const atLimit = repoCount >= repoLimit;
-  // GitHub forwards the `state` parameter back to the post-install
-  // callback verbatim. The callback already requires a Supabase
-  // session, so `state` is not a security boundary — it's a
-  // correlation hint we can log when the user_id doesn't match.
   const installUrl =
     APP_SLUG && userId
       ? `https://github.com/apps/${APP_SLUG}/installations/new?state=${encodeURIComponent(userId)}`
@@ -309,9 +276,6 @@ function ConnectRepoInner() {
         ? `https://github.com/apps/${APP_SLUG}/installations/new`
         : null;
 
-  // Filter the picker locally. ~100 repos is fine to do client-side;
-  // the GitHub endpoint already caps at `per_page=100` so we don't
-  // need to wire a paginated server query for the v1 picker.
   const filteredRepos =
     fetchRepos.kind === "ok"
       ? fetchRepos.repos.filter((r) =>
@@ -320,26 +284,22 @@ function ConnectRepoInner() {
       : [];
 
   return (
-    <main className="max-w-2xl mx-auto px-6 py-8 space-y-6">
+    <Container size="narrow" className="py-10 space-y-8">
       <div className="space-y-1">
         <Link
           href="/dashboard/repos"
-          className="text-xs text-muted hover:text-text"
+          className="text-[11px] font-mono uppercase tracking-[0.14em] text-muted hover:text-text"
         >
           ← Your repositories
         </Link>
-        <h1 className="text-xl font-semibold">Connect a repository</h1>
-        <p className="text-sm text-muted">
-          The agent will review every new pull request on the repos you
-          connect.
-        </p>
+        <SectionHeading
+          title="Connect a repository"
+          subtitle="The agent will review every new pull request on the repos you connect."
+        />
       </div>
 
       {atLimit ? (
-        <Card
-          className="p-6 space-y-3 border-2"
-          style={{ borderColor: "#fbbf24" }}
-        >
+        <Card className="p-6 space-y-4 border-[#f5c63a]">
           <h2 className="text-base font-semibold">
             Upgrade to Pro to add more repositories
           </h2>
@@ -347,16 +307,10 @@ function ConnectRepoInner() {
             You&apos;ve connected {repoCount} of {repoLimit} repositories
             included in your free plan.
           </p>
-          <div className="flex items-center gap-3 pt-1">
-            <button
-              type="button"
-              disabled
-              className="px-4 py-2 rounded-md text-sm font-medium text-white opacity-60 cursor-not-allowed"
-              style={{ backgroundColor: "#4338ca" }}
-              title="Billing not wired up yet"
-            >
+          <div className="flex flex-wrap items-center gap-3">
+            <Button variant="primary" disabled title="Billing not wired up yet">
               Upgrade to Pro (coming soon)
-            </button>
+            </Button>
             <Link
               href="/dashboard/repos"
               className="text-sm text-muted hover:text-text"
@@ -368,107 +322,97 @@ function ConnectRepoInner() {
       ) : (
         <>
           {/* Section 1 — GitHub App (recommended) */}
-          <Card className="p-6 space-y-4">
+          <Card className="p-6 space-y-5">
             <div className="flex items-start gap-3">
-              <div
-                className="mt-0.5 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase tracking-wider"
-                style={{ backgroundColor: "#dcfce7", color: "#15803d" }}
-              >
+              <span className="rounded-sm bg-[#4ade80] px-2 py-0.5 text-[10px] font-mono uppercase tracking-[0.16em] text-black">
                 Recommended
-              </div>
+              </span>
               <div className="min-w-0">
                 <h2 className="text-base font-semibold">
                   Connect via GitHub App
                 </h2>
-                <p className="text-sm text-muted mt-1">
+                <p className="mt-1 text-sm text-muted">
                   Grant access to specific repositories without sharing
-                  personal tokens. GitHub will ask you which repos to
-                  allow.
+                  personal tokens. GitHub will ask you which repos to allow.
                 </p>
               </div>
             </div>
 
             {installUrl ? (
-              <a
+              <ExternalLinkButton
                 href={installUrl}
-                className="inline-flex items-center justify-center gap-2 w-full sm:w-auto px-4 py-2.5 rounded-md text-sm font-medium text-white"
-                style={{ backgroundColor: "#18181b" }}
+                variant="primary"
+                size="md"
+                className="w-full sm:w-auto"
               >
                 <GitHubIcon />
                 Install Night PR Reviewer on GitHub →
-              </a>
+              </ExternalLinkButton>
             ) : (
-              <div
-                className="text-xs px-3 py-2 rounded-md border"
-                style={{
-                  borderColor: "#fecaca",
-                  backgroundColor: "#fef2f2",
-                  color: "#991b1b",
-                }}
-              >
+              <div className="rounded-sm border border-[#ff5252]/40 bg-[#ff5252]/10 px-3 py-2 text-xs text-[#ff5252]">
                 The GitHub App isn&apos;t fully configured on this deploy
-                (missing <code>NEXT_PUBLIC_GITHUB_APP_SLUG</code>). Use the
-                PAT path below or ask your administrator to finish setup.
+                (missing <code>NEXT_PUBLIC_GITHUB_APP_SLUG</code>). Use the PAT
+                path below or ask your administrator to finish setup.
               </div>
             )}
 
             <p className="text-xs text-muted">
-              You&apos;ll be redirected to GitHub to select repositories,
-              then brought back here automatically.
+              You&apos;ll be redirected to GitHub to select repositories, then
+              brought back here automatically.
             </p>
           </Card>
 
           {/* Section 2 — PAT (collapsed) */}
-          <Card className="p-0 overflow-hidden">
+          <Card flush className="overflow-hidden">
             <details className="group">
-              <summary className="px-6 py-4 cursor-pointer flex items-center justify-between gap-3 select-none">
+              <summary className="flex cursor-pointer select-none items-center justify-between gap-3 px-6 py-4">
                 <div>
                   <span className="text-sm font-medium">
                     Advanced: use a PAT instead
                   </span>
-                  <p className="text-xs text-muted mt-0.5">
+                  <p className="mt-0.5 text-xs text-muted">
                     For personal use or testing only.
                   </p>
                 </div>
-                <span className="text-muted text-xs group-open:hidden">
+                <span className="text-[11px] font-mono uppercase tracking-[0.14em] text-muted group-open:hidden">
                   Show
                 </span>
-                <span className="text-muted text-xs hidden group-open:inline">
+                <span className="hidden text-[11px] font-mono uppercase tracking-[0.14em] text-muted group-open:inline">
                   Hide
                 </span>
               </summary>
 
-              <div className="px-6 pb-6 pt-2 border-t border-border space-y-5">
+              <div className="space-y-6 border-t border-border px-6 pb-6 pt-5">
                 <div className="space-y-2">
                   <div className="flex items-center justify-between gap-3">
                     <label
                       htmlFor="repo"
-                      className="block text-sm font-medium text-text"
+                      className="block text-[10px] font-mono uppercase tracking-[0.18em] text-muted"
                     >
                       Repository
                     </label>
-                    <button
+                    <Button
                       type="button"
                       onClick={() => void handleFetchMyRepos()}
                       disabled={fetchRepos.kind === "loading"}
-                      className="text-xs px-2.5 py-1 rounded-md border border-border bg-card hover:bg-bg disabled:opacity-50"
+                      size="sm"
+                      variant="default"
                     >
                       {fetchRepos.kind === "loading"
                         ? "Fetching…"
                         : fetchRepos.kind === "ok"
                           ? "Refresh"
                           : "Fetch my repos"}
-                    </button>
+                    </Button>
                   </div>
 
-                  {/* Selected repo badge (only when set) */}
                   {repo && (
                     <div className="flex items-center gap-2">
                       <span
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-mono border border-border bg-bg"
+                        className="inline-flex items-center gap-1.5 rounded-sm border border-border bg-bg px-2.5 py-1 font-mono text-xs"
                         title={repo}
                       >
-                        <span className="truncate max-w-[260px]">{repo}</span>
+                        <span className="max-w-[260px] truncate">{repo}</span>
                         <button
                           type="button"
                           onClick={() => {
@@ -485,17 +429,16 @@ function ConnectRepoInner() {
                     </div>
                   )}
 
-                  {/* Picker — only when we have OAuth-fetched repos */}
                   {fetchRepos.kind === "ok" && (
-                    <div className="border border-border rounded-md overflow-hidden">
+                    <div className="overflow-hidden rounded-sm border border-border">
                       <input
                         type="text"
                         value={repoSearch}
                         onChange={(e) => setRepoSearch(e.target.value)}
                         placeholder={`Search ${fetchRepos.repos.length} repos…`}
-                        className="w-full bg-card px-3 py-2 text-xs font-mono border-b border-border focus:outline-none"
+                        className="w-full border-b border-border bg-bg px-3 py-2 text-xs font-mono focus:outline-none"
                       />
-                      <div className="max-h-52 overflow-y-auto bg-card">
+                      <div className="max-h-52 overflow-y-auto bg-bg">
                         {filteredRepos.length === 0 ? (
                           <div className="px-3 py-3 text-xs text-muted">
                             No matches.
@@ -509,7 +452,7 @@ function ConnectRepoInner() {
                                 setRepo(r.full_name);
                                 resetVerify();
                               }}
-                              className="w-full text-left px-3 py-1.5 text-xs font-mono hover:bg-bg flex items-center justify-between gap-2"
+                              className="flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left font-mono text-xs hover:bg-bg-elev"
                             >
                               <span className="truncate">{r.full_name}</span>
                               {r.private && (
@@ -525,20 +468,11 @@ function ConnectRepoInner() {
                   )}
 
                   {fetchRepos.kind === "fallback" && (
-                    <p
-                      className="text-xs px-3 py-2 rounded-md border"
-                      style={{
-                        borderColor: "#fde68a",
-                        backgroundColor: "#fffbeb",
-                        color: "#92400e",
-                      }}
-                    >
+                    <p className="rounded-sm border border-[#f5c63a]/40 bg-[#f5c63a]/10 px-3 py-2 text-xs text-[#f5c63a]">
                       {fetchRepos.message}
                     </p>
                   )}
 
-                  {/* Manual input — always available as fallback /
-                      override, pre-filled when a row was picked. */}
                   <input
                     id="repo"
                     type="text"
@@ -550,7 +484,7 @@ function ConnectRepoInner() {
                       resetVerify();
                     }}
                     placeholder="e.g. HarshBti1805/HackHelix-LLMHallucination"
-                    className="w-full bg-card border border-border rounded-md px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent"
+                    className="w-full rounded-sm border border-border bg-bg px-3 py-2 text-sm font-mono focus:border-white focus:outline-none"
                   />
                   <p className="text-xs text-muted">
                     Format: <code className="font-mono">owner/name</code>. Click{" "}
@@ -561,7 +495,7 @@ function ConnectRepoInner() {
                 <div>
                   <label
                     htmlFor="token"
-                    className="block text-sm font-medium text-text mb-1.5"
+                    className="mb-1.5 block text-[10px] font-mono uppercase tracking-[0.18em] text-muted"
                   >
                     GitHub Personal Access Token
                   </label>
@@ -575,53 +509,52 @@ function ConnectRepoInner() {
                       resetVerify();
                     }}
                     placeholder="ghp_…"
-                    className="w-full bg-card border border-border rounded-md px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent"
+                    className="w-full rounded-sm border border-border bg-bg px-3 py-2 text-sm font-mono focus:border-white focus:outline-none"
                   />
-                  <p className="text-xs text-muted mt-1.5">
+                  <p className="mt-1.5 text-xs text-muted">
                     Needs <code className="font-mono">contents:read</code> and{" "}
                     <code className="font-mono">pull_requests:write</code>{" "}
                     permissions.
                   </p>
                 </div>
 
-                <div className="flex items-center gap-3 flex-wrap">
-                  <button
+                <div className="flex flex-wrap items-center gap-3">
+                  <Button
                     type="button"
                     onClick={handleVerify}
                     disabled={verify.status === "checking" || !repo || !token}
-                    className="px-4 py-2 rounded-md text-sm font-medium border border-border bg-card hover:bg-bg disabled:opacity-50"
+                    variant="default"
                   >
                     {verify.status === "checking" ? "Checking…" : "Verify access"}
-                  </button>
+                  </Button>
 
                   {verify.status === "ok" && (
-                    <span className="text-sm" style={{ color: "#16a34a" }}>
+                    <span className="text-sm text-[#4ade80]">
                       ✓ {verify.message}
                     </span>
                   )}
                   {verify.status === "error" && (
-                    <span className="text-sm" style={{ color: "#dc2626" }}>
+                    <span className="text-sm text-[#ff5252]">
                       ✕ {verify.message}
                     </span>
                   )}
                 </div>
 
-                <div className="flex items-center justify-between pt-2 border-t border-border">
+                <div className="flex items-center justify-between border-t border-border pt-4">
                   <Link
                     href="/dashboard/repos"
                     className="text-sm text-muted hover:text-text"
                   >
                     Cancel
                   </Link>
-                  <button
+                  <Button
                     type="button"
                     onClick={handleSave}
                     disabled={verify.status !== "ok" || saving}
-                    className="px-4 py-2 rounded-md text-sm font-medium text-white disabled:opacity-50"
-                    style={{ backgroundColor: "#4338ca" }}
+                    variant="primary"
                   >
                     {saving ? "Saving…" : "Save & connect"}
-                  </button>
+                  </Button>
                 </div>
               </div>
             </details>
@@ -631,17 +564,18 @@ function ConnectRepoInner() {
 
       {toast && (
         <div
-          className="fixed bottom-6 right-6 px-4 py-2 rounded-md shadow-lg text-sm font-medium max-w-md"
-          style={{
-            backgroundColor: toast.kind === "success" ? "#16a34a" : "#dc2626",
-            color: "white",
-          }}
+          className={
+            "fixed bottom-6 right-6 max-w-md rounded-sm px-4 py-2 text-sm font-medium shadow-lg " +
+            (toast.kind === "success"
+              ? "bg-[#4ade80] text-black"
+              : "bg-[#ff5252] text-black")
+          }
           role="status"
         >
           {toast.message}
         </div>
       )}
-    </main>
+    </Container>
   );
 }
 
@@ -664,9 +598,9 @@ export default function ConnectRepoPage() {
   return (
     <Suspense
       fallback={
-        <main className="max-w-2xl mx-auto px-6 py-10">
-          <Card className="p-10 text-center text-muted text-sm">Loading…</Card>
-        </main>
+        <Container size="narrow" className="py-10">
+          <Card className="p-10 text-center text-sm text-muted">Loading…</Card>
+        </Container>
       }
     >
       <ConnectRepoInner />

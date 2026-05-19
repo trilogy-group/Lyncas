@@ -11,18 +11,17 @@ import {
 } from "recharts";
 import type { AccuracyTimePoint } from "@/lib/types";
 
-// Phase 7: accuracy-over-time chart for /learning. Same visual language as
-// ActivityChart (so /learning and / overview feel like one product) but
-// the y-axis is a 0–100 percent scale clamped explicitly.
+// Phase 7: accuracy-over-time chart for /learning. Same visual language
+// as ActivityChart so /learning and /overview feel coherent.
 
 export function AccuracyChart({ data }: { data: AccuracyTimePoint[] }) {
   return (
-    <div className="bg-card border border-border rounded-lg p-4">
-      <div className="text-[11px] font-mono uppercase tracking-wider text-muted mb-3">
+    <div className="rounded-md border border-border bg-card p-4">
+      <div className="mb-3 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
         Accuracy over time (last 90 days)
       </div>
       {data.length === 0 ? (
-        <div className="h-[220px] flex items-center justify-center text-xs font-mono text-muted">
+        <div className="flex h-[220px] items-center justify-center font-mono text-xs text-muted">
           no resolved observations yet
         </div>
       ) : (
@@ -31,16 +30,18 @@ export function AccuracyChart({ data }: { data: AccuracyTimePoint[] }) {
             data={data}
             margin={{ top: 4, right: 12, left: 12, bottom: 4 }}
           >
-            <CartesianGrid strokeDasharray="3 3" stroke="#e7e5e4" />
+            <CartesianGrid strokeDasharray="3 3" stroke="#1f1f1f" />
             <XAxis
               dataKey="date"
-              tick={{ fontSize: 10, fill: "#57534e" }}
+              tick={{ fontSize: 10, fill: "#8a8a8a" }}
+              stroke="#1f1f1f"
               tickFormatter={(d: string) => d.slice(5)}
             />
             <YAxis
               domain={[0, 100]}
               ticks={[0, 25, 50, 75, 100]}
-              tick={{ fontSize: 11, fill: "#57534e" }}
+              tick={{ fontSize: 11, fill: "#8a8a8a" }}
+              stroke="#1f1f1f"
               tickFormatter={(v: number) => `${v}%`}
               width={36}
             />
@@ -48,10 +49,12 @@ export function AccuracyChart({ data }: { data: AccuracyTimePoint[] }) {
               contentStyle={{
                 fontSize: 12,
                 fontFamily: "monospace",
-                border: "1px solid #e7e5e4",
-                borderRadius: 6,
-                background: "#ffffff",
+                border: "1px solid #1f1f1f",
+                borderRadius: 4,
+                background: "#0a0a0a",
+                color: "#ffffff",
               }}
+              labelStyle={{ color: "#8a8a8a" }}
               formatter={(value, _name, item) => {
                 const pct = typeof value === "number" ? value : Number(value);
                 const total = (item?.payload as AccuracyTimePoint | undefined)
@@ -66,7 +69,7 @@ export function AccuracyChart({ data }: { data: AccuracyTimePoint[] }) {
             <Line
               type="monotone"
               dataKey="accuracy_pct"
-              stroke="#16a34a"
+              stroke="#4ade80"
               strokeWidth={2}
               dot={{ r: 2 }}
               connectNulls

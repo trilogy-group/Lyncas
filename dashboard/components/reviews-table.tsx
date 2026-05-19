@@ -3,8 +3,8 @@ import { Badge } from "./ui/badge";
 import { Table, TableHeader, TableBody, Th, Td } from "./ui/table";
 import {
   formatRelativeTime,
-  palette,
   severityColor,
+  severityColors,
   verdictBadge,
 } from "@/lib/design";
 import type { Review } from "@/lib/types";
@@ -44,7 +44,7 @@ export function ReviewsTable({
 }: ReviewsTableProps) {
   if (reviews.length === 0) {
     return (
-      <div className="bg-card border border-border rounded-lg p-8 text-center text-muted text-sm">
+      <div className="rounded-md border border-border bg-card p-8 text-center text-sm text-muted">
         No reviews match the current filters.
       </div>
     );
@@ -93,14 +93,20 @@ export function ReviewsTable({
           const sevColor = severityColor(r.severity_score);
           const closed = r.action === "closed";
           return (
-            <tr key={r.id} className={closed ? "bg-closed-bg" : undefined}>
-              <Td className="font-mono text-xs whitespace-nowrap">{r.repo}</Td>
+            <tr
+              key={r.id}
+              className={
+                "hover:bg-bg-elev transition-colors " +
+                (closed ? "bg-closed-bg" : "")
+              }
+            >
+              <Td className="whitespace-nowrap font-mono text-xs">{r.repo}</Td>
               <Td className="font-mono text-xs">
                 <a
                   href={r.pr_url}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-accent hover:underline"
+                  className="text-text hover:underline underline-offset-4"
                 >
                   #{r.pr_number}
                 </a>
@@ -108,7 +114,7 @@ export function ReviewsTable({
               <Td className="max-w-md">
                 <Link
                   href={`/pr/${r.id}`}
-                  className="hover:underline line-clamp-1"
+                  className="line-clamp-1 hover:underline underline-offset-4"
                 >
                   {r.pr_title}
                 </Link>
@@ -122,12 +128,12 @@ export function ReviewsTable({
               <Td className="font-mono text-xs text-muted">{r.confidence}</Td>
               <Td className="font-mono text-xs">
                 {closed ? (
-                  <Badge color={palette.text}>closed</Badge>
+                  <Badge color={severityColors.critical}>closed</Badge>
                 ) : (
                   <span className="text-muted">commented</span>
                 )}
               </Td>
-              <Td className="font-mono text-xs text-muted whitespace-nowrap">
+              <Td className="whitespace-nowrap font-mono text-xs text-muted">
                 {formatRelativeTime(r.created_at)}
               </Td>
             </tr>

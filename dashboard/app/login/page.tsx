@@ -3,24 +3,18 @@
 import Link from "next/link";
 import { useState, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
+import { BrandMark } from "@/components/ui/brand";
+import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 
-// Login page. Two paths:
-//   1. Continue with GitHub  → Supabase Auth OAuth, redirects to
-//                              <site>/auth/callback?code=...
-//   2. Continue with Email   → magic link (signInWithOtp) — clicking
-//                              the email also lands on /auth/callback.
-//
-// The callback route exchanges the code for a session and creates the
-// user_profiles row on first login. The `next` query param flows
-// through so we can return the user to wherever they came from after
-// the middleware bounced them.
+// Login page — black, monospace, two paths:
+//   1. Continue with GitHub  → Supabase Auth OAuth (returns to
+//                              /auth/callback).
+//   2. Continue with Email   → magic link (signInWithOtp).
+// Post-auth the callback redirects to `next`, which defaults to
+// /dashboard/chat (the v3 default landing).
 
-// Computes the redirect-to URL for both OAuth and magic-link flows.
-// Prefers NEXT_PUBLIC_SITE_URL (set on Vercel) so production deploys
-// don't accidentally redirect to localhost. Falls back to
-// window.location.origin for local dev where the env var is unset.
 function siteUrl(): string {
   const env = process.env.NEXT_PUBLIC_SITE_URL;
   if (env) return env.replace(/\/$/, "");
@@ -30,7 +24,7 @@ function siteUrl(): string {
 
 function LoginInner() {
   const params = useSearchParams();
-  const next = params.get("next") || "/dashboard";
+  const next = params.get("next") || "/dashboard/chat";
   const errorParam = params.get("error");
 
   const [email, setEmail] = useState("");
@@ -47,18 +41,10 @@ function LoginInner() {
         provider: "github",
         options: {
           redirectTo: `${siteUrl()}/auth/callback?next=${encodeURIComponent(next)}`,
-          // Ask GitHub for the scopes we'll need when we wire per-user
-          // GitHub App / OAuth installations. For v2 launch the
-          // dashboard still asks operators for a separate PAT on the
-          // connect-repo page; `read:user` keeps the consent screen
-          // minimal in the meantime.
           scopes: "read:user",
         },
       });
       if (error) throw error;
-      // The redirect navigates away from this page; if it didn't
-      // (popup blocked, etc.) we'll fall through and show a generic
-      // error.
     } catch (e) {
       setError((e as Error).message || "GitHub sign-in failed");
       setSubmitting(null);
@@ -91,29 +77,28 @@ function LoginInner() {
   }
 
   return (
-    <main className="min-h-screen flex items-center justify-center bg-bg text-text px-4">
-      <div className="w-full max-w-sm space-y-6">
-        <div className="text-center space-y-2">
-          <Link
-            href="/landing"
-            className="inline-block text-xs text-muted hover:text-text"
-          >
-            ← back
-          </Link>
-          <h1 className="text-2xl font-semibold">Night PR Reviewer</h1>
-          <p className="text-sm text-muted">
-            Autonomous code review for your repositories
-          </p>
+    <main className="relative min-h-screen flex items-center justify-center bg-bg text-text px-4 dot-grid">
+      <div className="w-full max-w-md space-y-8 animate-fade-up">
+        <div className="text-center space-y-5">
+          <BrandMark href="/landing" />
+          <div>
+            <h1 className="font-mono font-bold uppercase tracking-tight text-3xl">
+              Sign in
+            </h1>
+            <p className="mt-2 text-sm text-muted">
+              Autonomous code review for your repositories
+            </p>
+          </div>
         </div>
 
-        <Card className="p-6 space-y-4">
+        <Card className="p-6 space-y-5">
           {emailSent ? (
-            <div className="text-center space-y-3">
+            <div className="text-center space-y-3 py-4">
               <p className="text-sm font-medium">
                 Check your email for a magic link.
               </p>
               <p className="text-xs text-muted">
-                We sent it to <span className="font-mono">{email}</span>.
+                We sent it to <span className="font-mono text-text">{email}</span>.
               </p>
               <button
                 type="button"
@@ -121,27 +106,25 @@ function LoginInner() {
                   setEmailSent(false);
                   setEmail("");
                 }}
-                className="text-xs text-muted underline hover:text-text"
+                className="text-xs text-muted underline underline-offset-4 hover:text-text"
               >
                 Use a different email
               </button>
             </div>
           ) : (
             <>
-              <button
-                type="button"
+              <Button
+                variant="primary"
+                size="lg"
                 onClick={handleGitHub}
                 disabled={submitting !== null}
-                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-md font-medium text-sm text-white disabled:opacity-50"
-                style={{ backgroundColor: "#18181b" }}
+                className="w-full"
               >
                 <GitHubIcon />
-                {submitting === "github"
-                  ? "Redirecting…"
-                  : "Continue with GitHub"}
-              </button>
+                {submitting === "github" ? "Redirecting…" : "Continue with GitHub"}
+              </Button>
 
-              <div className="flex items-center gap-3 text-xs text-muted">
+              <div className="flex items-center gap-3 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
                 <div className="flex-1 h-px bg-border" />
                 or
                 <div className="flex-1 h-px bg-border" />
@@ -156,23 +139,22 @@ function LoginInner() {
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   placeholder="you@example.com"
-                  className="w-full bg-card border border-border rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent"
+                  className="w-full bg-bg border border-border rounded-sm px-3 py-3 text-sm font-mono focus:outline-none focus:border-white transition-colors"
                 />
-                <button
+                <Button
                   type="submit"
+                  size="lg"
+                  variant="default"
                   disabled={submitting !== null}
-                  className="w-full px-4 py-2.5 rounded-md font-medium text-sm border border-border bg-card hover:bg-bg disabled:opacity-50 transition-colors"
+                  className="w-full"
                 >
-                  {submitting === "email"
-                    ? "Sending magic link…"
-                    : "Continue with Email"}
-                </button>
+                  {submitting === "email" ? "Sending magic link…" : "Continue with Email"}
+                </Button>
               </form>
 
               {error && (
                 <p
-                  className="text-xs text-center"
-                  style={{ color: "#dc2626" }}
+                  className="text-xs text-center text-[#ff5252] font-mono"
                   role="alert"
                 >
                   {error}
@@ -182,8 +164,10 @@ function LoginInner() {
           )}
         </Card>
 
-        <p className="text-xs text-muted text-center leading-relaxed">
-          By signing in you agree to let the agent review your pull requests.
+        <p className="text-[11px] font-mono uppercase tracking-[0.14em] text-center text-muted leading-relaxed">
+          <Link href="/landing" className="hover:text-text">
+            ← Back to landing
+          </Link>
         </p>
       </div>
     </main>
@@ -191,7 +175,6 @@ function LoginInner() {
 }
 
 function GitHubIcon() {
-  // Inline SVG — keeps us off any icon library and away from a new dep.
   return (
     <svg
       xmlns="http://www.w3.org/2000/svg"

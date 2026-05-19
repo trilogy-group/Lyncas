@@ -1,21 +1,30 @@
 import type { Metadata } from "next";
-import { Inter, JetBrains_Mono } from "next/font/google";
+import { IBM_Plex_Sans, IBM_Plex_Mono } from "next/font/google";
 import { Nav } from "@/components/nav";
 import "./globals.css";
 
-const inter = Inter({
+// IBM Plex Sans + IBM Plex Mono — the typeface pairing the E2B-inspired
+// redesign asked for. next/font/google self-hosts both at build time so
+// there's no extra network hop at request time and no FOUT.
+
+const plexSans = IBM_Plex_Sans({
   subsets: ["latin"],
+  weight: ["300", "400", "500", "600", "700"],
   variable: "--font-sans-pr",
+  display: "swap",
 });
 
-const jetbrains = JetBrains_Mono({
+const plexMono = IBM_Plex_Mono({
   subsets: ["latin"],
+  weight: ["300", "400", "500", "600", "700"],
   variable: "--font-mono-pr",
+  display: "swap",
 });
 
 export const metadata: Metadata = {
   title: "Night PR Reviewer",
-  description: "Dashboard for the night-pr-reviewer agent.",
+  description:
+    "Autonomous code review for your GitHub repositories — powered by Claude Opus.",
 };
 
 export default function RootLayout({
@@ -24,7 +33,7 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${inter.variable} ${jetbrains.variable} h-full antialiased`}
+      className={`${plexSans.variable} ${plexMono.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col bg-bg text-text">
         <Nav />

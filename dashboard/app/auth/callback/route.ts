@@ -35,8 +35,11 @@ export async function GET(request: NextRequest) {
   // Sanitize `next` — only accept same-origin paths, never an
   // attacker-controlled full URL. A leading "/" check is sufficient
   // because Next won't merge a no-host string with another origin.
-  const rawNext = searchParams.get("next") || "/dashboard";
-  const next = rawNext.startsWith("/") ? rawNext : "/dashboard";
+  // v3: post-login default is /dashboard/chat (it was /dashboard before
+  // — that stub now itself redirects to /dashboard/chat, so the user
+  // ends up in the same place either way).
+  const rawNext = searchParams.get("next") || "/dashboard/chat";
+  const next = rawNext.startsWith("/") ? rawNext : "/dashboard/chat";
 
   if (!code) {
     return loginError(request, "Missing auth code");

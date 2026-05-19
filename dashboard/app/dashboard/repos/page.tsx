@@ -1,21 +1,18 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
+import { LinkButton } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { Container } from "@/components/ui/container";
+import { SectionHeading } from "@/components/ui/section-heading";
 import { Table, TableBody, TableHeader, Td, Th } from "@/components/ui/table";
 import { formatRelativeTime } from "@/lib/design";
 import { getUserProfile, getWatchedRepos } from "@/lib/queries";
 import { getUser } from "@/lib/supabase/server";
 
-// User-scoped repo list. Only shows watched_repos owned by the logged-
-// in user (RLS already enforces this in queries.ts → getWatchedRepos).
-// The legacy /repos page stays public and continues to show every
-// repo with reviews — that's the v1 demo route.
-//
-// Connect-repo CTA in the header is the one-and-only way to add a
-// repo; gated on the free-plan repo_limit. When the user is at limit
-// we render the CTA as a disabled-looking pill that links to a future
-// upgrade page (for now /dashboard/connect-repo will itself render
-// the upgrade banner — see that page).
+// User-scoped repo list. Shows only watched_repos owned by the logged-
+// in user (RLS enforced in queries.ts → getWatchedRepos). The legacy
+// /repos page stays public and continues to show every repo with
+// reviews — that's the v1 demo route.
 
 export const dynamic = "force-dynamic";
 
@@ -31,42 +28,40 @@ export default async function DashboardReposPage() {
   const atLimit = watched.length >= repoLimit;
 
   return (
-    <main className="max-w-6xl mx-auto px-6 py-8 space-y-6">
-      <section className="flex items-end justify-between gap-4 flex-wrap">
-        <div>
-          <h1 className="text-xl font-semibold mb-1">Your repositories</h1>
-          <p className="text-sm text-muted">
-            {watched.length} of{" "}
-            {repoLimit >= 9999 ? "unlimited" : repoLimit} watched
-            {profile?.plan ? ` · ${profile.plan} plan` : ""}
-          </p>
-        </div>
-        <Link
-          href="/dashboard/connect-repo"
-          className="px-4 py-2 rounded-md text-sm font-medium text-white"
-          style={{
-            backgroundColor: atLimit ? "#a1a1aa" : "#4338ca",
-            pointerEvents: atLimit ? "none" : undefined,
-          }}
-          aria-disabled={atLimit}
-          tabIndex={atLimit ? -1 : undefined}
-        >
-          {atLimit ? "Limit reached" : "+ Connect repo"}
-        </Link>
+    <Container className="py-10 space-y-8">
+      <section className="flex flex-wrap items-end justify-between gap-4">
+        <SectionHeading
+          eyebrow="Repositories"
+          title="Your repositories"
+          subtitle={
+            <>
+              {watched.length} of {repoLimit >= 9999 ? "unlimited" : repoLimit}{" "}
+              watched
+              {profile?.plan ? ` · ${profile.plan} plan` : ""}
+            </>
+          }
+        />
+        {atLimit ? (
+          <LinkButton href="/dashboard/connect-repo" variant="default" size="md">
+            Limit reached
+          </LinkButton>
+        ) : (
+          <LinkButton href="/dashboard/connect-repo" variant="primary" size="md">
+            + Connect repo
+          </LinkButton>
+        )}
       </section>
 
       {watched.length === 0 ? (
-        <Card className="p-10 text-center space-y-3">
+        <Card className="p-12 text-center space-y-4">
           <p className="text-sm text-muted">
             No repositories connected yet.
           </p>
-          <Link
-            href="/dashboard/connect-repo"
-            className="inline-block px-4 py-2 rounded-md text-sm font-medium text-white"
-            style={{ backgroundColor: "#4338ca" }}
-          >
-            Connect your first repo
-          </Link>
+          <div className="flex justify-center">
+            <LinkButton href="/dashboard/connect-repo" variant="primary">
+              Connect your first repo
+            </LinkButton>
+          </div>
         </Card>
       ) : (
         <Table>
@@ -82,19 +77,19 @@ export default async function DashboardReposPage() {
           </TableHeader>
           <TableBody>
             {watched.map((r) => (
-              <tr key={r.id}>
+              <tr key={r.id} className="hover:bg-bg-elev transition-colors">
                 <Td className="font-mono text-xs">
                   <div className="flex items-center gap-2">
                     <span
                       aria-hidden
-                      className="inline-block w-2 h-2 rounded-full"
+                      className="inline-block h-2 w-2 rounded-full"
                       style={{
-                        backgroundColor: r.enabled ? "#16a34a" : "#dc2626",
+                        backgroundColor: r.enabled ? "#4ade80" : "#ff5252",
                       }}
                     />
                     <Link
                       href={`/dashboard/overview?repo=${encodeURIComponent(r.repo)}`}
-                      className="text-accent hover:underline"
+                      className="text-text hover:underline underline-offset-4"
                     >
                       {r.repo}
                     </Link>
@@ -109,20 +104,20 @@ export default async function DashboardReposPage() {
                     </a>
                   </div>
                 </Td>
-                <Td className="text-xs">
+                <Td className="font-mono text-xs uppercase tracking-[0.14em]">
                   {r.enabled ? (
-                    <span style={{ color: "#16a34a" }}>active</span>
+                    <span style={{ color: "#4ade80" }}>active</span>
                   ) : (
-                    <span style={{ color: "#dc2626" }}>paused</span>
+                    <span style={{ color: "#ff5252" }}>paused</span>
                   )}
                 </Td>
-                <Td className="font-mono text-xs text-muted whitespace-nowrap">
+                <Td className="whitespace-nowrap font-mono text-xs text-muted">
                   {formatRelativeTime(r.created_at)}
                 </Td>
-                <Td className="font-mono text-xs text-right whitespace-nowrap">
+                <Td className="whitespace-nowrap text-right font-mono text-xs">
                   <Link
                     href={`/repos/${r.repo}/settings`}
-                    className="text-accent hover:underline"
+                    className="text-text hover:underline underline-offset-4"
                     title={`Configure ${r.repo}`}
                   >
                     ⚙ Configure
@@ -133,6 +128,6 @@ export default async function DashboardReposPage() {
           </TableBody>
         </Table>
       )}
-    </main>
+    </Container>
   );
 }

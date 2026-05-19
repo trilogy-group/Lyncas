@@ -2,17 +2,15 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { BrandMark } from "./ui/brand";
+import { Button } from "./ui/button";
 import { signOut } from "@/lib/supabase/client";
 
-// Authenticated dashboard nav. Used only by /dashboard/layout.tsx —
-// the public-side nav (components/nav.tsx) handles the legacy demo
-// routes. This component is a client component because:
-//   * it reads usePathname() to highlight the active link
-//   * signOut() is browser-only (clears local cookies + redirects)
+// Authenticated dashboard nav — rendered by /dashboard/layout.tsx.
 //
-// User identity is passed in as props rather than re-fetched here so
-// the (server-rendered) layout above can do the auth round-trip once
-// per request.
+// Post-login the user lands on /dashboard/chat (the v3 default), so
+// chat sits first in the nav and the underlines highlight it as the
+// active surface on /dashboard root.
 
 interface AuthedNavProps {
   email: string | null;
@@ -23,17 +21,16 @@ interface AuthedNavProps {
 }
 
 const LINKS: ReadonlyArray<{ href: string; label: string }> = [
-  { href: "/dashboard/overview", label: "overview" },
-  { href: "/dashboard/chat", label: "chat" },
-  { href: "/dashboard/repos", label: "repos" },
-  { href: "/dashboard/settings", label: "settings" },
-  // Cross-link to the public demo pages — same data, no scoping yet
-  // (see /dashboard/overview header for the explanation). Keeps the
-  // existing /runs, /benchmark, /learning reachable from inside the
-  // authed shell without us cloning them.
-  { href: "/runs", label: "runs" },
-  { href: "/learning", label: "learning" },
-  { href: "/benchmark", label: "benchmark" },
+  { href: "/dashboard/chat", label: "Chat" },
+  { href: "/dashboard/overview", label: "Overview" },
+  { href: "/dashboard/repos", label: "Repos" },
+  { href: "/dashboard/settings", label: "Settings" },
+  // Public-demo cross-links — same as the previous nav. These stay
+  // available inside the authed shell so the demo data is one click
+  // away without us cloning those pages.
+  { href: "/runs", label: "Runs" },
+  { href: "/learning", label: "Learning" },
+  { href: "/benchmark", label: "Benchmark" },
 ];
 
 export function AuthedNav({
@@ -46,23 +43,16 @@ export function AuthedNav({
   const pathname = usePathname() ?? "";
   const display = displayName ?? email ?? "Account";
 
-  // 9999 is the sentinel for unlimited (pro/enterprise). Render that
-  // as a friendlier "—" rather than a fake "X/9999 repos" string.
   const limitDisplay =
     repoLimit >= 9999 ? `${repoCount}` : `${repoCount}/${repoLimit}`;
   const overLimit = repoLimit < 9999 && repoCount >= repoLimit;
 
   return (
-    <nav className="border-b border-border bg-card">
-      <div className="max-w-6xl mx-auto px-6 h-14 flex items-center justify-between gap-4">
-        <div className="flex items-center gap-8 min-w-0">
-          <Link
-            href="/dashboard/overview"
-            className="font-semibold text-sm tracking-tight whitespace-nowrap hover:text-accent transition-colors"
-          >
-            Night PR Reviewer
-          </Link>
-          <div className="hidden md:flex items-center gap-5 text-sm font-mono">
+    <nav className="border-b border-border bg-bg">
+      <div className="mx-auto flex h-14 max-w-7xl items-center justify-between gap-4 px-4 sm:px-6">
+        <div className="flex min-w-0 items-center gap-8">
+          <BrandMark href="/dashboard/chat" />
+          <div className="hidden lg:flex items-center gap-5 text-[11px] font-mono uppercase tracking-[0.14em]">
             {LINKS.map((l) => {
               const active =
                 pathname === l.href ||
@@ -73,7 +63,7 @@ export function AuthedNav({
                   href={l.href}
                   className={
                     active
-                      ? "text-text"
+                      ? "text-text underline underline-offset-[6px] decoration-text/40 hover:decoration-text"
                       : "text-muted hover:text-text transition-colors"
                   }
                 >
@@ -88,10 +78,10 @@ export function AuthedNav({
           <Link
             href="/dashboard/connect-repo"
             className={
-              "text-xs px-2.5 py-1 rounded-full border " +
+              "hidden sm:inline-flex items-center gap-1.5 rounded-sm border px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.14em] transition-colors " +
               (overLimit
-                ? "border-amber-300 text-amber-700 bg-amber-50 hover:bg-amber-100"
-                : "border-border text-muted hover:text-text hover:bg-bg")
+                ? "border-[#ff9d4d]/60 text-[#ff9d4d] hover:bg-[#ff9d4d]/10"
+                : "border-border text-muted hover:text-text hover:border-border-strong")
             }
             title={
               overLimit
@@ -103,36 +93,33 @@ export function AuthedNav({
           </Link>
           <div className="flex items-center gap-2">
             {avatarUrl ? (
-              // Plain <img> rather than next/image because the host
-              // (Supabase / GitHub) is variable per-user and we don't
-              // want to maintain an `images.domains` allowlist.
               // eslint-disable-next-line @next/next/no-img-element
               <img
                 src={avatarUrl}
                 alt={display}
-                className="w-7 h-7 rounded-full border border-border"
+                className="h-7 w-7 rounded-full border border-border"
               />
             ) : (
               <div
-                className="w-7 h-7 rounded-full bg-bg border border-border flex items-center justify-center text-xs font-mono text-muted"
+                className="flex h-7 w-7 items-center justify-center rounded-full border border-border bg-card font-mono text-xs text-muted"
                 aria-hidden
               >
                 {display.charAt(0).toUpperCase()}
               </div>
             )}
             <span
-              className="text-xs text-muted hidden sm:inline max-w-[140px] truncate"
+              className="hidden max-w-[140px] truncate text-[11px] font-mono text-muted sm:inline"
               title={display}
             >
               {display}
             </span>
-            <button
-              type="button"
+            <Button
+              size="sm"
+              variant="default"
               onClick={() => void signOut()}
-              className="text-xs text-muted hover:text-text border border-border rounded-md px-2 py-1"
             >
               Sign out
-            </button>
+            </Button>
           </div>
         </div>
       </div>

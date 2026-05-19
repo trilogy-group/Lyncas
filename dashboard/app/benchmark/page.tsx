@@ -1,11 +1,9 @@
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
+import { Container } from "@/components/ui/container";
+import { SectionHeading } from "@/components/ui/section-heading";
 import { StatCard } from "@/components/ui/stat-card";
-import {
-  palette,
-  severityColors,
-  verdictBadge,
-} from "@/lib/design";
+import { palette, severityColors, verdictBadge } from "@/lib/design";
 import { getBenchmarkRuns, getBenchmarkStats } from "@/lib/queries";
 import type { BenchmarkRun, BenchmarkStats, Bug } from "@/lib/types";
 
@@ -13,9 +11,8 @@ export const dynamic = "force-dynamic";
 
 // --- Bug matching (mirrors agent/benchmark.py's heuristic) ----------------
 // Same Jaccard-on-(file + first-60-chars-of-issue) approach the Python
-// runner uses. We re-do it here so the drill-down can highlight matched
-// vs unique bugs visually — the DB only stores counts, not match pairs.
-// If we ever care to be authoritative, store the matches in the row.
+// runner uses. Re-done here so the drill-down can highlight matched
+// vs unique bugs.
 
 const BUG_OVERLAP_THRESHOLD = 0.7;
 
@@ -93,8 +90,7 @@ function formatMicros(micros: number | null | undefined): string {
 function Conclusion({ stats }: { stats: BenchmarkStats }) {
   if (stats.sample_size === 0) return null;
 
-  const agree =
-    stats.agreement_pct >= 80 && stats.mean_sev_delta <= 1;
+  const agree = stats.agreement_pct >= 80 && stats.mean_sev_delta <= 1;
   const disagreePct = 100 - stats.agreement_pct;
   const ratio = formatRatio(stats.cost_ratio);
 
@@ -103,12 +99,12 @@ function Conclusion({ stats }: { stats: BenchmarkStats }) {
     : `Models disagree meaningfully on ${disagreePct.toFixed(0)}% of cases. Cost savings of choosing Sonnet may not be worth the quality variance for production use. Larger benchmark + ground truth needed before committing.`;
 
   return (
-    <Card className="p-6 bg-bg">
-      <div className="text-[11px] font-mono uppercase tracking-wider text-muted mb-3">
+    <Card className="p-6">
+      <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
         Conclusion
       </div>
-      <p className="text-sm leading-relaxed">{headline}</p>
-      <p className="mt-3 font-serif italic text-sm text-muted leading-relaxed">
+      <p className="mt-3 text-sm leading-relaxed">{headline}</p>
+      <p className="mt-3 text-sm text-muted leading-relaxed">
         This is n={stats.sample_size}, single-grader, directional only. Not a
         substitute for a ground-truth labeled benchmark with multiple raters.
       </p>
@@ -130,7 +126,7 @@ function ModelCell({
   }
   const meta = verdictBadge(verdict);
   return (
-    <div className="flex items-center gap-2 min-w-0">
+    <div className="flex min-w-0 items-center gap-2">
       <Badge color={meta.color}>{meta.label}</Badge>
       <span className="text-xs font-mono text-muted">
         sev {severity ?? "?"}
@@ -151,41 +147,40 @@ function BugList({
   if (bugs.length === 0) {
     return (
       <div>
-        <div className="text-[11px] font-mono uppercase tracking-wider text-muted mb-2">
+        <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
           {label}
         </div>
-        <div className="text-xs text-muted italic">no bugs flagged</div>
+        <div className="mt-2 text-xs italic text-muted">no bugs flagged</div>
       </div>
     );
   }
   return (
     <div>
-      <div className="text-[11px] font-mono uppercase tracking-wider text-muted mb-2">
+      <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
         {label} ({bugs.length})
       </div>
-      <ul className="space-y-2">
+      <ul className="mt-2 space-y-2">
         {bugs.map((b, i) => {
           const isMatched = matched[i];
-          // matched -> green tint, unique -> amber tint
           const borderColor = isMatched
             ? severityColors.clean
             : severityColors.moderate;
           return (
             <li
               key={i}
-              className="rounded border-l-4 px-3 py-2 text-xs bg-card"
-              style={{ borderColor }}
+              className="rounded-sm border-l-2 bg-card px-3 py-2 text-xs"
+              style={{ borderLeftColor: borderColor }}
             >
-              <div className="font-mono text-[11px] text-muted mb-0.5">
+              <div className="mb-0.5 font-mono text-[11px] text-muted">
                 {b.file || "?"} ·{" "}
                 <span style={{ color: borderColor }}>
                   {isMatched ? "matched" : "only here"}
                 </span>{" "}
                 · sev {b.severity}
               </div>
-              <div className="text-text leading-snug">{b.issue}</div>
+              <div className="leading-snug text-text">{b.issue}</div>
               {b.suggestion && (
-                <div className="mt-1 text-muted leading-snug">
+                <div className="mt-1 leading-snug text-muted">
                   → {b.suggestion}
                 </div>
               )}
@@ -214,39 +209,32 @@ function BenchmarkRow({ row }: { row: BenchmarkRun }) {
 
   const agree = row.verdict_agreement === true;
   const sevDelta = row.severity_delta ?? 0;
-  // Opus failed entirely on this row — don't pretend we have a comparison
   const opusFailed = row.verdict_agreement === null;
 
   return (
-    <details className="group bg-card open:bg-bg">
-      <summary className="cursor-pointer list-none px-5 py-4 hover:bg-bg transition-colors">
-        <div className="grid grid-cols-12 gap-3 items-center">
+    <details className="group bg-card open:bg-bg-elev">
+      <summary className="cursor-pointer list-none px-5 py-4 hover:bg-bg-elev transition-colors">
+        <div className="grid grid-cols-12 items-center gap-3">
           <div className="col-span-4 min-w-0">
             <a
               href={row.pr_url}
               target="_blank"
               rel="noopener noreferrer"
-              className="block font-medium text-sm truncate hover:text-accent"
+              className="block truncate text-sm font-medium hover:text-text"
             >
               {row.pr_title}
             </a>
-            <div className="text-[11px] font-mono text-muted truncate">
+            <div className="truncate font-mono text-[11px] text-muted">
               {row.pr_url.replace("https://github.com/", "")}
             </div>
           </div>
           <div className="col-span-3">
-            <ModelCell
-              verdict={row.sonnet_verdict}
-              severity={row.sonnet_severity}
-            />
+            <ModelCell verdict={row.sonnet_verdict} severity={row.sonnet_severity} />
           </div>
           <div className="col-span-3">
-            <ModelCell
-              verdict={row.opus_verdict}
-              severity={row.opus_severity}
-            />
+            <ModelCell verdict={row.opus_verdict} severity={row.opus_severity} />
           </div>
-          <div className="col-span-2 flex flex-wrap gap-2 justify-end text-xs font-mono">
+          <div className="col-span-2 flex flex-wrap items-center justify-end gap-2 font-mono text-xs">
             {opusFailed ? (
               <Badge color={palette.muted} variant="outline">
                 no opus data
@@ -254,7 +242,9 @@ function BenchmarkRow({ row }: { row: BenchmarkRun }) {
             ) : (
               <>
                 <Badge
-                  color={agree ? severityColors.clean : severityColors.critical}
+                  color={
+                    agree ? severityColors.clean : severityColors.critical
+                  }
                 >
                   {agree ? "✓ agree" : "✗ disagree"}
                 </Badge>
@@ -272,70 +262,62 @@ function BenchmarkRow({ row }: { row: BenchmarkRun }) {
                 </span>
               </>
             )}
-            <span className="text-muted group-open:rotate-180 transition-transform">
+            <span className="text-muted transition-transform group-open:rotate-180">
               ▾
             </span>
           </div>
         </div>
       </summary>
 
-      <div className="px-5 pb-5 pt-1 border-t border-border bg-bg">
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-5 mt-4">
+      <div className="border-t border-border bg-bg px-5 pb-5 pt-4">
+        <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
           <div>
-            <div className="text-xs font-mono uppercase tracking-wider text-muted mb-2">
+            <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
               Sonnet summary
             </div>
-            <p className="text-sm leading-relaxed text-text">
+            <p className="mt-2 text-sm leading-relaxed text-text">
               {row.sonnet_summary ?? <span className="italic text-muted">no summary</span>}
             </p>
           </div>
           <div>
-            <div className="text-xs font-mono uppercase tracking-wider text-muted mb-2">
+            <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
               Opus summary
             </div>
-            <p className="text-sm leading-relaxed text-text">
+            <p className="mt-2 text-sm leading-relaxed text-text">
               {row.opus_summary ?? <span className="italic text-muted">no summary</span>}
             </p>
           </div>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-5 mt-6">
-          <BugList
-            bugs={sonnetBugs}
-            matched={sonnetMatched}
-            label="Sonnet bugs"
-          />
-          <BugList
-            bugs={opusBugs}
-            matched={opusMatched}
-            label="Opus bugs"
-          />
+        <div className="mt-6 grid grid-cols-1 gap-5 md:grid-cols-2">
+          <BugList bugs={sonnetBugs} matched={sonnetMatched} label="Sonnet bugs" />
+          <BugList bugs={opusBugs} matched={opusMatched} label="Opus bugs" />
         </div>
 
-        <div className="mt-5 pt-4 border-t border-border grid grid-cols-2 md:grid-cols-4 gap-3 text-[11px] font-mono text-muted">
+        <div className="mt-5 grid grid-cols-2 gap-3 border-t border-border pt-4 text-[11px] font-mono text-muted md:grid-cols-4">
           <div>
-            <div className="uppercase tracking-wider">Sonnet tokens</div>
-            <div className="text-text mt-1">
+            <div className="uppercase tracking-[0.14em]">Sonnet tokens</div>
+            <div className="mt-1 text-text">
               {row.sonnet_input_tokens ?? "?"} in /{" "}
               {row.sonnet_output_tokens ?? "?"} out
             </div>
             <div className="mt-0.5">{formatMicros(row.sonnet_cost_micros)}</div>
           </div>
           <div>
-            <div className="uppercase tracking-wider">Opus tokens</div>
-            <div className="text-text mt-1">
+            <div className="uppercase tracking-[0.14em]">Opus tokens</div>
+            <div className="mt-1 text-text">
               {row.opus_input_tokens ?? "?"} in /{" "}
               {row.opus_output_tokens ?? "?"} out
             </div>
             <div className="mt-0.5">{formatMicros(row.opus_cost_micros)}</div>
           </div>
           <div>
-            <div className="uppercase tracking-wider">Sonnet confidence</div>
-            <div className="text-text mt-1">{row.sonnet_confidence}</div>
+            <div className="uppercase tracking-[0.14em]">Sonnet confidence</div>
+            <div className="mt-1 text-text">{row.sonnet_confidence}</div>
           </div>
           <div>
-            <div className="uppercase tracking-wider">Opus confidence</div>
-            <div className="text-text mt-1">
+            <div className="uppercase tracking-[0.14em]">Opus confidence</div>
+            <div className="mt-1 text-text">
               {row.opus_confidence ?? <span className="italic">—</span>}
             </div>
           </div>
@@ -354,24 +336,23 @@ export default async function BenchmarkPage() {
   ]);
 
   return (
-    <div className="max-w-6xl mx-auto px-6 py-10 space-y-8">
-      <header>
-        <h1 className="text-2xl font-semibold tracking-tight">
-          Sonnet vs Opus benchmark
-        </h1>
-        <p className="mt-2 font-serif italic text-muted">
-          comparing two models on the same diffs with the same prompt. n=
-          {stats.sample_size}.
-        </p>
-      </header>
+    <Container className="py-10 space-y-8">
+      <SectionHeading
+        eyebrow="Benchmark"
+        title="Sonnet vs Opus"
+        subtitle={
+          <>Comparing two models on the same diffs with the same prompt. n=
+          {stats.sample_size}.</>
+        }
+      />
 
       {stats.sample_size === 0 ? (
         <Card className="p-8 text-center">
-          <div className="text-sm text-muted leading-relaxed max-w-md mx-auto">
+          <div className="mx-auto max-w-md text-sm leading-relaxed text-muted">
             <p>No benchmark runs yet.</p>
             <p className="mt-3">
               Populate the table by running{" "}
-              <code className="px-1.5 py-0.5 bg-bg border border-border rounded text-[12px] font-mono">
+              <code className="rounded-sm border border-border bg-bg-elev px-1.5 py-0.5 font-mono text-[12px]">
                 cd agent && python benchmark.py --latest 5
               </code>{" "}
               from the repo root with the same env vars the agent uses.
@@ -379,7 +360,7 @@ export default async function BenchmarkPage() {
           </div>
         </Card>
       ) : (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
           <StatCard
             label="Verdict agreement"
             value={`${stats.agreement_pct.toFixed(0)}%`}
@@ -405,38 +386,34 @@ export default async function BenchmarkPage() {
             label="Cost ratio"
             value={formatRatio(stats.cost_ratio)}
             hint="opus / sonnet"
-            accent={palette.accent}
           />
         </div>
       )}
 
-      <details
-        open
-        className="bg-card border border-border rounded-lg px-5 py-4"
-      >
-        <summary className="cursor-pointer text-sm font-medium select-none">
+      <details open className="rounded-md border border-border bg-card px-5 py-4">
+        <summary className="cursor-pointer select-none text-sm font-medium">
           Methodology
         </summary>
         <p className="mt-3 text-sm leading-relaxed text-muted">
           Each PR diff was sent through both models using the same system
           prompt (
-          <code className="font-mono text-[12px]">prompt.md</code>
-          ). Outputs were compared on verdict, severity, and bug list. Bug
-          overlap is computed via a simple 70% token Jaccard on file + issue
-          text — a heuristic, not perfect. Sample size is small (&lt;10 in
-          v1); this is directional evidence, not statistically significant. A
-          larger benchmark would need a hand-graded ground truth, which I
-          haven&apos;t built yet.
+          <code className="font-mono text-[12px]">prompt.md</code>). Outputs
+          were compared on verdict, severity, and bug list. Bug overlap is
+          computed via a simple 70% token Jaccard on file + issue text — a
+          heuristic, not perfect. Sample size is small (&lt;10 in v1); this is
+          directional evidence, not statistically significant. A larger
+          benchmark would need a hand-graded ground truth, which I haven&apos;t
+          built yet.
         </p>
       </details>
 
       {rows.length > 0 && (
         <div>
-          <div className="text-[11px] font-mono uppercase tracking-wider text-muted mb-2 px-1">
+          <div className="mb-2 px-1 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
             Per-PR comparison · {rows.length} row{rows.length === 1 ? "" : "s"}
           </div>
-          <div className="bg-card border border-border rounded-lg divide-y divide-border overflow-hidden">
-            <div className="hidden md:grid grid-cols-12 gap-3 px-5 py-3 text-[11px] font-mono uppercase tracking-wider text-muted bg-bg border-b border-border">
+          <div className="divide-y divide-border overflow-hidden rounded-md border border-border bg-card">
+            <div className="hidden grid-cols-12 gap-3 border-b border-border bg-bg-elev px-5 py-3 text-[10px] font-mono uppercase tracking-[0.18em] text-muted md:grid">
               <div className="col-span-4">PR</div>
               <div className="col-span-3">Sonnet</div>
               <div className="col-span-3">Opus</div>
@@ -450,6 +427,6 @@ export default async function BenchmarkPage() {
       )}
 
       <Conclusion stats={stats} />
-    </div>
+    </Container>
   );
 }

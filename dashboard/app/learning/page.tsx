@@ -2,6 +2,8 @@ import Link from "next/link";
 import { AccuracyChart } from "@/components/accuracy-chart";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
+import { Container } from "@/components/ui/container";
+import { SectionHeading } from "@/components/ui/section-heading";
 import { StatCard } from "@/components/ui/stat-card";
 import { Table, TableBody, TableHeader, Td, Th } from "@/components/ui/table";
 import { formatRelativeTime, palette, severityColors } from "@/lib/design";
@@ -16,15 +18,13 @@ import type { HumanActionType } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
-// Self-learning surface. Originally Phase 7; Phase 8 adds the
-// "Pending prompt improvements" section at the bottom.
-//  * headline accuracy stat over the last 30 days
-//  * 90-day accuracy line chart
-//  * recent misses table (false_close + missed_issue) — the cases that
-//    drive prompt improvements
-//  * unresolved drift alerts at the top, red banner
-//  * Phase 8 — open PRs from agent/prompt_tuner.py, each with the
-//    failure cases that drove it and the proposed prompt.md diff
+// Self-learning surface.
+//   * headline accuracy stat over the last 30 days
+//   * 90-day accuracy line chart
+//   * recent misses table (false_close + missed_issue)
+//   * unresolved drift alerts at the top
+//   * open prompt-tuner PRs, each with the failure cases that drove it
+//     and the proposed prompt.md diff
 
 const ACTION_LABEL: Record<HumanActionType, string> = {
   agreement_close: "Agreement (close)",
@@ -35,8 +35,8 @@ const ACTION_LABEL: Record<HumanActionType, string> = {
 };
 
 const ACTION_COLOR: Record<HumanActionType, string> = {
-  agreement_close: "#16a34a",
-  agreement_approve: "#16a34a",
+  agreement_close: severityColors.clean,
+  agreement_approve: severityColors.clean,
   false_close: severityColors.critical,
   missed_issue: severityColors.critical,
   pending: palette.muted,
@@ -57,23 +57,16 @@ export default async function LearningPage() {
   ]);
 
   return (
-    <main className="max-w-6xl mx-auto px-6 py-8 space-y-8">
-      <section>
-        <h1 className="text-xl font-semibold mb-1">Learning</h1>
-        <p className="text-sm text-muted italic font-serif">
-          how often the agent agrees with you, and where it doesn&apos;t
-        </p>
-      </section>
+    <Container className="py-10 space-y-10">
+      <SectionHeading
+        eyebrow="Learning"
+        title="How the agent improves"
+        subtitle="How often the agent agrees with you, and where it doesn't."
+      />
 
       {alerts.length > 0 && (
-        <section
-          className="rounded-lg border p-4"
-          style={{
-            borderColor: severityColors.critical,
-            background: "#fef2f2",
-          }}
-        >
-          <div className="flex items-center gap-2 mb-2">
+        <section className="rounded-md border border-[#ff5252] bg-[#ff5252]/10 p-4">
+          <div className="mb-2 flex items-center gap-2">
             <Badge color={severityColors.critical}>DRIFT</Badge>
             <h2 className="text-sm font-semibold text-text">
               {alerts.length === 1
@@ -81,7 +74,7 @@ export default async function LearningPage() {
                 : `${alerts.length} unresolved alerts`}
             </h2>
           </div>
-          <ul className="text-sm font-mono space-y-1">
+          <ul className="space-y-1 font-mono text-sm">
             {alerts.map((a) => (
               <li key={a.id}>
                 <span className="text-text">
@@ -95,9 +88,9 @@ export default async function LearningPage() {
               </li>
             ))}
           </ul>
-          <p className="text-xs font-mono text-muted mt-3">
+          <p className="mt-3 font-mono text-xs text-muted">
             Resolve in Supabase by setting{" "}
-            <code className="px-1 py-0.5 bg-card rounded border border-border">
+            <code className="rounded-sm border border-border bg-card px-1 py-0.5">
               agent_alerts.resolved_at
             </code>{" "}
             once you&apos;ve audited the cases below.
@@ -105,7 +98,7 @@ export default async function LearningPage() {
         </section>
       )}
 
-      <section className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+      <section className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <StatCard
           label="Agent accuracy (30d)"
           value={
@@ -149,12 +142,12 @@ export default async function LearningPage() {
       <section className="space-y-3">
         <div>
           <h2 className="text-lg font-semibold">Recent misses</h2>
-          <p className="text-xs text-muted font-mono">
+          <p className="text-[11px] font-mono uppercase tracking-[0.14em] text-muted">
             false_close + missed_issue · these drive prompt improvements
           </p>
         </div>
         {misses.length === 0 ? (
-          <Card className="p-6 text-sm font-mono text-muted text-center">
+          <Card className="p-6 text-center font-mono text-sm text-muted">
             no misses yet — either the agent is perfect or there&apos;s not
             enough data
           </Card>
@@ -170,15 +163,15 @@ export default async function LearningPage() {
             </TableHeader>
             <TableBody>
               {misses.map((m) => (
-                <tr key={m.id}>
+                <tr key={m.id} className="hover:bg-bg-elev transition-colors">
                   <Td>
                     <Link
                       href={`/pr/${m.review_id}`}
-                      className="text-accent hover:underline font-mono text-xs"
+                      className="font-mono text-xs text-text hover:underline underline-offset-4"
                     >
                       {m.repo}#{m.pr_number}
                     </Link>
-                    <div className="text-xs text-muted truncate max-w-[28ch]">
+                    <div className="max-w-[28ch] truncate text-xs text-muted">
                       {m.pr_title}
                     </div>
                   </Td>
@@ -190,10 +183,8 @@ export default async function LearningPage() {
                   <Td className="font-mono text-xs text-muted">
                     {formatRelativeTime(m.observed_at)}
                   </Td>
-                  <Td className="text-xs text-muted max-w-[36ch] truncate">
-                    {m.notes || (
-                      <span className="italic text-muted/70">—</span>
-                    )}
+                  <Td className="max-w-[36ch] truncate text-xs text-muted">
+                    {m.notes || <span className="italic text-muted/70">—</span>}
                   </Td>
                 </tr>
               ))}
@@ -205,16 +196,16 @@ export default async function LearningPage() {
       <section className="space-y-3">
         <div>
           <h2 className="text-lg font-semibold">Pending prompt improvements</h2>
-          <p className="text-xs text-muted font-mono">
+          <p className="text-[11px] font-mono uppercase tracking-[0.14em] text-muted">
             open PRs from the prompt-tuner agent · each one proposes a{" "}
-            <code className="px-1 py-0.5 bg-card rounded border border-border">
+            <code className="rounded-sm border border-border bg-bg-elev px-1 py-0.5 normal-case tracking-normal">
               agent/prompt.md
             </code>{" "}
             edit driven by the misses above
           </p>
         </div>
         {promptTunerRuns.length === 0 ? (
-          <Card className="p-6 text-sm font-mono text-muted text-center">
+          <Card className="p-6 text-center font-mono text-sm text-muted">
             no open prompt-tuner PRs · the agent hasn&apos;t found enough
             failure cases to justify a prompt change yet
           </Card>
@@ -228,38 +219,38 @@ export default async function LearningPage() {
                       href={run.pr_url}
                       target="_blank"
                       rel="noreferrer"
-                      className="text-accent hover:underline font-semibold"
+                      className="text-base font-semibold text-text hover:underline underline-offset-4"
                     >
                       {run.agent_repo}#{run.pr_number}
                     </a>
-                    <div className="text-sm text-text mt-0.5">
+                    <div className="mt-0.5 text-sm text-text">
                       {run.pr_title}
                     </div>
-                    <div className="text-xs font-mono text-muted mt-1">
+                    <div className="mt-1 font-mono text-xs text-muted">
                       opened {formatRelativeTime(run.created_at)} · branch{" "}
-                      <code className="px-1 py-0.5 bg-bg rounded border border-border">
+                      <code className="rounded-sm border border-border bg-bg-elev px-1 py-0.5">
                         {run.branch_name}
                       </code>
                     </div>
                   </div>
-                  <Badge color={palette.accent}>OPEN</Badge>
+                  <Badge color={severityColors.clean}>OPEN</Badge>
                 </div>
 
                 {run.rationale && (
                   <div>
-                    <div className="text-xs font-mono text-muted uppercase tracking-wide mb-1">
+                    <div className="mb-1 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
                       Rationale
                     </div>
-                    <p className="text-sm text-text whitespace-pre-line">
+                    <p className="whitespace-pre-line text-sm text-text">
                       {run.rationale}
                     </p>
                   </div>
                 )}
 
-                <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs font-mono">
+                <div className="flex flex-wrap gap-x-6 gap-y-2 font-mono text-xs">
                   <span>
                     <span className="text-muted">cases driving it:</span>{" "}
-                    <span className="text-text font-semibold">
+                    <span className="font-semibold text-text">
                       {run.failure_case_count}
                     </span>
                   </span>
@@ -283,7 +274,7 @@ export default async function LearningPage() {
 
                 {run.failure_cases.length > 0 && (
                   <div>
-                    <div className="text-xs font-mono text-muted uppercase tracking-wide mb-2">
+                    <div className="mb-2 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
                       Failure cases
                     </div>
                     <Table>
@@ -301,11 +292,11 @@ export default async function LearningPage() {
                             <Td>
                               <Link
                                 href={`/pr/${c.review_id}`}
-                                className="text-accent hover:underline font-mono text-xs"
+                                className="font-mono text-xs text-text hover:underline underline-offset-4"
                               >
                                 {c.repo}#{c.pr_number}
                               </Link>
-                              <div className="text-xs text-muted truncate max-w-[28ch]">
+                              <div className="max-w-[28ch] truncate text-xs text-muted">
                                 {c.pr_title}
                               </div>
                             </Td>
@@ -331,23 +322,23 @@ export default async function LearningPage() {
                 )}
 
                 <div>
-                  <div className="text-xs font-mono text-muted uppercase tracking-wide mb-2">
+                  <div className="mb-2 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
                     Proposed diff (agent/prompt.md)
                   </div>
-                  <pre className="text-xs font-mono bg-bg border border-border rounded p-3 overflow-x-auto max-h-96 leading-relaxed">
+                  <pre className="max-h-96 overflow-x-auto rounded-sm border border-border bg-bg-elev p-3 text-xs leading-relaxed font-mono">
                     {run.proposed_diff}
                   </pre>
                 </div>
 
-                <p className="text-xs font-mono text-muted italic">
-                  The agent never merges its own PR. Review the diff on
-                  GitHub before merging.
+                <p className="italic font-mono text-xs text-muted">
+                  The agent never merges its own PR. Review the diff on GitHub
+                  before merging.
                 </p>
               </Card>
             ))}
           </div>
         )}
       </section>
-    </main>
+    </Container>
   );
 }

@@ -1,18 +1,13 @@
 "use client";
 
-// Per-repo configuration page. The only 'use client' page in the
-// dashboard — file upload, local form state, and direct Supabase
-// upserts via the browser anon key (RLS policy in 009_repo_rules.sql
-// allows anon write).
-//
-// Route is /repos/<owner>/<name>/settings. Two dynamic segments rather
-// than a catch-all because Next requires catch-alls to be the last
-// path segment, and we want /settings to sit underneath. GitHub repos
-// are always two-part (owner/name), so two segments is exactly right.
+// Per-repo configuration page. Same logic as the v2 implementation;
+// chrome rebuilt for the v3 black/E2B-style aesthetic.
 
 import Link from "next/link";
 import { use, useEffect, useState } from "react";
+import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { Container } from "@/components/ui/container";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 import type { RepoRule } from "@/lib/types";
 
@@ -42,14 +37,11 @@ const DEFAULT_FORM: FormState = {
   rules_file_name: null,
 };
 
-// One typographic family for the whole page (default sans). The label
-// styles below intentionally avoid the all-caps font-mono used on
-// table headers — that style fights the form inputs. Hints are a
-// small muted line in the same family.
-const LABEL = "block text-sm font-medium text-text mb-1.5";
+const LABEL =
+  "block text-[10px] font-mono uppercase tracking-[0.18em] text-muted mb-1.5";
 const SUBLABEL = "text-xs text-muted leading-relaxed";
 const INPUT =
-  "w-full bg-card border border-border rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent transition-colors";
+  "w-full bg-bg border border-border rounded-sm px-3 py-2 text-sm focus:outline-none focus:border-white transition-colors";
 const TEXTAREA = `${INPUT} font-mono text-xs leading-relaxed`;
 
 function arrayToLines(arr: string[] | null | undefined): string {
@@ -63,10 +55,6 @@ function linesToArray(text: string): string[] {
     .filter((s) => s.length > 0);
 }
 
-// Section wrapper — single source of truth for spacing + card chrome.
-// Title is a clear sans-serif heading; the optional `description` slot
-// holds at most one short line. Anything longer goes inline next to
-// the field it describes.
 function Section({
   title,
   description,
@@ -81,7 +69,7 @@ function Section({
       <div>
         <h2 className="text-base font-semibold text-text">{title}</h2>
         {description && (
-          <p className="text-xs text-muted mt-1">{description}</p>
+          <p className="mt-1 text-xs text-muted">{description}</p>
         )}
       </div>
       {children}
@@ -89,9 +77,6 @@ function Section({
   );
 }
 
-// Inline toggle row used for the two boolean settings. Reads
-// left-to-right like a sentence; checkbox stays on the left so the
-// click target is wide and obvious.
 function ToggleRow({
   checked,
   onChange,
@@ -106,18 +91,18 @@ function ToggleRow({
   tone?: "default" | "danger";
 }) {
   return (
-    <label className="flex items-start gap-3 cursor-pointer group">
+    <label className="group flex cursor-pointer items-start gap-3">
       <input
         type="checkbox"
         checked={checked}
         onChange={(e) => onChange(e.target.checked)}
-        className="mt-0.5 h-4 w-4 accent-accent cursor-pointer"
+        className="mt-0.5 h-4 w-4 cursor-pointer accent-white"
       />
-      <div className="flex-1 min-w-0">
+      <div className="min-w-0 flex-1">
         <div
           className="text-sm font-medium text-text"
           style={
-            tone === "danger" && checked ? { color: "#dc2626" } : undefined
+            tone === "danger" && checked ? { color: "#ff5252" } : undefined
           }
         >
           {label}
@@ -153,9 +138,6 @@ export default function RepoSettingsPage({ params }: PageProps) {
           .maybeSingle();
         if (cancelled) return;
         if (error) {
-          // Tolerate the table not existing yet (PGRST205) — render
-          // an empty form so an operator setting up Phase 9 for the
-          // first time can still save once the migration has run.
           setForm(DEFAULT_FORM);
           setDirectoryTree(null);
         } else if (data) {
@@ -240,27 +222,25 @@ export default function RepoSettingsPage({ params }: PageProps) {
       }
 
       const supabase = createSupabaseBrowserClient();
-      const { error } = await supabase
-        .from("repo_rules")
-        .upsert(
-          {
-            repo,
-            enabled: form.enabled,
-            auto_close_all: form.auto_close_all,
-            auto_close_severity_threshold: threshold,
-            watch_paths: linesToArray(form.watch_paths),
-            skip_paths: linesToArray(form.skip_paths),
-            custom_instructions:
-              form.custom_instructions.trim().length > 0
-                ? form.custom_instructions
-                : null,
-            rules_file_content:
-              form.rules_file_content.length > 0
-                ? form.rules_file_content
-                : null,
-          },
-          { onConflict: "repo" },
-        );
+      const { error } = await supabase.from("repo_rules").upsert(
+        {
+          repo,
+          enabled: form.enabled,
+          auto_close_all: form.auto_close_all,
+          auto_close_severity_threshold: threshold,
+          watch_paths: linesToArray(form.watch_paths),
+          skip_paths: linesToArray(form.skip_paths),
+          custom_instructions:
+            form.custom_instructions.trim().length > 0
+              ? form.custom_instructions
+              : null,
+          rules_file_content:
+            form.rules_file_content.length > 0
+              ? form.rules_file_content
+              : null,
+        },
+        { onConflict: "repo" },
+      );
 
       if (error) throw error;
       setToast({ kind: "success", message: "Saved" });
@@ -276,41 +256,38 @@ export default function RepoSettingsPage({ params }: PageProps) {
 
   if (loading) {
     return (
-      <main className="max-w-3xl mx-auto px-6 py-10">
-        <Card className="p-10 text-center text-muted text-sm">Loading…</Card>
-      </main>
+      <Container size="narrow" className="py-10">
+        <Card className="p-10 text-center text-sm text-muted">Loading…</Card>
+      </Container>
     );
   }
 
-  // Status pill in the header reflects the live form state, not the
-  // saved state — operators get immediate visual feedback when they
-  // flip the "Enable reviews" toggle.
   const statusPill = form.enabled
-    ? { bg: "#dcfce7", color: "#15803d", label: "Active" }
-    : { bg: "#fee2e2", color: "#b91c1c", label: "Paused" };
+    ? { bg: "#4ade80", color: "#000000", label: "Active" }
+    : { bg: "#ff5252", color: "#000000", label: "Paused" };
 
   return (
-    <main className="max-w-3xl mx-auto px-6 py-8 pb-24">
+    <Container size="narrow" className="py-10 pb-28">
       {/* Header */}
       <div className="mb-6 space-y-3">
         <Link
           href="/repos"
-          className="text-xs text-muted hover:text-text inline-flex items-center gap-1"
+          className="inline-flex items-center gap-1 text-[11px] font-mono uppercase tracking-[0.14em] text-muted hover:text-text"
         >
           ← All repos
         </Link>
-        <div className="flex items-center justify-between gap-4 flex-wrap">
+        <div className="flex flex-wrap items-center justify-between gap-4">
           <div className="min-w-0">
-            <h1 className="text-xl font-semibold text-text font-mono truncate">
+            <h1 className="truncate font-mono text-xl font-semibold text-text">
               {repo}
             </h1>
-            <p className="text-xs text-muted mt-1">
+            <p className="mt-1 text-xs text-muted">
               Per-repo rules · read by the agent before each review.
             </p>
           </div>
           <div className="flex items-center gap-2">
             <span
-              className="px-2 py-0.5 rounded-full text-xs font-medium"
+              className="rounded-sm px-2 py-0.5 text-[10px] font-mono uppercase tracking-[0.18em]"
               style={{
                 backgroundColor: statusPill.bg,
                 color: statusPill.color,
@@ -324,7 +301,7 @@ export default function RepoSettingsPage({ params }: PageProps) {
               rel="noreferrer"
               title="Open on GitHub"
               aria-label={`Open ${repo} on GitHub`}
-              className="text-xs text-muted hover:text-text border border-border rounded-md px-2 py-1"
+              className="rounded-sm border border-border px-2 py-1 text-[11px] font-mono uppercase tracking-[0.14em] text-muted hover:border-border-strong hover:text-text"
             >
               GitHub ↗
             </a>
@@ -351,12 +328,7 @@ export default function RepoSettingsPage({ params }: PageProps) {
 
           {form.auto_close_all && (
             <div
-              className="text-xs rounded-md px-3 py-2 border"
-              style={{
-                color: "#991b1b",
-                backgroundColor: "#fef2f2",
-                borderColor: "#fecaca",
-              }}
+              className="rounded-sm border border-[#ff5252]/40 bg-[#ff5252]/10 px-3 py-2 text-xs text-[#ff5252]"
               role="alert"
             >
               This will close every PR including good ones. Use with caution.
@@ -410,8 +382,8 @@ export default function RepoSettingsPage({ params }: PageProps) {
               placeholder="src/&#10;api/"
             />
             <p className={`${SUBLABEL} mt-1.5`}>
-              Empty reviews everything. Otherwise only PRs touching these
-              paths are reviewed.
+              Empty reviews everything. Otherwise only PRs touching these paths
+              are reviewed.
             </p>
           </div>
 
@@ -457,8 +429,8 @@ export default function RepoSettingsPage({ params }: PageProps) {
 
           <div className="pt-1">
             <label className={LABEL}>Rules file</label>
-            <div className="flex items-center gap-3 flex-wrap">
-              <label className="inline-flex items-center gap-2 px-3 py-1.5 border border-border rounded-md cursor-pointer hover:bg-bg text-sm transition-colors">
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="inline-flex cursor-pointer items-center gap-2 rounded-sm border border-border px-3 py-1.5 text-sm hover:border-border-strong hover:text-text transition-colors">
                 <input
                   type="file"
                   accept=".txt,.md,text/plain,text/markdown"
@@ -470,18 +442,14 @@ export default function RepoSettingsPage({ params }: PageProps) {
               {form.rules_file_name && (
                 <div className="flex items-center gap-2 text-xs text-muted">
                   <span
-                    className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full"
-                    style={{
-                      backgroundColor: "#dcfce7",
-                      color: "#15803d",
-                    }}
+                    className="inline-flex items-center gap-1.5 rounded-sm bg-[#4ade80]/15 px-2 py-0.5 text-[#4ade80]"
                   >
                     <span className="font-mono">{form.rules_file_name}</span>
                     <span>· {form.rules_file_content.length} chars</span>
                   </span>
                   <button
                     type="button"
-                    className="text-muted hover:text-text underline"
+                    className="text-muted underline underline-offset-4 hover:text-text"
                     onClick={() =>
                       setForm((f) => ({
                         ...f,
@@ -507,11 +475,11 @@ export default function RepoSettingsPage({ params }: PageProps) {
           description="Read-only · populated by the agent from recent PR diffs."
         >
           {directoryTree ? (
-            <pre className="font-mono text-xs leading-relaxed text-muted whitespace-pre-wrap overflow-x-auto bg-bg border border-border rounded-md p-3 max-h-64 overflow-y-auto">
+            <pre className="max-h-64 overflow-x-auto overflow-y-auto whitespace-pre-wrap rounded-sm border border-border bg-bg-elev p-3 font-mono text-xs leading-relaxed text-muted">
               {directoryTree}
             </pre>
           ) : (
-            <div className="text-sm text-muted bg-bg border border-border rounded-md p-3">
+            <div className="rounded-sm border border-border bg-bg-elev p-3 text-sm text-muted">
               Appears after the next agent run.
             </div>
           )}
@@ -519,38 +487,38 @@ export default function RepoSettingsPage({ params }: PageProps) {
       </div>
 
       {/* Sticky save bar */}
-      <div className="fixed bottom-0 left-0 right-0 bg-card/95 backdrop-blur border-t border-border">
-        <div className="max-w-3xl mx-auto px-6 py-3 flex items-center justify-between gap-4">
+      <div className="fixed bottom-0 left-0 right-0 border-t border-border bg-bg/95 backdrop-blur">
+        <div className="mx-auto flex max-w-3xl items-center justify-between gap-4 px-4 py-3 sm:px-6">
           <Link
             href={`/?repo=${encodeURIComponent(repo)}`}
-            className="text-xs text-muted hover:text-text"
+            className="text-[11px] font-mono uppercase tracking-[0.14em] text-muted hover:text-text"
           >
             ← Back to reviews
           </Link>
-          <button
+          <Button
             type="button"
             disabled={saving}
             onClick={handleSave}
-            className="px-4 py-2 rounded-md text-sm font-medium text-white disabled:opacity-50 transition-opacity"
-            style={{ backgroundColor: "#4338ca" }}
+            variant="primary"
           >
             {saving ? "Saving…" : "Save changes"}
-          </button>
+          </Button>
         </div>
       </div>
 
       {toast && (
         <div
-          className="fixed bottom-20 right-6 px-4 py-2 rounded-md shadow-lg text-sm font-medium"
-          style={{
-            backgroundColor: toast.kind === "success" ? "#16a34a" : "#dc2626",
-            color: "white",
-          }}
+          className={
+            "fixed bottom-20 right-6 rounded-sm px-4 py-2 text-sm font-medium shadow-lg " +
+            (toast.kind === "success"
+              ? "bg-[#4ade80] text-black"
+              : "bg-[#ff5252] text-black")
+          }
           role="status"
         >
           {toast.message}
         </div>
       )}
-    </main>
+    </Container>
   );
 }

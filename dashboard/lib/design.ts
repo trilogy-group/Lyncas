@@ -1,27 +1,34 @@
 import type { Verdict } from "./types";
 
-// Palette mirrors agent/send_digest.py so the dashboard and email digest
-// look like the same product.
+// Visual tokens used by React components in the dashboard. The agent's
+// send_digest.py keeps its own light-mode palette (digests render in
+// email clients we don't control), so this file deliberately diverges:
+// the dashboard is dark-mode E2B-style, the digest stays light-mode.
+//
+// Keep these in sync with globals.css `@theme inline` if you add new
+// colors — Tailwind only reads classes there, but inline `style={…}`
+// references in components read from this file.
+
 export const palette = {
-  bg: "#fafaf9",
-  card: "#ffffff",
-  border: "#e7e5e4",
-  text: "#1c1917",
-  muted: "#57534e",
-  accent: "#4338ca",
+  bg: "#000000",
+  card: "#0a0a0a",
+  border: "#1f1f1f",
+  text: "#ffffff",
+  muted: "#8a8a8a",
+  accent: "#ffffff",
 } as const;
 
 export const severityColors = {
-  critical: "#dc2626", // 9-10
-  serious: "#ea580c", // 7-8
-  moderate: "#ca8a04", // 4-6
-  clean: "#16a34a", // 1-3
+  critical: "#ff5252", // 9-10
+  serious: "#ff9d4d",  // 7-8
+  moderate: "#f5c63a", // 4-6
+  clean: "#4ade80",    // 1-3
 } as const;
 
 export const verdictColors = {
-  approve: "#16a34a",
-  request_changes: "#dc2626",
-  comment: "#2563eb",
+  approve: "#4ade80",
+  request_changes: "#ff5252",
+  comment: "#60a5fa",
 } as const;
 
 export function severityColor(score: number | null | undefined): string {

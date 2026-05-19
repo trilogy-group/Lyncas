@@ -3,17 +3,15 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { Container } from "@/components/ui/container";
+import { SectionHeading } from "@/components/ui/section-heading";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 
 // /dashboard/settings — per-user account preferences. Currently scoped
 // to one section ("Notification settings") that wires digest emails to
 // an OTP-verified address.
-//
-// Why a separate /dashboard/settings (vs the legacy /settings):
-//   * /settings is the v1 public read-only "agent config" page.
-//   * /dashboard/settings is auth-gated and owner-scoped — RLS on
-//     user_profiles + email_verifications keeps the writes safe.
 
 interface ProfileState {
   digest_email: string | null;
@@ -95,7 +93,6 @@ export default function DashboardSettingsPage() {
       if (data.dev_otp) {
         setDevOtp(data.dev_otp);
       }
-      // Optimistically reflect the new (unverified) address.
       setProfile({
         digest_email: email,
         digest_email_verified: false,
@@ -134,9 +131,9 @@ export default function DashboardSettingsPage() {
 
   if (loading) {
     return (
-      <main className="max-w-3xl mx-auto px-6 py-10">
-        <Card className="p-10 text-center text-muted text-sm">Loading…</Card>
-      </main>
+      <Container size="narrow" className="py-10">
+        <Card className="p-10 text-center text-sm text-muted">Loading…</Card>
+      </Container>
     );
   }
 
@@ -144,31 +141,30 @@ export default function DashboardSettingsPage() {
     profile.digest_email_verified && profile.digest_email === email;
 
   return (
-    <main className="max-w-3xl mx-auto px-6 py-8 space-y-6">
-      <section>
-        <h1 className="text-xl font-semibold mb-1">Settings</h1>
-        <p className="text-sm text-muted">
-          Manage where Night PR Reviewer sends your daily digest.
-        </p>
-      </section>
+    <Container size="narrow" className="py-10 space-y-8">
+      <SectionHeading
+        eyebrow="Settings"
+        title="Account & notifications"
+        subtitle="Manage where Night PR Reviewer sends your daily digest."
+      />
 
-      <Card className="p-6 space-y-5">
+      <Card className="p-6 space-y-6">
         <div>
           <h2 className="text-base font-semibold">Notification settings</h2>
-          <p className="text-xs text-muted mt-1">
-            We send one digest per day summarising PRs reviewed and
-            auto-closed across your connected repositories.
+          <p className="mt-1 text-xs text-muted">
+            One digest per day summarising PRs reviewed and auto-closed across
+            your connected repositories.
           </p>
         </div>
 
         <div className="space-y-2">
           <label
             htmlFor="digest-email"
-            className="block text-xs font-medium text-muted"
+            className="block text-[10px] font-mono uppercase tracking-[0.18em] text-muted"
           >
             Digest email address
           </label>
-          <div className="flex flex-col sm:flex-row gap-2">
+          <div className="flex flex-col gap-2 sm:flex-row">
             <input
               id="digest-email"
               type="email"
@@ -180,14 +176,13 @@ export default function DashboardSettingsPage() {
                 setError(null);
               }}
               placeholder="you@example.com"
-              className="flex-1 bg-bg border border-border rounded-md px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent"
+              className="flex-1 rounded-sm border border-border bg-bg px-3 py-2 text-sm font-mono focus:border-white focus:outline-none"
             />
-            <button
+            <Button
               type="button"
               onClick={() => void sendCode()}
               disabled={sending || !email || currentVerified}
-              className="px-4 py-2 rounded-md text-sm font-medium text-white disabled:opacity-50 whitespace-nowrap"
-              style={{ backgroundColor: "#4338ca" }}
+              variant="primary"
             >
               {sending
                 ? "Sending…"
@@ -196,10 +191,10 @@ export default function DashboardSettingsPage() {
                   : stage === "sent"
                     ? "Resend code"
                     : "Send verification code"}
-            </button>
+            </Button>
           </div>
           {currentVerified && (
-            <div className="text-xs text-green-700">
+            <div className="text-xs text-[#4ade80]">
               ✓ Email verified — digests will go to{" "}
               <span className="font-mono">{email}</span>
             </div>
@@ -210,12 +205,14 @@ export default function DashboardSettingsPage() {
           <div className="space-y-2 border-t border-border pt-5">
             <label
               htmlFor="otp"
-              className="block text-xs font-medium text-muted"
+              className="block text-[10px] font-mono uppercase tracking-[0.18em] text-muted"
             >
               Enter the 6-digit code we sent to{" "}
-              <span className="font-mono">{email}</span>
+              <span className="font-mono normal-case tracking-normal">
+                {email}
+              </span>
             </label>
-            <div className="flex flex-col sm:flex-row gap-2">
+            <div className="flex flex-col gap-2 sm:flex-row">
               <input
                 id="otp"
                 type="text"
@@ -227,40 +224,40 @@ export default function DashboardSettingsPage() {
                   setOtp(e.target.value.replace(/\D/g, "").slice(0, 6))
                 }
                 placeholder="000000"
-                className="w-full sm:w-40 bg-bg border border-border rounded-md px-3 py-2 text-base font-mono tracking-[0.4em] text-center focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent"
+                className="w-full rounded-sm border border-border bg-bg px-3 py-2 text-center text-base font-mono tracking-[0.4em] focus:border-white focus:outline-none sm:w-40"
               />
-              <button
+              <Button
                 type="button"
                 onClick={() => void confirmCode()}
                 disabled={verifying || otp.length !== 6}
-                className="px-4 py-2 rounded-md text-sm font-medium border border-border bg-card hover:bg-bg disabled:opacity-50 whitespace-nowrap"
+                variant="default"
               >
                 {verifying ? "Verifying…" : "Verify"}
-              </button>
+              </Button>
             </div>
             <div className="text-[11px] text-muted">
-              Code expires in 10 minutes. Didn&apos;t arrive? Check spam
-              or click &quot;Resend code&quot; above.
+              Code expires in 10 minutes. Didn&apos;t arrive? Check spam or
+              click &quot;Resend code&quot; above.
             </div>
             {devOtp && (
-              <div className="mt-2 p-2 text-[11px] font-mono rounded-md border border-amber-300 bg-amber-50 text-amber-800">
+              <div className="mt-2 rounded-sm border border-[#f5c63a]/40 bg-[#f5c63a]/10 p-2 text-[11px] font-mono text-[#f5c63a]">
                 Dev mode (no SMTP configured): your code is{" "}
                 <span className="font-bold">{devOtp}</span>. Configure{" "}
-                <code>GMAIL_USER</code> + <code>GMAIL_APP_PASSWORD</code>{" "}
-                in the environment to email it instead.
+                <code>GMAIL_USER</code> + <code>GMAIL_APP_PASSWORD</code> in the
+                environment to email it instead.
               </div>
             )}
           </div>
         )}
 
         {error && (
-          <div className="text-xs px-3 py-2 rounded-md border border-red-300 bg-red-50 text-red-700">
+          <div className="rounded-sm border border-[#ff5252]/40 bg-[#ff5252]/10 px-3 py-2 text-xs text-[#ff5252]">
             {error}
           </div>
         )}
       </Card>
 
-      <Card className="p-6 space-y-2">
+      <Card className="p-6 space-y-3">
         <h2 className="text-base font-semibold">Other settings</h2>
         <p className="text-xs text-muted">
           Per-repository configuration (path filters, custom prompts,
@@ -268,11 +265,11 @@ export default function DashboardSettingsPage() {
         </p>
         <Link
           href="/dashboard/repos"
-          className="inline-block mt-2 text-sm font-medium text-accent hover:underline"
+          className="inline-block text-sm font-medium text-text underline underline-offset-4 hover:opacity-80"
         >
           Manage repository settings →
         </Link>
       </Card>
-    </main>
+    </Container>
   );
 }

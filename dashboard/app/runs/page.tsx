@@ -1,6 +1,8 @@
 import { Card } from "@/components/ui/card";
+import { Container } from "@/components/ui/container";
+import { SectionHeading } from "@/components/ui/section-heading";
 import { Table, TableBody, TableHeader, Td, Th } from "@/components/ui/table";
-import { formatDuration, formatRelativeTime, palette } from "@/lib/design";
+import { formatDuration, formatRelativeTime } from "@/lib/design";
 import { getRuns } from "@/lib/queries";
 
 export const dynamic = "force-dynamic";
@@ -8,16 +10,15 @@ export const dynamic = "force-dynamic";
 export default async function RunsPage() {
   const runs = await getRuns(50);
   return (
-    <main className="max-w-6xl mx-auto px-6 py-8 space-y-6">
-      <section>
-        <h1 className="text-xl font-semibold mb-1">Agent runs</h1>
-        <p className="text-sm text-muted italic font-serif">
-          last 50 invocations
-        </p>
-      </section>
+    <Container className="py-10 space-y-6">
+      <SectionHeading
+        eyebrow="Runs"
+        title="Agent runs"
+        subtitle="Last 50 invocations of the cron-driven reviewer."
+      />
 
       {runs.length === 0 ? (
-        <Card className="p-8 text-center text-muted text-sm">
+        <Card className="p-8 text-center text-sm text-muted">
           No runs recorded yet.
         </Card>
       ) : (
@@ -38,12 +39,12 @@ export default async function RunsPage() {
               const errCount = r.errors?.length ?? 0;
               const hasErr = errCount > 0;
               return (
-                <tr key={r.id}>
+                <tr key={r.id} className="hover:bg-bg-elev transition-colors">
                   <Td
-                    className="font-mono text-xs whitespace-nowrap"
+                    className="whitespace-nowrap font-mono text-xs"
                     style={
                       hasErr
-                        ? { borderLeft: "4px solid #dc2626" }
+                        ? { borderLeft: "3px solid #ff5252" }
                         : undefined
                     }
                   >
@@ -56,13 +57,11 @@ export default async function RunsPage() {
                     {(r.repos_scanned ?? []).join(", ") || "—"}
                   </Td>
                   <Td className="font-mono text-xs">{r.reviews_created}</Td>
-                  <Td className="font-mono text-xs text-muted">
-                    {r.skipped}
-                  </Td>
+                  <Td className="font-mono text-xs text-muted">{r.skipped}</Td>
                   <Td
                     className="font-mono text-xs"
                     style={{
-                      color: hasErr ? palette.text : palette.muted,
+                      color: hasErr ? "#ff5252" : "#8a8a8a",
                       fontWeight: hasErr ? 600 : 400,
                     }}
                   >
@@ -77,6 +76,6 @@ export default async function RunsPage() {
           </TableBody>
         </Table>
       )}
-    </main>
+    </Container>
   );
 }

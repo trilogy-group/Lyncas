@@ -24,7 +24,7 @@
 
 import "server-only";
 
-import jwt from "jsonwebtoken";
+import * as crypto from "crypto";
 
 const GITHUB_API = "https://api.github.com";
 const GITHUB_API_VERSION = "2022-11-28";
@@ -72,6 +72,16 @@ function appConfig(): AppConfig {
 
 /**
  * Sign a short-lived App JWT (10 minutes — GitHub's documented max).
+ *
+ * Hand-rolled with node:crypto rather than node-jsonwebtoken because
+ * the latter has bitten us with "A JSON web token could not be
+ * decoded" responses from GitHub that point at subtle library /
+ * version interactions around RS256 signing on PKCS#1-vs-PKCS#8 PEMs.
+ * The crypto.createSign('RSA-SHA256') path is the same primitive
+ * GitHub's docs reference, and base64url is the JWT spec encoding —
+ * jsonwebtoken's older "base64 + trim padding + url-safe swap"
+ * approach is what we used to do manually.
+ *
  * `iat` is intentionally backdated 60s to cope with mild clock skew
  * between Vercel's serverless runtime and GitHub's API; without this,
  * a request that arrives "before" the iat fails 401 with no useful
@@ -80,11 +90,28 @@ function appConfig(): AppConfig {
 export function getAppJWT(): string {
   const { appId, privateKey } = appConfig();
   const now = Math.floor(Date.now() / 1000);
-  return jwt.sign(
-    { iat: now - 60, exp: now + 600, iss: appId },
-    privateKey,
-    { algorithm: "RS256" },
-  );
+
+  const header = Buffer.from(
+    JSON.stringify({ alg: "RS256", typ: "JWT" }),
+  ).toString("base64url");
+
+  const payload = Buffer.from(
+    JSON.stringify({
+      iat: now - 60,
+      exp: now + 600,
+      iss: appId,
+    }),
+  ).toString("base64url");
+
+  const signingInput = `${header}.${payload}`;
+
+  const sign = crypto.createSign("RSA-SHA256");
+  sign.update(signingInput);
+  sign.end();
+
+  const signature = sign.sign(privateKey, "base64url");
+
+  return `${signingInput}.${signature}`;
 }
 
 interface FetchOptions {

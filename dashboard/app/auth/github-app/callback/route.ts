@@ -2,6 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import {
   getInstallation,
   listInstallationRepos,
+  probeAppJWT,
   type Installation,
 } from "@/lib/github-app";
 import { upsertInstallation } from "@/lib/queries";
@@ -85,7 +86,40 @@ export async function GET(request: NextRequest) {
     installation = await getInstallation(installationId);
     repos = await listInstallationRepos(installationId);
   } catch (e) {
-    return backToConnect(request, (e as Error).message);
+    const baseMessage = (e as Error).message;
+
+    // If GitHub rejected the JWT itself ("could not be decoded"),
+    // run a follow-up probe against GET /app to separate "JWT is
+    // wrong" from "install_id is wrong". The probe authenticates
+    // with the same JWT but no install_id — if it ALSO 401s with
+    // the same wording, the App ID and the private key disagree on
+    // which App they belong to (the most common cause of this
+    // error after a fresh App-creation cycle).
+    if (
+      baseMessage.includes("could not be decoded") ||
+      baseMessage.includes("401")
+    ) {
+      const probe = await probeAppJWT();
+      if (probe.ok) {
+        console.error(
+          `[github-app] JWT works against GET /app (app id=${probe.app.id}, slug=${probe.app.slug}) but installation ${installationId} 401s — installation_id probably belongs to a different App.`,
+        );
+        return backToConnect(
+          request,
+          `JWT is valid (App: ${probe.app.slug}) but installation ${installationId} doesn't belong to it. Re-install on the correct App, or update GITHUB_APP_ID / GITHUB_APP_PRIVATE_KEY to match the App you installed.`,
+        );
+      } else {
+        console.error(
+          `[github-app] GET /app probe also failed (status=${probe.status}, message=${probe.message}) — GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY do NOT belong to the same App. Compare the pub_key_fingerprint logged above to the SHA256 shown next to your private key at https://github.com/settings/apps/<slug>/keys.`,
+        );
+        return backToConnect(
+          request,
+          `GitHub can't validate the App JWT — the App ID (${process.env.GITHUB_APP_ID}) and private key in Vercel env vars don't belong to the same GitHub App. Check https://github.com/settings/apps and the function logs for the public-key fingerprint.`,
+        );
+      }
+    }
+
+    return backToConnect(request, baseMessage);
   }
 
   // Persist the install row first. If this fails we abort — we don't

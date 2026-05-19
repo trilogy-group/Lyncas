@@ -121,14 +121,40 @@ export function getAppJWT(): string {
   const signature = sign.sign(privateKey, "base64url");
   const token = `${signingInput}.${signature}`;
 
+  // Derive a public-key fingerprint so we can prove the env-var key
+  // matches the App. GitHub's App settings page shows the same
+  // SHA-256-of-DER-public-key fingerprint next to each private key
+  // registered for the App. If THIS fingerprint isn't listed on
+  // https://github.com/settings/apps/<your-app>/keys, the key in
+  // GITHUB_APP_PRIVATE_KEY belongs to a different App (or was
+  // deleted) — that's the most common cause of GitHub returning
+  // "A JSON web token could not be decoded" with an otherwise
+  // well-formed JWT.
+  let pubKeyFingerprint = "unknown";
+  try {
+    const pubKey = crypto.createPublicKey(privateKey);
+    const der = pubKey.export({ format: "der", type: "spki" });
+    pubKeyFingerprint =
+      "SHA256:" +
+      crypto
+        .createHash("sha256")
+        .update(der as Buffer)
+        .digest("base64")
+        .replace(/=+$/, "");
+  } catch (e) {
+    pubKeyFingerprint = `derive-failed: ${(e as Error).message}`;
+  }
+
   // TEMP diagnostic — every field below is intentionally non-secret
   // (iss is the public App ID, iat/exp are timestamps, sig_len is
-  // the byte count of the signature segment). If GitHub keeps
-  // returning "could not be decoded" after this fix, these logs let
-  // us tell at a glance whether iss is numeric, whether iat is in
-  // the past, whether the signature length is right (~342 chars
-  // base64url for 2048-bit RSA, ~683 for 4096-bit), and that we
-  // produced exactly three dot-separated segments.
+  // the byte count of the signature segment, fingerprint is the
+  // PUBLIC part of an asymmetric pair). Lets us tell at a glance:
+  //   * whether iss is numeric (fixed in the previous commit)
+  //   * whether iat is in the past
+  //   * whether the sig length is right (~342 for 2048-bit RSA,
+  //     ~683 for 4096-bit)
+  //   * whether we produced exactly three dot-separated segments
+  //   * whether the key in the env matches an App on GitHub
   console.log(
     "[github-app] jwt:",
     JSON.stringify({
@@ -139,10 +165,58 @@ export function getAppJWT(): string {
       now,
       sig_len: signature.length,
       segments: token.split(".").length,
+      pub_key_fingerprint: pubKeyFingerprint,
     }),
   );
 
   return token;
+}
+
+/**
+ * Sanity probe — calls GET /app, which is the simplest endpoint
+ * authenticated only by the App JWT (no installation, no repo
+ * scope). If this succeeds, the JWT + key + App ID combination is
+ * correct and any subsequent failure is about the installation
+ * being wrong (or revoked). If it fails with the same "could not
+ * be decoded" message, the App ID and the private key disagree
+ * on which App they belong to.
+ *
+ * We use it as a diagnostic step in /auth/github-app/callback so
+ * the user gets a precise error rather than a confusing 401.
+ */
+export async function probeAppJWT(): Promise<
+  | { ok: true; app: { id: number; slug: string; name: string } }
+  | { ok: false; status: number; message: string }
+> {
+  const token = getAppJWT();
+  try {
+    const res = await fetch(`${GITHUB_API}/app`, {
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${token}`,
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+      },
+      cache: "no-store",
+    });
+    if (res.ok) {
+      const app = (await res.json()) as {
+        id: number;
+        slug: string;
+        name: string;
+      };
+      return { ok: true, app };
+    }
+    let message = `HTTP ${res.status}`;
+    try {
+      const j = (await res.json()) as { message?: string };
+      if (j.message) message = j.message;
+    } catch {
+      // non-json body
+    }
+    return { ok: false, status: res.status, message };
+  } catch (e) {
+    return { ok: false, status: 0, message: (e as Error).message };
+  }
 }
 
 interface FetchOptions {

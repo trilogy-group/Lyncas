@@ -12,17 +12,18 @@ import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 //
 //   1. GitHub App install (primary)
 //      One button that links to
-//      https://github.com/apps/<slug>/installations/new. GitHub asks
-//      the user which repos to grant, then redirects them back to
-//      /auth/github-app/callback?installation_id=… which provisions
-//      the watched_repos rows server-side.
+//      https://github.com/apps/<slug>/installations/new?state=<user_id>.
+//      GitHub asks the user which repos to grant, then redirects them
+//      to /auth/github-app/callback?installation_id=…&state=<user_id>
+//      which provisions the watched_repos rows server-side. The
+//      `state` is a defense-in-depth hint that lets the callback log
+//      a session-mismatch when the redirected browser doesn't carry
+//      the expected user; the callback still requires a real session
+//      so `state` alone is not a credential.
 //
-//   2. PAT (collapsed, "Advanced") — unchanged behavior from the
-//      pre-011 flow. Kept because:
-//        * Some users can't install Apps on repos they don't admin.
-//        * The v1 cron-path agent still reads github_token directly.
-//      Hidden behind a <details> so the App path is what users see
-//      first; the PAT form only appears when explicitly expanded.
+//   2. PAT (collapsed, "Advanced") — unchanged from the pre-011 flow,
+//      now with a "Fetch my repos" picker that drives the input via
+//      the logged-in user's GitHub OAuth token instead of typing.
 //
 // Free-plan check (repo_limit) gates both paths — at-limit users see
 // the upgrade banner regardless of which method they'd prefer.
@@ -35,6 +36,17 @@ interface VerifyState {
   message: string | null;
 }
 
+interface MyRepoOption {
+  full_name: string;
+  private: boolean;
+}
+
+type FetchReposState =
+  | { kind: "idle" }
+  | { kind: "loading" }
+  | { kind: "ok"; repos: MyRepoOption[] }
+  | { kind: "fallback"; message: string };
+
 const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const APP_SLUG = process.env.NEXT_PUBLIC_GITHUB_APP_SLUG ?? "";
 
@@ -46,6 +58,7 @@ function ConnectRepoInner() {
   const [loading, setLoading] = useState(true);
   const [repoCount, setRepoCount] = useState(0);
   const [repoLimit, setRepoLimit] = useState(2);
+  const [userId, setUserId] = useState<string | null>(null);
 
   const [repo, setRepo] = useState("");
   const [token, setToken] = useState("");
@@ -54,6 +67,14 @@ function ConnectRepoInner() {
     message: null,
   });
   const [saving, setSaving] = useState(false);
+  // Repo picker state — only populated when the user clicks
+  // "Fetch my repos". Falls back to a plain text input when the
+  // OAuth token isn't available (e.g. magic-link login) or when
+  // GitHub returns an error.
+  const [fetchRepos, setFetchRepos] = useState<FetchReposState>({
+    kind: "idle",
+  });
+  const [repoSearch, setRepoSearch] = useState("");
   // The callback bounces back here with ?error=… on failure (and to
   // /dashboard/repos?connected=N on success, which this page never
   // sees). Surface the inbound error as a toast on first render by
@@ -77,6 +98,7 @@ function ConnectRepoInner() {
           if (!cancelled) router.replace("/login");
           return;
         }
+        if (!cancelled) setUserId(user.id);
         const [profileRes, watchedRes] = await Promise.all([
           supabase
             .from("user_profiles")
@@ -100,6 +122,64 @@ function ConnectRepoInner() {
       cancelled = true;
     };
   }, [router, supabase]);
+
+  async function handleFetchMyRepos() {
+    setFetchRepos({ kind: "loading" });
+    try {
+      // Supabase only exposes provider_token via getSession (not
+      // getUser); the token is the GitHub OAuth access token from the
+      // login flow. It has `read:user` scope by default — enough to
+      // call /user/repos for repos the user can see.
+      const { data } = await supabase.auth.getSession();
+      const providerToken = data.session?.provider_token;
+      if (!providerToken) {
+        setFetchRepos({
+          kind: "fallback",
+          message:
+            "We couldn't read your GitHub OAuth token (magic-link logins don't include one). Type the repo manually below.",
+        });
+        return;
+      }
+      const res = await fetch(
+        "https://api.github.com/user/repos?per_page=100&sort=updated",
+        {
+          headers: {
+            Accept: "application/vnd.github+json",
+            Authorization: `Bearer ${providerToken}`,
+            "X-GitHub-Api-Version": "2022-11-28",
+          },
+        },
+      );
+      if (!res.ok) {
+        setFetchRepos({
+          kind: "fallback",
+          message:
+            res.status === 401
+              ? "GitHub rejected your OAuth token (it may have expired — sign in again, or type the repo manually below)."
+              : `GitHub returned HTTP ${res.status}. Type the repo manually below.`,
+        });
+        return;
+      }
+      const body = (await res.json()) as Array<{
+        full_name: string;
+        private: boolean;
+      }>;
+      setFetchRepos({
+        kind: "ok",
+        repos: body.map((r) => ({
+          full_name: r.full_name,
+          private: r.private,
+        })),
+      });
+    } catch (e) {
+      setFetchRepos({
+        kind: "fallback",
+        message:
+          (e as Error).message ||
+          "Could not reach GitHub. Type the repo manually below.",
+      });
+    }
+  }
 
   function resetVerify() {
     setVerify((v) =>
@@ -218,9 +298,26 @@ function ConnectRepoInner() {
   }
 
   const atLimit = repoCount >= repoLimit;
-  const installUrl = APP_SLUG
-    ? `https://github.com/apps/${APP_SLUG}/installations/new`
-    : null;
+  // GitHub forwards the `state` parameter back to the post-install
+  // callback verbatim. The callback already requires a Supabase
+  // session, so `state` is not a security boundary — it's a
+  // correlation hint we can log when the user_id doesn't match.
+  const installUrl =
+    APP_SLUG && userId
+      ? `https://github.com/apps/${APP_SLUG}/installations/new?state=${encodeURIComponent(userId)}`
+      : APP_SLUG
+        ? `https://github.com/apps/${APP_SLUG}/installations/new`
+        : null;
+
+  // Filter the picker locally. ~100 repos is fine to do client-side;
+  // the GitHub endpoint already caps at `per_page=100` so we don't
+  // need to wire a paginated server query for the v1 picker.
+  const filteredRepos =
+    fetchRepos.kind === "ok"
+      ? fetchRepos.repos.filter((r) =>
+          r.full_name.toLowerCase().includes(repoSearch.trim().toLowerCase()),
+        )
+      : [];
 
   return (
     <main className="max-w-2xl mx-auto px-6 py-8 space-y-6">
@@ -342,13 +439,106 @@ function ConnectRepoInner() {
               </summary>
 
               <div className="px-6 pb-6 pt-2 border-t border-border space-y-5">
-                <div>
-                  <label
-                    htmlFor="repo"
-                    className="block text-sm font-medium text-text mb-1.5"
-                  >
-                    Repository
-                  </label>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <label
+                      htmlFor="repo"
+                      className="block text-sm font-medium text-text"
+                    >
+                      Repository
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => void handleFetchMyRepos()}
+                      disabled={fetchRepos.kind === "loading"}
+                      className="text-xs px-2.5 py-1 rounded-md border border-border bg-card hover:bg-bg disabled:opacity-50"
+                    >
+                      {fetchRepos.kind === "loading"
+                        ? "Fetching…"
+                        : fetchRepos.kind === "ok"
+                          ? "Refresh"
+                          : "Fetch my repos"}
+                    </button>
+                  </div>
+
+                  {/* Selected repo badge (only when set) */}
+                  {repo && (
+                    <div className="flex items-center gap-2">
+                      <span
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-mono border border-border bg-bg"
+                        title={repo}
+                      >
+                        <span className="truncate max-w-[260px]">{repo}</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setRepo("");
+                            resetVerify();
+                          }}
+                          className="text-muted hover:text-text"
+                          aria-label="Clear selection"
+                          title="Clear selection"
+                        >
+                          ×
+                        </button>
+                      </span>
+                    </div>
+                  )}
+
+                  {/* Picker — only when we have OAuth-fetched repos */}
+                  {fetchRepos.kind === "ok" && (
+                    <div className="border border-border rounded-md overflow-hidden">
+                      <input
+                        type="text"
+                        value={repoSearch}
+                        onChange={(e) => setRepoSearch(e.target.value)}
+                        placeholder={`Search ${fetchRepos.repos.length} repos…`}
+                        className="w-full bg-card px-3 py-2 text-xs font-mono border-b border-border focus:outline-none"
+                      />
+                      <div className="max-h-52 overflow-y-auto bg-card">
+                        {filteredRepos.length === 0 ? (
+                          <div className="px-3 py-3 text-xs text-muted">
+                            No matches.
+                          </div>
+                        ) : (
+                          filteredRepos.map((r) => (
+                            <button
+                              key={r.full_name}
+                              type="button"
+                              onClick={() => {
+                                setRepo(r.full_name);
+                                resetVerify();
+                              }}
+                              className="w-full text-left px-3 py-1.5 text-xs font-mono hover:bg-bg flex items-center justify-between gap-2"
+                            >
+                              <span className="truncate">{r.full_name}</span>
+                              {r.private && (
+                                <span className="text-[10px] uppercase text-muted">
+                                  private
+                                </span>
+                              )}
+                            </button>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {fetchRepos.kind === "fallback" && (
+                    <p
+                      className="text-xs px-3 py-2 rounded-md border"
+                      style={{
+                        borderColor: "#fde68a",
+                        backgroundColor: "#fffbeb",
+                        color: "#92400e",
+                      }}
+                    >
+                      {fetchRepos.message}
+                    </p>
+                  )}
+
+                  {/* Manual input — always available as fallback /
+                      override, pre-filled when a row was picked. */}
                   <input
                     id="repo"
                     type="text"
@@ -362,8 +552,9 @@ function ConnectRepoInner() {
                     placeholder="e.g. HarshBti1805/HackHelix-LLMHallucination"
                     className="w-full bg-card border border-border rounded-md px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent"
                   />
-                  <p className="text-xs text-muted mt-1.5">
-                    Format: <code className="font-mono">owner/name</code>
+                  <p className="text-xs text-muted">
+                    Format: <code className="font-mono">owner/name</code>. Click{" "}
+                    <em>Fetch my repos</em> to pick from a list instead.
                   </p>
                 </div>
 

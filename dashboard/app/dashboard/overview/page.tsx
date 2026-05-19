@@ -268,6 +268,39 @@ export default async function DashboardOverviewPage({
         <SeverityChart data={severity} />
         <ActivityChart data={activity} />
       </section>
+
+      {/* Floating chat launcher. Anchored to the viewport (fixed),
+          right-aligned, above the bottom edge. Pure CSS — no JS needed
+          because the destination is server-rendered. */}
+      <Link
+        href="/dashboard/chat"
+        aria-label="Open repository chat"
+        title="Ask the agent about your repos"
+        className="fixed bottom-6 right-6 z-30 flex items-center gap-2 px-4 py-3 rounded-full shadow-lg text-sm font-medium text-white hover:opacity-90 transition"
+        style={{ backgroundColor: "#4338ca" }}
+      >
+        <ChatBubbleIcon />
+        <span className="hidden sm:inline">Ask the agent</span>
+      </Link>
     </main>
+  );
+}
+
+function ChatBubbleIcon() {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      width={18}
+      height={18}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
+    </svg>
   );
 }

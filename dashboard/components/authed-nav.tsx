@@ -24,6 +24,7 @@ interface AuthedNavProps {
 
 const LINKS: ReadonlyArray<{ href: string; label: string }> = [
   { href: "/dashboard/overview", label: "overview" },
+  { href: "/dashboard/chat", label: "chat" },
   { href: "/dashboard/repos", label: "repos" },
   // Cross-link to the public demo pages — same data, no scoping yet
   // (see /dashboard/overview header for the explanation). Keeps the

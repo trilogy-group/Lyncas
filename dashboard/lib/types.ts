@@ -121,6 +121,11 @@ export interface UserProfile {
   repo_limit: number;
 }
 
+// How a watched_repos row authenticates against GitHub. Migration 011
+// adds the github_app variant alongside the original PAT path. The
+// agent picks the credential by reading this column.
+export type WatchedRepoTokenType = "pat" | "github_app";
+
 export interface WatchedRepo {
   id: string;
   created_at: string;
@@ -130,6 +135,29 @@ export interface WatchedRepo {
   // never reads it back to the browser. Server-side code that needs it
   // queries Supabase directly with an explicit select('github_token').
   enabled: boolean;
+  // Non-null only when token_type='github_app'. References
+  // github_app_installations.installation_id (the GitHub-issued id,
+  // not our internal uuid).
+  github_installation_id: number | null;
+  token_type: WatchedRepoTokenType;
+}
+
+// Mirrors agent/migrations/011_github_app.sql. One row per GitHub App
+// install per user; many watched_repos rows can share an installation.
+export type GitHubAccountType = "User" | "Organization";
+
+export interface GitHubAppInstallation {
+  id: string;
+  created_at: string;
+  user_id: string;
+  // GitHub's numeric id, not our uuid. Used as a foreign key from
+  // watched_repos.github_installation_id and as the path param when
+  // minting installation access tokens.
+  installation_id: number;
+  account_login: string;
+  account_type: GitHubAccountType;
+  repos_selected: string[];
+  suspended_at: string | null;
 }
 
 // --- Phase 9: per-repo rules ---------------------------------------------

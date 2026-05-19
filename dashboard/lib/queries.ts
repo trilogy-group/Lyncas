@@ -14,6 +14,7 @@ import type {
   PromptTunerRun,
   RepoRule,
   RepoRulesStatus,
+  GitHubAppInstallation,
   RepoStat,
   Review,
   Run,
@@ -690,9 +691,65 @@ export async function getWatchedRepos(
   const supabase = await createSupabaseServerClient();
   const { data, error } = await supabase
     .from("watched_repos")
-    .select("id, created_at, user_id, repo, enabled")
+    .select(
+      "id, created_at, user_id, repo, enabled, github_installation_id, token_type",
+    )
     .eq("user_id", userId)
     .order("created_at", { ascending: false });
   if (error) return [];
-  return (data ?? []) as unknown as WatchedRepo[];
+  // Pre-011 rows have neither column; coerce them to the PAT shape so
+  // downstream code can rely on the discriminator being set.
+  return ((data ?? []) as unknown as Array<Partial<WatchedRepo>>).map(
+    (r) => ({
+      id: r.id!,
+      created_at: r.created_at!,
+      user_id: r.user_id!,
+      repo: r.repo!,
+      enabled: r.enabled ?? true,
+      github_installation_id: r.github_installation_id ?? null,
+      token_type: (r.token_type as WatchedRepo["token_type"]) ?? "pat",
+    }),
+  );
+}
+
+// --- v2 SaaS: GitHub App installations -----------------------------------
+// Used by /dashboard/connect-repo (post-install reconciliation) and by
+// /auth/github-app/callback (the upsert path). Service-role would also
+// work here but we deliberately stay on the user's anon-keyed client so
+// RLS enforces "you can only see your own installations".
+
+export async function getGitHubAppInstallations(
+  userId: string,
+): Promise<GitHubAppInstallation[]> {
+  const supabase = await createSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("github_app_installations")
+    .select("*")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false });
+  if (error) return [];
+  return (data ?? []) as unknown as GitHubAppInstallation[];
+}
+
+/**
+ * Upsert one installation row, keyed on installation_id. The user_id
+ * column is part of the payload (and the RLS WITH CHECK clause
+ * enforces that the caller's auth.uid() matches), so an attacker
+ * can't steal another user's install by guessing a numeric id.
+ */
+export async function upsertInstallation(
+  data: Pick<
+    GitHubAppInstallation,
+    | "user_id"
+    | "installation_id"
+    | "account_login"
+    | "account_type"
+    | "repos_selected"
+  >,
+): Promise<void> {
+  const supabase = await createSupabaseServerClient();
+  const { error } = await supabase
+    .from("github_app_installations")
+    .upsert(data, { onConflict: "installation_id" });
+  if (error) throw error;
 }

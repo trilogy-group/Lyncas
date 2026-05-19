@@ -36,18 +36,26 @@ interface AppConfig {
 
 // Centralized config read so a missing env throws once with a clear
 // message rather than landing as a cryptic jwt.sign error inside
-// node-jsonwebtoken. The Vercel env panel strips newlines from
-// multiline values, so private keys are stored with literal `\n`
-// sequences and decoded at read time.
+// node-jsonwebtoken.
+//
+// Vercel accepts the private key in either shape:
+//   * Single-line with literal `\n` between PEM lines — common when
+//     pasted via the CLI / API or copied from a `.env.local`.
+//   * Multi-line with actual newlines — what Vercel's web UI
+//     produces when you paste the raw .pem contents into the
+//     multiline textarea.
+// Replacing `\\n` first is a no-op on the multi-line variant (it
+// has no literal backslash-n sequences), then `.trim()` strips any
+// trailing newline the UI tends to add. Either path yields a PEM
+// that node-jsonwebtoken accepts.
 function appConfig(): AppConfig {
   const appId = process.env.GITHUB_APP_ID;
-  const rawKey = process.env.GITHUB_APP_PRIVATE_KEY;
   if (!appId) throw new Error("GITHUB_APP_ID env var is not set");
-  if (!rawKey) throw new Error("GITHUB_APP_PRIVATE_KEY env var is not set");
-  return {
-    appId,
-    privateKey: rawKey.replace(/\\n/g, "\n"),
-  };
+  const privateKey = (process.env.GITHUB_APP_PRIVATE_KEY || "")
+    .replace(/\\n/g, "\n")
+    .trim();
+  if (!privateKey) throw new Error("GITHUB_APP_PRIVATE_KEY env var is not set");
+  return { appId, privateKey };
 }
 
 /**

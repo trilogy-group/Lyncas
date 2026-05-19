@@ -6,12 +6,43 @@ export type Confidence = "high" | "medium" | "low";
 export type Action = "commented" | "closed";
 export type BugSeverity = "high" | "medium" | "low";
 
+// The agent's JSON schema (see agent/review_graph.py) emits a richer
+// `severity` set than just high/medium/low — "critical" shows up on
+// reviewer + critic node output before being normalised. Accepting it
+// here means we can render legacy rows without dropping them, and the
+// SEVERITY_COLOR_MAP in pr-detail.tsx maps "critical" onto "high".
+export type BugSeverityRaw = BugSeverity | "critical";
+
 export interface Bug {
-  severity: BugSeverity;
+  severity: BugSeverityRaw;
   file: string;
   issue: string;
-  suggestion?: string;
+  // The agent always writes these for new rows (see prompt template) but
+  // older rows from before 005_langgraph_outputs may have them missing —
+  // hence optional. The dashboard surfaces them when present.
+  line_hint?: string | null;
+  impact?: string | null;
+  suggestion?: string | null;
+  reference?: string | null;
 }
+
+// `concerns` is declared as a string[] in the SQL schema but the agent
+// JSON schema (review_graph.py) emits structured concern objects with
+// the same field set as bugs. So old rows are plain strings, new rows
+// are objects. The renderer accepts both. Same defensive widening for
+// `questions` / `praise` since the prompt is free to upgrade them later
+// without a migration.
+export type Concern =
+  | string
+  | {
+      file?: string;
+      line_hint?: string | null;
+      severity?: BugSeverityRaw;
+      issue?: string;
+      impact?: string | null;
+      suggestion?: string | null;
+      reference?: string | null;
+    };
 
 export interface RunError {
   repo?: string;
@@ -33,9 +64,9 @@ export interface Review {
   summary: string;
   bug_count: number;
   bugs: Bug[] | null;
-  concerns: string[] | null;
-  questions: string[] | null;
-  praise: string[] | null;
+  concerns: Concern[] | null;
+  questions: Concern[] | null;
+  praise: Concern[] | null;
   action: Action;
   gate_reason: string | null;
   input_tokens: number | null;

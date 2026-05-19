@@ -61,7 +61,11 @@ export default async function LearningPage() {
       <SectionHeading
         eyebrow="Learning"
         title="How the agent improves"
-        subtitle="How often the agent agrees with you, and where it doesn't."
+        subtitle={
+          <>
+            How often the agent agrees with you, and where it doesn&apos;t.
+          </>
+        }
       />
 
       {alerts.length > 0 && (
@@ -141,7 +145,7 @@ export default async function LearningPage() {
 
       <section className="space-y-3">
         <div>
-          <h2 className="text-lg font-semibold">Recent misses</h2>
+          <h2 className="text-lg font-semibold text-white tracking-tight">Recent misses</h2>
           <p className="text-[11px] font-mono uppercase tracking-[0.14em] text-muted">
             false_close + missed_issue · these drive prompt improvements
           </p>
@@ -195,7 +199,7 @@ export default async function LearningPage() {
 
       <section className="space-y-3">
         <div>
-          <h2 className="text-lg font-semibold">Pending prompt improvements</h2>
+          <h2 className="text-lg font-semibold text-white tracking-tight">Pending prompt improvements</h2>
           <p className="text-[11px] font-mono uppercase tracking-[0.14em] text-muted">
             open PRs from the prompt-tuner agent · each one proposes a{" "}
             <code className="rounded-sm border border-border bg-bg-elev px-1 py-0.5 normal-case tracking-normal">

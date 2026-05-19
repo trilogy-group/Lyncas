@@ -9,6 +9,7 @@ import {
   useState,
 } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { motion } from "framer-motion";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Container } from "@/components/ui/container";
@@ -2209,13 +2210,18 @@ function MessageBubble({
   }
 
   return (
-    <div className={"flex flex-col " + (isUser ? "items-end" : "items-start")}>
+    <motion.div
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
+      className={"flex flex-col " + (isUser ? "items-end" : "items-start")}
+    >
       <div
         className={
-          "max-w-[85%] rounded-sm px-3.5 py-2 text-sm sm:max-w-[80%] " +
+          "max-w-[85%] rounded-md px-3.5 py-2.5 text-sm sm:max-w-[80%] shadow-[0_1px_0_rgba(255,255,255,0.04)_inset] " +
           (isUser
             ? "bg-white text-black"
-            : "border border-border bg-bg-elev text-text")
+            : "border border-border bg-bg-elev text-white")
         }
       >
         {isPendingAssistant ? (
@@ -2239,13 +2245,13 @@ function MessageBubble({
           <button
             type="button"
             onClick={copy}
-            className="font-mono text-[10px] text-muted hover:text-text"
+            className="font-mono text-[10px] text-muted hover:text-white transition-colors"
           >
             {copied ? "copied" : "copy"}
           </button>
         )}
       </div>
-    </div>
+    </motion.div>
   );
 }
 

@@ -39,7 +39,12 @@ export default async function ReposPage() {
       <SectionHeading
         eyebrow="Repos"
         title="All watched repositories"
-        subtitle="One row per watched repo · totals are all-time · cost window is 30d."
+        subtitle={
+          <>
+            One row per watched repo · totals are all-time · cost window is{" "}
+            <span className="text-white">30d</span>.
+          </>
+        }
       />
 
       {repos.length === 0 ? (

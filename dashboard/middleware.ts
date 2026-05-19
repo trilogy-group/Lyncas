@@ -19,10 +19,19 @@ import { NextResponse, type NextRequest } from "next/server";
 const PROTECTED_PREFIX = "/dashboard";
 
 export async function middleware(request: NextRequest) {
+  // Forward the current pathname as an `x-pathname` request header so
+  // server components (e.g. the auth-aware <Nav>) can branch on the
+  // route without becoming client components. Next.js doesn't expose
+  // the pathname to RSCs natively, so we copy it in here.
+  const requestHeaders = new Headers(request.headers);
+  requestHeaders.set("x-pathname", request.nextUrl.pathname);
+
   // Start with a passthrough response. The Supabase SSR cookie adapter
   // needs both `request` and `response` so it can read the incoming
   // cookies AND write refreshed cookies back to the browser.
-  let response = NextResponse.next({ request });
+  let response = NextResponse.next({
+    request: { headers: requestHeaders },
+  });
 
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
@@ -43,7 +52,9 @@ export async function middleware(request: NextRequest) {
         for (const { name, value } of cookiesToSet) {
           request.cookies.set(name, value);
         }
-        response = NextResponse.next({ request });
+        response = NextResponse.next({
+          request: { headers: requestHeaders },
+        });
         for (const { name, value, options } of cookiesToSet) {
           response.cookies.set(name, value, options);
         }

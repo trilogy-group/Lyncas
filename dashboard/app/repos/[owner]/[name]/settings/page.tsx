@@ -278,7 +278,7 @@ export default function RepoSettingsPage({ params }: PageProps) {
         </Link>
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div className="min-w-0">
-            <h1 className="truncate font-mono text-xl font-semibold text-text">
+            <h1 className="truncate font-mono text-xl font-semibold text-white tracking-tight">
               {repo}
             </h1>
             <p className="mt-1 text-xs text-muted">

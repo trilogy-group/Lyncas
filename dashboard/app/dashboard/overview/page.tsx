@@ -4,6 +4,7 @@ import { Filters } from "@/components/filters";
 import { ReviewsTable } from "@/components/reviews-table";
 import { SeverityChart } from "@/components/severity-chart";
 import { Container } from "@/components/ui/container";
+import { Stagger, StaggerItem } from "@/components/ui/motion";
 import { SectionHeading } from "@/components/ui/section-heading";
 import { StatCard } from "@/components/ui/stat-card";
 import { Table, TableBody, TableHeader, Td, Th } from "@/components/ui/table";
@@ -20,12 +21,8 @@ import {
 import type { Action, Verdict } from "@/lib/types";
 
 // /dashboard/overview — the authenticated user's "everything the agent
-// has seen" surface. Same shape as the v1 root overview, redrawn for
-// the v3 dark-mode/E2B aesthetic.
-//
-// The fixed-position chat launcher that used to sit bottom-right was
-// removed per the v3 product brief — chat is now first-class in the
-// nav, accessible via the brand mark + Chat link.
+// has seen" surface. Black/E2B v3 aesthetic, with one inverted stat
+// card (Total reviews) to break up the row visually.
 
 export const dynamic = "force-dynamic";
 
@@ -107,66 +104,77 @@ export default async function DashboardOverviewPage({
   const lastShown = (page - 1) * PAGE_SIZE + recent.reviews.length;
 
   return (
-    <Container className="py-10 space-y-10">
+    <Container className="py-10 space-y-12">
       <SectionHeading
         eyebrow="Overview"
         title="Everything the agent has seen"
         subtitle="Live feed across every connected repository."
       />
 
-      <section className="grid grid-cols-2 lg:grid-cols-5 gap-3">
-        <StatCard label="Total reviews" value={String(stats.totalReviews)} />
-        <StatCard
-          label="Auto-closed"
-          value={String(stats.totalClosed)}
-          accent={
-            stats.totalClosed > 0 ? severityColors.critical : undefined
-          }
-        />
-        <StatCard
-          label="Avg severity (30d)"
-          value={stats.avgSeverity ? stats.avgSeverity.toFixed(1) : "—"}
-          hint="out of 10"
-        />
-        <StatCard
-          label="Est. cost (30d)"
-          value={formatCost(stats.estimatedCostUSD)}
-          hint="claude opus-4-5"
-        />
-        <StatCard
-          label="Agent accuracy (30d)"
-          value={
-            accuracy.total_non_pending > 0
-              ? `${accuracy.accuracy_pct.toFixed(0)}%`
-              : "—"
-          }
-          hint={
-            accuracy.total_non_pending > 0
-              ? `${accuracy.agreements} / ${accuracy.total_non_pending}`
-              : "no settled obs yet"
-          }
-          accent={
-            accuracy.total_non_pending > 0 && accuracy.accuracy_pct < 95
-              ? severityColors.serious
-              : undefined
-          }
-        />
-      </section>
+      {/* KPI row — one inverted card to break up the rhythm. */}
+      <Stagger className="grid grid-cols-2 gap-3 lg:grid-cols-5" whenInView>
+        <StaggerItem>
+          <StatCard label="Total reviews" value={String(stats.totalReviews)} invert />
+        </StaggerItem>
+        <StaggerItem>
+          <StatCard
+            label="Auto-closed"
+            value={String(stats.totalClosed)}
+            accent={stats.totalClosed > 0 ? severityColors.critical : undefined}
+          />
+        </StaggerItem>
+        <StaggerItem>
+          <StatCard
+            label="Avg severity (30d)"
+            value={stats.avgSeverity ? stats.avgSeverity.toFixed(1) : "—"}
+            hint="out of 10"
+          />
+        </StaggerItem>
+        <StaggerItem>
+          <StatCard
+            label="Est. cost (30d)"
+            value={formatCost(stats.estimatedCostUSD)}
+            hint="claude opus-4-5"
+          />
+        </StaggerItem>
+        <StaggerItem>
+          <StatCard
+            label="Agent accuracy (30d)"
+            value={
+              accuracy.total_non_pending > 0
+                ? `${accuracy.accuracy_pct.toFixed(0)}%`
+                : "—"
+            }
+            hint={
+              accuracy.total_non_pending > 0
+                ? `${accuracy.agreements} / ${accuracy.total_non_pending}`
+                : "no settled obs yet"
+            }
+            accent={
+              accuracy.total_non_pending > 0 && accuracy.accuracy_pct < 95
+                ? severityColors.serious
+                : undefined
+            }
+          />
+        </StaggerItem>
+      </Stagger>
 
       {repoStats.length > 0 && (
         <section className="space-y-3">
-          <div>
-            <h2 className="text-lg font-semibold">By repo</h2>
-            <p className="text-[11px] text-muted font-mono uppercase tracking-[0.14em]">
-              {repoStats.length}
-              {repoStats.length === 1 ? " repo" : " repos"} watched ·{" "}
-              <Link
-                href="/dashboard/repos"
-                className="underline underline-offset-4 hover:text-text"
-              >
-                full breakdown →
-              </Link>
-            </p>
+          <div className="flex flex-wrap items-end justify-between gap-2">
+            <div>
+              <h2 className="text-lg font-semibold text-white">By repo</h2>
+              <p className="text-[11px] text-muted font-mono uppercase tracking-[0.14em]">
+                {repoStats.length}
+                {repoStats.length === 1 ? " repo" : " repos"} watched
+              </p>
+            </div>
+            <Link
+              href="/dashboard/repos"
+              className="text-[11px] font-mono uppercase tracking-[0.14em] text-muted hover:text-white transition-colors"
+            >
+              full breakdown →
+            </Link>
           </div>
           <Table>
             <TableHeader>
@@ -183,16 +191,16 @@ export default async function DashboardOverviewPage({
                   <Td className="font-mono text-xs">
                     <Link
                       href={`/dashboard/overview?repo=${encodeURIComponent(r.repo)}`}
-                      className="text-text hover:underline underline-offset-4"
+                      className="text-white hover:underline underline-offset-4"
                     >
                       {r.repo}
                     </Link>
                   </Td>
-                  <Td className="text-right font-mono text-xs">
+                  <Td className="text-right font-mono text-xs tabular-nums">
                     {r.total_reviews}
                   </Td>
                   <Td
-                    className="text-right font-mono text-xs"
+                    className="text-right font-mono text-xs tabular-nums"
                     style={
                       r.total_closed > 0
                         ? { color: severityColors.critical }
@@ -202,7 +210,7 @@ export default async function DashboardOverviewPage({
                     {r.total_closed}
                   </Td>
                   <Td
-                    className="text-right font-mono text-xs"
+                    className="text-right font-mono text-xs tabular-nums"
                     style={
                       r.avg_severity
                         ? { color: severityColor(r.avg_severity) }
@@ -221,7 +229,7 @@ export default async function DashboardOverviewPage({
       <section className="space-y-4">
         <div className="flex flex-wrap items-end justify-between gap-4">
           <div>
-            <h2 className="text-lg font-semibold">Recent reviews</h2>
+            <h2 className="text-lg font-semibold text-white">Recent reviews</h2>
             <p className="text-[11px] text-muted font-mono uppercase tracking-[0.14em]">
               {recent.totalCount} total · page {page} of {totalPages}
             </p>
@@ -244,7 +252,7 @@ export default async function DashboardOverviewPage({
             {page > 1 && (
               <Link
                 href={pageLink(page - 1)}
-                className="rounded-sm border border-border px-3 py-1.5 hover:border-border-strong hover:text-text"
+                className="rounded-sm border border-border px-3 py-1.5 hover:border-border-strong hover:text-white transition-colors"
               >
                 ← prev
               </Link>
@@ -252,7 +260,7 @@ export default async function DashboardOverviewPage({
             {page < totalPages && (
               <Link
                 href={pageLink(page + 1)}
-                className="rounded-sm border border-border px-3 py-1.5 hover:border-border-strong hover:text-text"
+                className="rounded-sm border border-border px-3 py-1.5 hover:border-border-strong hover:text-white transition-colors"
               >
                 next →
               </Link>

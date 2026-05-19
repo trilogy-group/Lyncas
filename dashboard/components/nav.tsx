@@ -1,20 +1,41 @@
-"use client";
+import { headers } from "next/headers";
+import { NavBar, type NavLinkSpec, type NavUser } from "./nav-bar";
+import { getUser } from "@/lib/supabase/server";
+import { getUserProfile } from "@/lib/queries";
 
-import Link from "next/link";
-import { usePathname } from "next/navigation";
-import { BrandMark } from "./ui/brand";
-import { LinkButton } from "./ui/button";
+// Server-side Nav mount. Reads the current pathname from the proxy
+// header set by middleware (so this stays a server component and we
+// can fetch the user once per request without hydration mismatches)
+// and the Supabase user so the bar reflects logged-in / logged-out
+// chrome consistently across every non-dashboard page.
+//
+// Hidden routes — these ship their own chrome:
+//   /landing                       — marketing nav
+//   /login, /auth/callback         — auth-only screens
+//   /dashboard/*                   — AuthedNav from dashboard/layout
+//
+// Everything else (the v1 demo: /, /repos, /runs, /benchmark, /settings,
+// /learning, /pr/[id]) renders this bar.
 
-// Public demo nav. Hidden on:
-//   /login, /landing                — they ship their own chrome.
-//   /dashboard/*, /auth/callback    — the authenticated shell renders
-//                                     AuthedNav instead.
-// Everything else (the legacy demo: /, /repos, /runs, /benchmark,
-// /settings, /learning, /pr/[id]) keeps this nav.
+const HIDDEN_PREFIXES = [
+  "/login",
+  "/landing",
+  "/dashboard",
+  "/auth/callback",
+  "/auth/github-app",
+];
 
-const HIDDEN_PREFIXES = ["/login", "/landing", "/dashboard", "/auth/callback"];
+const LOGGED_IN_LINKS: NavLinkSpec[] = [
+  { href: "/dashboard/chat", label: "Chat" },
+  { href: "/dashboard/overview", label: "Overview" },
+  { href: "/dashboard/repos", label: "Repos" },
+  { href: "/runs", label: "Runs" },
+  { href: "/learning", label: "Learning" },
+  { href: "/benchmark", label: "Benchmark" },
+  { href: "/dashboard/settings", label: "Settings" },
+];
 
-const LINKS: ReadonlyArray<{ href: string; label: string }> = [
+const LOGGED_OUT_LINKS: NavLinkSpec[] = [
   { href: "/", label: "Overview" },
   { href: "/repos", label: "Repos" },
   { href: "/runs", label: "Runs" },
@@ -23,47 +44,46 @@ const LINKS: ReadonlyArray<{ href: string; label: string }> = [
   { href: "/settings", label: "Settings" },
 ];
 
-export function Nav() {
-  const pathname = usePathname() ?? "/";
-  if (HIDDEN_PREFIXES.some((p) => pathname === p || pathname.startsWith(p + "/"))) {
+async function readPathname(): Promise<string> {
+  // next-url header is set by Next.js on every request and reads as
+  // the path the user actually requested (rewrites included). Falls
+  // back to "/" if missing so we never crash on the edge of a config
+  // change.
+  const h = await headers();
+  const url = h.get("x-pathname") ?? h.get("next-url") ?? "/";
+  // next-url sometimes carries query/hash — strip them.
+  try {
+    return new URL(url, "http://localhost").pathname || "/";
+  } catch {
+    return "/";
+  }
+}
+
+export async function Nav() {
+  const pathname = await readPathname();
+  if (
+    HIDDEN_PREFIXES.some(
+      (p) => pathname === p || pathname.startsWith(p + "/"),
+    )
+  ) {
     return null;
   }
 
+  const user = await getUser().catch(() => null);
+  let navUser: NavUser | null = null;
+  if (user) {
+    const profile = await getUserProfile(user.id).catch(() => null);
+    navUser = {
+      email: profile?.email ?? user.email ?? null,
+      displayName: profile?.display_name ?? profile?.github_username ?? null,
+      avatarUrl: profile?.avatar_url ?? null,
+    };
+  }
+
   return (
-    <nav className="border-b border-border bg-bg">
-      <div className="mx-auto flex h-14 max-w-7xl items-center justify-between gap-4 px-4 sm:px-6">
-        <div className="flex items-center gap-8">
-          <BrandMark href="/" />
-          <div className="hidden md:flex items-center gap-6 text-[11px] font-mono uppercase tracking-[0.14em]">
-            {LINKS.map((l) => {
-              const active =
-                pathname === l.href ||
-                (l.href !== "/" && pathname.startsWith(l.href + "/"));
-              return (
-                <Link
-                  key={l.href}
-                  href={l.href}
-                  className={
-                    active
-                      ? "text-text underline underline-offset-[6px] decoration-text/40 hover:decoration-text"
-                      : "text-muted hover:text-text transition-colors"
-                  }
-                >
-                  {l.label}
-                </Link>
-              );
-            })}
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <LinkButton href="/login" size="sm" variant="default">
-            Sign in
-          </LinkButton>
-          <LinkButton href="/login" size="sm" variant="primary">
-            Sign up
-          </LinkButton>
-        </div>
-      </div>
-    </nav>
+    <NavBar
+      user={navUser}
+      links={navUser ? LOGGED_IN_LINKS : LOGGED_OUT_LINKS}
+    />
   );
 }

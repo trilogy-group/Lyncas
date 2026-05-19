@@ -41,8 +41,8 @@ export default async function DashboardReposPage() {
           title="Your repositories"
           subtitle={
             <>
-              {watched.length} watched · managed via the Night PR Reviewer
-              GitHub App
+              <span className="text-white font-medium">{watched.length}</span>{" "}
+              watched · managed via the Night PR Reviewer GitHub App.
             </>
           }
         />
@@ -54,10 +54,10 @@ export default async function DashboardReposPage() {
       </section>
 
       {watched.length === 0 ? (
-        <Card className="p-12 text-center space-y-4">
-          <p className="text-sm text-muted">
-            No repositories connected yet. Install the GitHub App and pick
-            the repos you want reviewed — GitHub will bring you back here.
+        <Card className="p-12 text-center space-y-5" tone="elev">
+          <p className="text-sm text-muted-strong">
+            No repositories connected yet. Install the GitHub App and pick the
+            repos you want reviewed — GitHub will bring you back here.
           </p>
           {installUrl && (
             <div className="flex justify-center">
@@ -88,12 +88,12 @@ export default async function DashboardReposPage() {
                       aria-hidden
                       className="inline-block h-2 w-2 rounded-full"
                       style={{
-                        backgroundColor: r.enabled ? "#4ade80" : "#ff5252",
+                        backgroundColor: r.enabled ? "#58e684" : "#ff5a5a",
                       }}
                     />
                     <Link
                       href={`/dashboard/overview?repo=${encodeURIComponent(r.repo)}`}
-                      className="text-text hover:underline underline-offset-4"
+                      className="text-white hover:underline underline-offset-4"
                     >
                       {r.repo}
                     </Link>
@@ -102,7 +102,7 @@ export default async function DashboardReposPage() {
                       target="_blank"
                       rel="noreferrer"
                       title="Open on GitHub"
-                      className="text-muted hover:text-text"
+                      className="text-muted hover:text-white"
                     >
                       ↗
                     </a>
@@ -110,9 +110,9 @@ export default async function DashboardReposPage() {
                 </Td>
                 <Td className="font-mono text-xs uppercase tracking-[0.14em]">
                   {r.enabled ? (
-                    <span style={{ color: "#4ade80" }}>active</span>
+                    <span style={{ color: "#58e684" }}>active</span>
                   ) : (
-                    <span style={{ color: "#ff5252" }}>paused</span>
+                    <span style={{ color: "#ff5a5a" }}>paused</span>
                   )}
                 </Td>
                 <Td className="whitespace-nowrap font-mono text-xs text-muted">
@@ -121,7 +121,7 @@ export default async function DashboardReposPage() {
                 <Td className="whitespace-nowrap text-right font-mono text-xs">
                   <Link
                     href={`/repos/${r.repo}/settings`}
-                    className="text-text hover:underline underline-offset-4"
+                    className="text-white hover:underline underline-offset-4"
                     title={`Configure ${r.repo}`}
                   >
                     ⚙ Configure

@@ -341,8 +341,10 @@ export default async function BenchmarkPage() {
         eyebrow="Benchmark"
         title="Sonnet vs Opus"
         subtitle={
-          <>Comparing two models on the same diffs with the same prompt. n=
-          {stats.sample_size}.</>
+          <>
+            Two models, same diffs, same prompt.{" "}
+            <span className="font-mono text-white">n={stats.sample_size}</span>.
+          </>
         }
       />
 

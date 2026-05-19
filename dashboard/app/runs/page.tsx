@@ -14,7 +14,12 @@ export default async function RunsPage() {
       <SectionHeading
         eyebrow="Runs"
         title="Agent runs"
-        subtitle="Last 50 invocations of the cron-driven reviewer."
+        subtitle={
+          <>
+            Last <span className="text-white font-medium">50</span> invocations
+            of the cron-driven reviewer.
+          </>
+        }
       />
 
       {runs.length === 0 ? (

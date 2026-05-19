@@ -3,12 +3,13 @@
 import Link from "next/link";
 import { useState, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
+import { motion } from "framer-motion";
 import { BrandMark } from "@/components/ui/brand";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 
-// Login page — black, monospace, two paths:
+// Login page — black, monospace, motion-eased entrance, two paths:
 //   1. Continue with GitHub  → Supabase Auth OAuth (returns to
 //                              /auth/callback).
 //   2. Continue with Email   → magic link (signInWithOtp).
@@ -21,6 +22,8 @@ function siteUrl(): string {
   if (typeof window !== "undefined") return window.location.origin;
   return "";
 }
+
+const EASE = [0.16, 1, 0.3, 1] as const;
 
 function LoginInner() {
   const params = useSearchParams();
@@ -77,15 +80,20 @@ function LoginInner() {
   }
 
   return (
-    <main className="relative min-h-screen flex items-center justify-center bg-bg text-text px-4 dot-grid">
-      <div className="w-full max-w-md space-y-8 animate-fade-up">
+    <main className="relative min-h-screen flex items-center justify-center bg-bg bg-noise text-text px-4 dot-grid">
+      <motion.div
+        initial={{ opacity: 0, y: 12 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.55, ease: EASE }}
+        className="w-full max-w-md space-y-8"
+      >
         <div className="text-center space-y-5">
           <BrandMark href="/landing" />
           <div>
-            <h1 className="font-mono font-bold uppercase tracking-tight text-3xl">
+            <h1 className="font-mono font-bold uppercase tracking-tight text-3xl text-white">
               Sign in
             </h1>
-            <p className="mt-2 text-sm text-muted">
+            <p className="mt-2 text-sm text-muted-strong">
               Autonomous code review for your repositories
             </p>
           </div>
@@ -93,12 +101,16 @@ function LoginInner() {
 
         <Card className="p-6 space-y-5">
           {emailSent ? (
-            <div className="text-center space-y-3 py-4">
-              <p className="text-sm font-medium">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              className="text-center space-y-3 py-4"
+            >
+              <p className="text-sm font-medium text-white">
                 Check your email for a magic link.
               </p>
-              <p className="text-xs text-muted">
-                We sent it to <span className="font-mono text-text">{email}</span>.
+              <p className="text-xs text-muted-strong">
+                We sent it to <span className="font-mono text-white">{email}</span>.
               </p>
               <button
                 type="button"
@@ -106,11 +118,11 @@ function LoginInner() {
                   setEmailSent(false);
                   setEmail("");
                 }}
-                className="text-xs text-muted underline underline-offset-4 hover:text-text"
+                className="text-xs text-muted underline underline-offset-4 hover:text-white transition-colors"
               >
                 Use a different email
               </button>
-            </div>
+            </motion.div>
           ) : (
             <>
               <Button
@@ -139,7 +151,7 @@ function LoginInner() {
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   placeholder="you@example.com"
-                  className="w-full bg-bg border border-border rounded-sm px-3 py-3 text-sm font-mono focus:outline-none focus:border-white transition-colors"
+                  className="w-full bg-bg border border-border rounded-sm px-3 py-3 text-sm font-mono text-white placeholder:text-muted focus:border-white focus:outline-none focus:ring-2 focus:ring-white/15 transition-colors"
                 />
                 <Button
                   type="submit"
@@ -154,7 +166,7 @@ function LoginInner() {
 
               {error && (
                 <p
-                  className="text-xs text-center text-[#ff5252] font-mono"
+                  className="text-xs text-center text-[#ff5a5a] font-mono"
                   role="alert"
                 >
                   {error}
@@ -165,11 +177,11 @@ function LoginInner() {
         </Card>
 
         <p className="text-[11px] font-mono uppercase tracking-[0.14em] text-center text-muted leading-relaxed">
-          <Link href="/landing" className="hover:text-text">
+          <Link href="/landing" className="hover:text-white transition-colors">
             ← Back to landing
           </Link>
         </p>
-      </div>
+      </motion.div>
     </main>
   );
 }

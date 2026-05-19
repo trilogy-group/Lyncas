@@ -27,7 +27,7 @@ export const metadata: Metadata = {
     "Autonomous code review for your GitHub repositories — powered by Claude Opus.",
 };
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
   return (
@@ -35,7 +35,9 @@ export default function RootLayout({
       lang="en"
       className={`${plexSans.variable} ${plexMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col bg-bg text-text">
+      <body className="min-h-full flex flex-col bg-bg text-text bg-noise">
+        {/* Nav is an async server component that branches on auth + */}
+        {/* hides itself on /dashboard, /landing, /login, etc. */}
         <Nav />
         <div className="flex-1">{children}</div>
       </body>

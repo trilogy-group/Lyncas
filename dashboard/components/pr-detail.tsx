@@ -66,18 +66,18 @@ export function PrDetail({
             href={review.pr_url}
             target="_blank"
             rel="noopener noreferrer"
-            className="text-text hover:underline underline-offset-4"
+            className="text-white hover:underline underline-offset-4"
           >
             {review.repo}#{review.pr_number} ↗
           </a>
           {review.pr_author && (
             <>
               {" · by "}
-              <span className="text-text">{review.pr_author}</span>
+              <span className="text-white">{review.pr_author}</span>
             </>
           )}
         </div>
-        <h1 className="text-2xl font-semibold leading-tight">
+        <h1 className="text-2xl sm:text-3xl font-semibold leading-tight tracking-tight text-white">
           {review.pr_title}
         </h1>
       </div>

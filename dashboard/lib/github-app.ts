@@ -57,14 +57,15 @@ function appConfig(): AppConfig {
     : rawKey;
   if (!privateKey) throw new Error("GITHUB_APP_PRIVATE_KEY env var is not set");
 
-  // TEMP debug — remove once the App JWT is confirmed working in prod.
-  // Expected output:
-  //   Key starts with: -----BEGIN RSA PRIVATE KEY
-  //   Key ends with:   END RSA PRIVATE KEY-----
-  // Safe to log because the markers are not secret; the entire key
-  // body is NOT logged.
-  console.log("Key starts with:", privateKey.substring(0, 27));
-  console.log("Key ends with:", privateKey.slice(-25));
+  // TEMP debug — single one-line classifier the Vercel logs can be
+  // grepped for. Expected output: `[github-app] key format: valid`.
+  // Anything else (most likely `INVALID`) means the env var contents
+  // got mangled: the PEM body is intentionally NOT logged so this
+  // line is safe to leave on until prod is happy.
+  console.log(
+    "[github-app] key format:",
+    privateKey.startsWith("-----BEGIN") ? "valid" : "INVALID",
+  );
 
   return { appId, privateKey };
 }

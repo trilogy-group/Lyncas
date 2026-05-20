@@ -22,6 +22,11 @@ const LINKS: NavLinkSpec[] = [
   { href: "/dashboard/chat", label: "Chat" },
   { href: "/dashboard/overview", label: "Overview" },
   { href: "/dashboard/repos", label: "Repos" },
+  // Reports (migration 018) — per-PR synthesis layer on top of the
+  // reviewer + sandbox signals. Placed after Repos because the
+  // mental model is "drill from a repo into its PRs"; ahead of
+  // Settings because it's a daily-driver surface, not a setup one.
+  { href: "/dashboard/reports", label: "Reports" },
   { href: "/dashboard/settings", label: "Settings" },
 ];
 

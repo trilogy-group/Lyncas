@@ -534,6 +534,74 @@ export type SandboxStep =
   | "app"
   | "complete";
 
+// --- Migration 018: PR analysis reports ----------------------------------
+// Synthesis layer on top of `reviews` + `pr_sandbox_results`. One row per
+// (repo, pr_number). Produced by agent/report_generator.py ~45s after a
+// webhook fires, persisted via SUPABASE_SERVICE_KEY (CLAUDE.md rule 5),
+// read by the dashboard's /dashboard/reports page and the chat sandbox
+// card's "View Report" button.
+//
+// Field shapes intentionally mirror the SQL column names rather than
+// adopting camelCase — matches the pattern set by `Review` / `Run` /
+// `SandboxResult`, so client code can pass rows straight from PostgREST
+// to the renderer without a remap.
+
+export type ReportVisionAlignment =
+  | "aligned"
+  | "neutral"
+  | "misaligned"
+  | "unknown";
+
+export type ReportMergeRecommendation =
+  | "merge"
+  | "request_changes"
+  | "reject"
+  | "needs_review";
+
+export type ReportMergeConfidence = "high" | "medium" | "low";
+
+export interface PrReport {
+  id: string;
+  repo: string;
+  pr_number: number;
+  pr_title: string | null;
+  pr_author: string | null;
+  user_id: string | null;
+  created_at: string;
+
+  // Synthesis fields produced by Claude.
+  what_it_adds: string | null;
+  use_case: string | null;
+  vision_alignment: ReportVisionAlignment | null;
+  vision_reasoning: string | null;
+
+  // Denormalized from `reviews`. review_bugs is the same `Bug[]`
+  // shape the reviewer emits — we keep it weakly typed here because
+  // the generator stores whatever was in `reviews.bugs` verbatim
+  // (which may include legacy/unknown fields).
+  review_verdict: string | null;
+  review_severity: number | null;
+  review_bugs: Bug[] | null;
+  review_summary: string | null;
+
+  // Denormalized from `pr_sandbox_results`. sandbox_overall mirrors
+  // the SandboxOverall enum but is intentionally typed as string |
+  // null here because the generator may store 'not_run' when no
+  // sandbox row materialized — a value the migration-015 CHECK
+  // forbids on pr_sandbox_results but tolerates on pr_reports.
+  sandbox_overall: string | null;
+  sandbox_tests_passed: number | null;
+  sandbox_tests_failed: number | null;
+  sandbox_build_success: boolean | null;
+  sandbox_app_url: string | null;
+
+  merge_recommendation: ReportMergeRecommendation | null;
+  merge_confidence: ReportMergeConfidence | null;
+  merge_reasoning: string | null;
+
+  report_markdown: string | null;
+}
+
 export interface SandboxProgressEvent {
   step: SandboxStep;
   status: "running" | "done" | "error";

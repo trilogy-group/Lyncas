@@ -11,6 +11,7 @@ import type {
   HumanAction,
   HumanActionType,
   HumanActionWithReview,
+  PrReport,
   PromptTunerRun,
   RepoResearch,
   RepoResearchArticle,
@@ -847,4 +848,50 @@ export async function getSandboxResultForPR(
     .maybeSingle();
   if (error) return null;
   return (data ?? null) as unknown as SandboxResult | null;
+}
+
+// --- Migration 018: PR analysis reports ----------------------------------
+// Reads from `pr_reports`. The table is RLS-permissive ("anon read") so
+// these helpers run on the user's anon-keyed client without needing the
+// service key. The actual ownership scope is enforced in the route /
+// page handlers above the call sites (they pass the user's
+// watched_repos list to getPrReports rather than letting an unfiltered
+// SELECT return every report in the database).
+
+export async function getPrReports(
+  repos: string[],
+  limit = 100,
+): Promise<PrReport[]> {
+  // Empty input is the "no watched repos yet" case. Short-circuiting
+  // avoids a PostgREST `in.()` call that would 400 on an empty list.
+  if (repos.length === 0) return [];
+  const supabase = await createSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("pr_reports")
+    .select("*")
+    .in("repo", repos)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+  if (error) {
+    // Soft-fail: a missing migration (table doesn't exist yet on a
+    // fresh DB) returns an empty list rather than 500-ing the
+    // /dashboard/reports page. The empty-state UI handles this.
+    return [];
+  }
+  return (data ?? []) as unknown as PrReport[];
+}
+
+export async function getPrReport(
+  repo: string,
+  prNumber: number,
+): Promise<PrReport | null> {
+  const supabase = await createSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("pr_reports")
+    .select("*")
+    .eq("repo", repo)
+    .eq("pr_number", prNumber)
+    .maybeSingle();
+  if (error) return null;
+  return (data ?? null) as unknown as PrReport | null;
 }

@@ -56,6 +56,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -73,7 +75,19 @@ AGENT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = AGENT_DIR.parent
 PR_REVIEWER_SCRIPT = AGENT_DIR / "pr_reviewer.py"
 DEVPOD_TESTER_SCRIPT = AGENT_DIR / "devpod_tester.py"
+REPORT_GENERATOR_SCRIPT = AGENT_DIR / "report_generator.py"
 VENV_PYTHON = AGENT_DIR / ".venv" / "bin" / "python"
+
+# Head-start the report generator gives the reviewer + sandbox before
+# starting to poll Supabase for their result rows. The reviewer
+# usually lands within ~30-60s on a webhook-triggered run; the
+# sandbox is slower. 45s avoids the case where wait_for_data() spins
+# its first few iterations on a row that doesn't exist yet, burning
+# the poll budget needlessly. The generator's own wait_for_data still
+# polls for up to 120s (reviewer) + 180s (sandbox) on top of this,
+# so the delay is purely an optimization — correctness doesn't
+# depend on it.
+REPORT_GENERATOR_DELAY_SEC = 45
 
 
 # --- HMAC verification ----------------------------------------------------
@@ -177,6 +191,58 @@ def get_active_devpod_session(repo: str) -> dict | None:
         return None
 
 
+# --- Report generator (delayed) ------------------------------------------
+
+def _spawn_report_delayed(env: dict, delay: int) -> None:
+    """Sleep `delay` seconds, then Popen the report generator.
+    Runs inside a daemon Thread spawned from dispatch_review.
+
+    Rationale for threading vs the more obvious approach of "let the
+    spawned report_generator.py sleep at its own startup": pushing
+    the sleep into the child means we'd hold a python process idle
+    for 45 seconds on every webhook delivery, which is wasteful on
+    a small EC2 box. Doing it in a thread means the cost is one
+    OS thread (sub-MB) for 45s, then a fresh interpreter for the
+    real work — same end state, an order of magnitude lighter.
+
+    The thread is daemon=True (caller passes daemon=True at start)
+    so a SIGTERM to the webhook server doesn't dangle a half-asleep
+    spawn. On systemd reload the in-flight reports are simply lost;
+    the webhook will redeliver any 'opened' / 'synchronize' event
+    that didn't get a 200, and the reviewer's idempotency marker
+    on the PR comment will keep it from double-reviewing."""
+    time.sleep(delay)
+    if not REPORT_GENERATOR_SCRIPT.exists():
+        print(
+            f"[webhook] report generator script missing at "
+            f"{REPORT_GENERATOR_SCRIPT}; skipping",
+            file=sys.stderr,
+        )
+        return
+    repo_label = env.get("PR_FILTER_REPO", "?")
+    pr_label = env.get("PR_FILTER_NUMBER", "?")
+    try:
+        proc = subprocess.Popen(
+            [str(VENV_PYTHON), str(REPORT_GENERATOR_SCRIPT)],
+            cwd=str(REPO_ROOT),
+            env=env,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
+        print(
+            f"[webhook] dispatched report generator for "
+            f"{repo_label}#{pr_label} (report_pid={proc.pid})"
+        )
+    except Exception as e:
+        # Mirrors the sandbox dispatch error path — a missing venv
+        # python or a bad script must not crash the webhook server.
+        print(
+            f"[webhook] report generator dispatch failed: "
+            f"{type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+
+
 # --- Reviewer + sandbox dispatch -----------------------------------------
 
 def dispatch_review(repo: str, pr_number: int) -> int:
@@ -239,6 +305,29 @@ def dispatch_review(repo: str, pr_number: int) -> int:
                 f"{type(e).__name__}: {e}",
                 file=sys.stderr,
             )
+
+    # Report generator. Fires regardless of whether the sandbox was
+    # dispatched — a report can still be useful from the review row
+    # alone (it'll just show "sandbox: not_run" in the body). The
+    # 45s delay lets the reviewer and sandbox accumulate something
+    # to synthesize from before the generator starts polling.
+    if REPORT_GENERATOR_SCRIPT.exists():
+        # Pass through ANTHROPIC_API_KEY + SUPABASE_URL + SUPABASE_SERVICE_KEY
+        # + GITHUB_TOKEN (or _PAT). They're already on env from
+        # os.environ.copy(); we just need to forward them as-is.
+        # PR_FILTER_REPO / PR_FILTER_NUMBER are already set above.
+        report_env = dict(env)
+        t = threading.Thread(
+            target=_spawn_report_delayed,
+            args=(report_env, REPORT_GENERATOR_DELAY_SEC),
+            daemon=True,
+            name=f"report-{repo}#{pr_number}",
+        )
+        t.start()
+        print(
+            f"[webhook] scheduled report generator for {repo}#{pr_number} "
+            f"in {REPORT_GENERATOR_DELAY_SEC}s"
+        )
     return proc.pid
 
 

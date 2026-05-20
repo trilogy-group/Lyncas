@@ -2,8 +2,10 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
+import { renderMarkdown } from "@/lib/markdown";
 import type {
   DevpodStatusResponse,
+  PrReport,
   SandboxProgressEvent,
   SandboxStep,
   SandboxVerdict,
@@ -180,6 +182,15 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
   const [dismissed, setDismissed] = useState(false);
   const [buildExpanded, setBuildExpanded] = useState(false);
 
+  // Report modal state (migration 018). Lazy-loaded on first
+  // click so we don't hit /api/reports until the user actually
+  // asks for it — the report row may not even exist yet (the
+  // generator runs ~45s after the sandbox, plus a Claude call).
+  const [reportOpen, setReportOpen] = useState(false);
+  const [reportLoading, setReportLoading] = useState(false);
+  const [report, setReport] = useState<PrReport | null>(null);
+  const [reportError, setReportError] = useState<string | null>(null);
+
   // One-shot liveness probe. The DevPod sidebar polls every 30s, so
   // we don't need to repeat that work here — a single check on
   // mount + a re-check whenever (repo, prNumber) changes is enough.
@@ -225,9 +236,65 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
       setFinal(INITIAL_FINAL);
       setDismissed(false);
       setBuildExpanded(false);
+      // Drop any cached report from the previous PR — its content
+      // is meaningless for the new PR even if both are in the
+      // same repo.
+      setReportOpen(false);
+      setReport(null);
+      setReportError(null);
+      setReportLoading(false);
     }
     lastKeyRef.current = k;
   }, [repo, prNumber, resetSteps]);
+
+  // Lazy-load the report on demand. Encodes the repo path because
+  // Next.js route segments can't contain a literal slash, so the
+  // /api/reports/[repo]/[pr_number] route expects an encoded
+  // "owner%2Fname".
+  const openReport = useCallback(async () => {
+    setReportOpen(true);
+    if (report || reportLoading) return;
+    setReportLoading(true);
+    setReportError(null);
+    try {
+      const r = await fetch(
+        `/api/reports/${encodeURIComponent(repo)}/${prNumber}`,
+        { cache: "no-store" },
+      );
+      if (r.status === 404) {
+        setReportError(
+          "Report not generated yet. Reports are produced ~45 seconds after a PR webhook fires; check back in a moment.",
+        );
+        return;
+      }
+      if (!r.ok) {
+        setReportError(`Could not load report (HTTP ${r.status}).`);
+        return;
+      }
+      const data = (await r.json()) as { report?: PrReport };
+      if (!data.report) {
+        setReportError("Report response was empty.");
+        return;
+      }
+      setReport(data.report);
+    } catch (e) {
+      setReportError((e as Error).message);
+    } finally {
+      setReportLoading(false);
+    }
+  }, [repo, prNumber, report, reportLoading]);
+
+  // Esc closes the modal. We attach the listener only while the
+  // modal is open so we don't compete with the chat input's
+  // keyboard handling.
+  useEffect(() => {
+    if (!reportOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setReportOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [reportOpen]);
 
   const start = useCallback(async () => {
     setRunning(true);
@@ -537,13 +604,110 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
             </div>
           )}
 
-          <div className="pt-1">
+          <div className="flex flex-wrap items-center gap-2 pt-1">
             <button
               onClick={() => void start()}
               className="inline-flex rounded-md border border-border px-2 py-1 text-[10px] uppercase tracking-wider text-muted transition hover:text-foreground"
             >
               Run again
             </button>
+            <button
+              onClick={() => void openReport()}
+              className="inline-flex rounded-md border border-border px-2 py-1 text-[10px] uppercase tracking-wider text-muted transition hover:text-foreground"
+            >
+              📊 View Report
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Report modal — overlays the chat while open. We use a
+          plain fixed-position div instead of a portal: the chat
+          page's layout doesn't have a scoped stacking context,
+          so a top-level fixed wrapper renders correctly above
+          everything else. */}
+      {reportOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-start justify-center bg-black/60 p-4 backdrop-blur-sm"
+          onClick={() => setReportOpen(false)}
+        >
+          <div
+            className="my-8 w-full max-w-3xl rounded-xl border border-border bg-surface shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-border px-5 py-3">
+              <div className="text-sm font-semibold text-foreground">
+                📊 PR Report — {repo} #{prNumber}
+              </div>
+              <button
+                onClick={() => setReportOpen(false)}
+                aria-label="Close report"
+                className="rounded-md border border-border px-2 py-1 text-[10px] uppercase tracking-wider text-muted transition hover:text-foreground"
+              >
+                Close (Esc)
+              </button>
+            </div>
+            <div className="max-h-[70vh] overflow-y-auto px-5 py-4">
+              {reportLoading && (
+                <div className="text-sm text-muted">Loading report…</div>
+              )}
+              {reportError && !reportLoading && (
+                <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                  {reportError}
+                </div>
+              )}
+              {report && !reportLoading && !reportError && (
+                <div className="space-y-3">
+                  {/* Quick metadata strip — recommendation +
+                      preview link if any. Kept compact so the
+                      markdown body below it stays the focus. */}
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-muted-strong">
+                    {report.merge_recommendation && (
+                      <span className="rounded-sm border border-border px-2 py-0.5 font-mono uppercase tracking-[0.12em]">
+                        {report.merge_recommendation.replace(/_/g, " ")}
+                      </span>
+                    )}
+                    {report.merge_confidence && (
+                      <span className="font-mono uppercase tracking-[0.12em] text-muted">
+                        {report.merge_confidence} confidence
+                      </span>
+                    )}
+                    {report.sandbox_app_url && (
+                      <a
+                        href={report.sandbox_app_url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="ml-auto inline-flex items-center gap-1 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-xs font-medium text-emerald-100 hover:bg-emerald-500/20"
+                      >
+                        🔗 Live Preview ↗
+                      </a>
+                    )}
+                  </div>
+                  {report.report_markdown ? (
+                    renderMarkdown(report.report_markdown)
+                  ) : (
+                    <div className="text-sm text-muted">
+                      Report has no markdown body.
+                    </div>
+                  )}
+                  <div className="flex flex-wrap items-center gap-2 border-t border-border pt-3">
+                    <a
+                      href={`data:text/markdown;charset=utf-8,${encodeURIComponent(report.report_markdown ?? "")}`}
+                      download={`pr-report-${repo.replace(/\//g, "-")}-${prNumber}.md`}
+                      className="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs font-medium text-foreground hover:border-border-strong"
+                    >
+                      📥 Download Report
+                    </a>
+                    <a
+                      href="/dashboard/reports"
+                      className="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs font-medium text-muted hover:text-foreground"
+                    >
+                      Open Reports dashboard →
+                    </a>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       )}

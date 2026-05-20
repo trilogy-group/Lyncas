@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
+import { downloadReportDocx } from "@/lib/docx-report";
 import { renderMarkdown } from "@/lib/markdown";
 import type {
   DevpodStatusResponse,
@@ -190,6 +191,14 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
   const [reportLoading, setReportLoading] = useState(false);
   const [report, setReport] = useState<PrReport | null>(null);
   const [reportError, setReportError] = useState<string | null>(null);
+  // Per-report download state. Independent from the modal-open /
+  // load states because building the .docx (Packer.toBlob ->
+  // JSZip chain) is meaningfully async and we want the button to
+  // signal "working…" without freezing the rest of the modal.
+  const [reportDownloading, setReportDownloading] = useState(false);
+  const [reportDownloadError, setReportDownloadError] = useState<string | null>(
+    null,
+  );
 
   // One-shot liveness probe. The DevPod sidebar polls every 30s, so
   // we don't need to repeat that work here — a single check on
@@ -243,6 +252,8 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
       setReport(null);
       setReportError(null);
       setReportLoading(false);
+      setReportDownloading(false);
+      setReportDownloadError(null);
     }
     lastKeyRef.current = k;
   }, [repo, prNumber, resetSteps]);
@@ -295,6 +306,25 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [reportOpen]);
+
+  // Build + download the .docx. Defensive about double-clicks
+  // and surfaces any generation error inline in the modal —
+  // throwing here would silently swallow into the click handler.
+  const handleDocxDownload = useCallback(async () => {
+    if (!report || reportDownloading) return;
+    setReportDownloadError(null);
+    setReportDownloading(true);
+    try {
+      await downloadReportDocx(report);
+    } catch (e) {
+      setReportDownloadError(
+        (e as Error).message ||
+          "Could not generate .docx — see browser console for details.",
+      );
+    } finally {
+      setReportDownloading(false);
+    }
+  }, [report, reportDownloading]);
 
   const start = useCallback(async () => {
     setRunning(true);
@@ -690,20 +720,30 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
                       Report has no markdown body.
                     </div>
                   )}
-                  <div className="flex flex-wrap items-center gap-2 border-t border-border pt-3">
-                    <a
-                      href={`data:text/markdown;charset=utf-8,${encodeURIComponent(report.report_markdown ?? "")}`}
-                      download={`pr-report-${repo.replace(/\//g, "-")}-${prNumber}.md`}
-                      className="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs font-medium text-foreground hover:border-border-strong"
-                    >
-                      📥 Download Report
-                    </a>
-                    <a
-                      href="/dashboard/reports"
-                      className="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs font-medium text-muted hover:text-foreground"
-                    >
-                      Open Reports dashboard →
-                    </a>
+                  <div className="space-y-2 border-t border-border pt-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void handleDocxDownload()}
+                        disabled={reportDownloading}
+                        className="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs font-medium text-foreground transition hover:border-border-strong disabled:cursor-wait disabled:opacity-60"
+                      >
+                        {reportDownloading
+                          ? "📄 Building .docx…"
+                          : "📥 Download .docx"}
+                      </button>
+                      <a
+                        href="/dashboard/reports"
+                        className="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs font-medium text-muted hover:text-foreground"
+                      >
+                        Open Reports dashboard →
+                      </a>
+                    </div>
+                    {reportDownloadError && (
+                      <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-200">
+                        {reportDownloadError}
+                      </div>
+                    )}
                   </div>
                 </div>
               )}

@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
+import { downloadReportDocx } from "@/lib/docx-report";
 import { renderMarkdown } from "@/lib/markdown";
 import type { PrReport } from "@/lib/types";
 
@@ -44,25 +45,35 @@ function truncate(text: string | null | undefined, n: number): string {
   return text.slice(0, n - 1).trimEnd() + "…";
 }
 
-function downloadHref(markdown: string | null): string {
-  // data: URI keeps the export pure-client. encodeURIComponent
-  // handles the full UTF-8 spectrum the report body might contain
-  // (em-dashes, smart quotes, etc.).
-  return `data:text/markdown;charset=utf-8,${encodeURIComponent(markdown ?? "")}`;
-}
-
-function downloadFilename(repo: string, prNumber: number): string {
-  // Slashes break filenames on every OS; flatten to a dash so
-  // "owner/name" becomes "owner-name".
-  return `pr-report-${repo.replace(/\//g, "-")}-${prNumber}.md`;
-}
-
 interface ReportCardProps {
   report: PrReport;
 }
 
 export function ReportCard({ report }: ReportCardProps) {
   const [expanded, setExpanded] = useState(false);
+  // Generating the .docx is asynchronous (Packer.toBlob is a
+  // microtask chain through JSZip). The button disables itself
+  // while building so we don't fire two parallel generations
+  // from a double-click — Word would happily save both files,
+  // but it wastes CPU on the user's machine.
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+
+  const handleDownload = async () => {
+    if (downloading) return;
+    setDownloadError(null);
+    setDownloading(true);
+    try {
+      await downloadReportDocx(report);
+    } catch (e) {
+      setDownloadError(
+        (e as Error).message ||
+          "Could not generate .docx — see browser console for details.",
+      );
+    } finally {
+      setDownloading(false);
+    }
+  };
 
   const rec = report.merge_recommendation ?? "needs_review";
   const recColor = REC_COLORS[rec] ?? "#9aa4b2";
@@ -167,13 +178,14 @@ export function ReportCard({ report }: ReportCardProps) {
             <span className="text-[10px] opacity-70">↗</span>
           </a>
         )}
-        <a
-          href={downloadHref(report.report_markdown)}
-          download={downloadFilename(report.repo, report.pr_number)}
-          className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs font-medium text-white transition hover:border-border-strong"
+        <button
+          type="button"
+          onClick={() => void handleDownload()}
+          disabled={downloading}
+          className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs font-medium text-white transition hover:border-border-strong disabled:cursor-wait disabled:opacity-60"
         >
-          📥 Download Report
-        </a>
+          {downloading ? "📄 Building .docx…" : "📥 Download .docx"}
+        </button>
         {hasMarkdown && (
           <button
             type="button"
@@ -187,6 +199,12 @@ export function ReportCard({ report }: ReportCardProps) {
           </button>
         )}
       </div>
+
+      {downloadError && (
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-200">
+          {downloadError}
+        </div>
+      )}
 
       {expanded && hasMarkdown && (
         <div className="rounded-md border border-border bg-bg-elev/60 p-4">

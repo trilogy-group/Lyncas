@@ -40,3 +40,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# payment logs (local dev; do not commit real transactions)
+/data/transactions.txt

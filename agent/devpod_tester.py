@@ -113,13 +113,19 @@ STEP_TIMEOUT_SEC = 360
 # and matches the dashboard's pre-allocation comment in migration 015.
 MAX_OUTPUT_BYTES = 16 * 1024
 
-# Ports to probe (in order) when looking for the running app. Default
-# 3000 covers Next.js, 8000 covers Django/FastAPI, 8080 covers
-# generic Java/Go servers, 5000 covers Flask. We deliberately do NOT
-# force PORT=3001 like the old single-port flow — many Python apps
-# ignore $PORT and bind to a hard-coded default, so probing is the
-# only reliable strategy.
-APP_PORT_CANDIDATES = (3000, 8000, 8080, 5000)
+# Per-PR app port. Formula gives 100 distinct ports in [3000, 3099]
+# — sufficient for the typical "active PRs per repo" range, with a
+# graceful-collision fallback baked into the start_app command
+# (fuser -k clears any zombie process from a prior run on the same
+# port before the new app boots). Trade-off vs the multi-port probe
+# this replaces: Python / Go apps that ignore $PORT and bind to
+# their own default (8000 / 5000 / 8080) will appear as
+# "App started, preview URL unavailable" since we only probe the
+# calculated port. Acceptable for the Next.js-dominant workflow
+# this code path was built for; if non-Node sandboxing comes back,
+# fan-out the probe again.
+def _app_port(pr_number: int) -> int:
+    return 3000 + (pr_number % 100)
 
 # Marker comment so a re-run on the same PR (e.g. force-push, then
 # webhook fires again) replaces the prior sandbox comment cleanly
@@ -291,21 +297,34 @@ def _verify_build_command(pr_number: int) -> str:
 
 
 def _start_app_command(pr_number: int) -> str:
-    """Try canonical entrypoints across Next.js, Python, and Go.
-    We set PORT=3000 as a hint for tools that honor it (npm scripts,
-    Next.js, Express) but DO NOT force the app to that port — most
-    Python frameworks ignore $PORT and bind to their own default,
-    which is exactly why _port_detect_command probes a sequence
-    rather than a single port.
+    """Try canonical entrypoints across Next.js, Python, and Go,
+    targeting the per-PR port computed by _app_port.
+
+    We `export PORT=<port>` so tools that honor it (npm scripts,
+    Next.js, Express) bind to the right place. Python / Go
+    apps that ignore $PORT will bind to their own default and
+    the port-probe below will not find them — see the comment on
+    _app_port for the trade-off.
+
+    The `fuser -k` prelude is best-effort port reclamation: if a
+    prior sandbox run on the same DevPod (same PR number, or a
+    PR that happened to mod-100 to the same port) left a zombie
+    process bound, kill it before booting the new one.
+      * `2>/dev/null` swallows the "no process found" stderr.
+      * `; echo PORT_CLEARED` (semicolon, not &&) keeps the
+        marker printing even when fuser exits non-zero, which
+        is the happy-path expected case on a clean port.
 
     Ordering matters here: `npm start` is checked first because
     Next.js / React apps are the most common stack. `go run .` is
     last because compiling Go on every start adds 5–15s, which
     eats into the 8s bind window."""
     workdir = _clone_dir(pr_number)
+    port = _app_port(pr_number)
     return (
         f"cd {workdir} && "
-        f"export PORT=3000 && "
+        f"export PORT={port} && "
+        f"fuser -k {port}/tcp 2>/dev/null; echo PORT_CLEARED; "
         f"( npm start 2>&1 "
         f"  || python app.py 2>&1 "
         f"  || python main.py 2>&1 "
@@ -325,30 +344,27 @@ def _cleanup_command(pr_number: int) -> str:
     return f"rm -rf {workdir}"
 
 
-def _port_detect_command() -> str:
+def _port_detect_command(pr_number: int) -> str:
     """Poll once per second for up to APP_BIND_TIMEOUT_SEC seconds,
-    probing each candidate port. First responder wins. Prints the
-    detected port on stdout if found, then exits 0; otherwise
-    exits 1 with no output.
+    probing the calculated per-PR port. Prints the port on stdout
+    if it responds (so the orchestrator can pass it on to
+    expose_port unchanged), otherwise exits 1 with no output.
 
-    Why a single shell loop rather than four separate
-    expose_port calls: cloudflared takes ~1s per tunnel handshake
-    even on a port nothing is listening on, so attempting all four
-    sequentially burns ~4s of the 8s budget on tunnels we'll throw
-    away. A local curl probe is sub-100ms and lets us reserve the
-    expose step for the one port we actually want."""
-    ports = " ".join(str(p) for p in APP_PORT_CANDIDATES)
+    Single port (not the legacy 4-port fan-out) because each PR
+    now has a deterministic destination port; the
+    rationale is documented on _app_port. A local curl probe is
+    sub-100ms so even the eight-iteration worst case fits well
+    inside the MCP server's 120s run_command cap."""
+    port = _app_port(pr_number)
     return (
-        f'for i in $(seq 1 {APP_BIND_TIMEOUT_SEC}); do '
-        f'  for p in {ports}; do '
-        f'    if curl -sI --max-time 1 "http://localhost:$p" '
-        f'      >/dev/null 2>&1; then '
-        f'      echo $p; exit 0; '
-        f'    fi; '
-        f'  done; '
-        f'  sleep 1; '
-        f'done; '
-        f'exit 1'
+        f"for i in $(seq 1 {APP_BIND_TIMEOUT_SEC}); do "
+        f'  if curl -sI --max-time 1 "http://localhost:{port}" '
+        f"    >/dev/null 2>&1; then "
+        f"    echo {port}; exit 0; "
+        f"  fi; "
+        f"  sleep 1; "
+        f"done; "
+        f"exit 1"
     )
 
 
@@ -819,7 +835,11 @@ def run() -> dict[str, Any]:
         return {"overall": "error", "error": "PR_FILTER_NUMBER not int"}
 
     started_at = time.time()
+    app_port_for_pr = _app_port(pr_number)
     print(f"[sandbox] starting PR {repo}#{pr_number} on {tunnel_url}")
+    print(
+        f"[sandbox] using port {app_port_for_pr} for PR #{pr_number}"
+    )
 
     cwd = _clone_dir(pr_number)
 
@@ -1121,7 +1141,7 @@ def run() -> dict[str, Any]:
                 {
                     "type": "run_command",
                     "repo": repo,
-                    "command": _port_detect_command(),
+                    "command": _port_detect_command(pr_number),
                 },
             )
             probe_stdout = (probe.get("stdout", "") or "").strip()

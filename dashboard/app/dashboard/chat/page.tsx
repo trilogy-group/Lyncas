@@ -52,18 +52,54 @@ interface ChatMessage {
   // Reports render as a special full-width card with white background
   // and download/copy controls. Everything else is a regular bubble.
   kind?: "chat" | "report";
+  // Only set on assistant messages whose stream errored before the
+  // server finished. Drives the "Response interrupted. Try again."
+  // affordance — a retry button re-issues the same prompt that
+  // produced this message.
+  streamError?: string | null;
+  // The exact user prompt that produced this assistant message; let
+  // the retry button replay without the user re-typing.
+  retryPrompt?: string | null;
 }
 
 interface WatchedRepoLite {
   repo: string;
 }
 
+// Per-repo briefing cache. When `generatedAt` is within
+// BRIEFING_TTL_MS we render `content` directly without making an API
+// call. The dismissed flag is sticky across tab switches because the
+// whole entry is persisted into sessionStorage.
+interface BriefingCacheEntry {
+  content: string;
+  generatedAt: number;
+  loading: boolean;
+  error: string | null;
+  dismissed: boolean;
+}
+
+// Adapter type the BriefingCard component reads from. Kept as a
+// distinct shape from BriefingCacheEntry so the cache store can
+// evolve (e.g. add per-repo last-error timestamps) without leaking
+// into the render layer.
 interface BriefingState {
   repo: string;
   content: string;
   loading: boolean;
   error: string | null;
   dismissed: boolean;
+}
+
+// Per-repo research cache. Same TTL pattern — an in-flight refresh
+// flips `refreshing: true` while keeping the prior `articles` visible
+// so the user doesn't see a flicker on the ↻ click.
+interface ResearchCacheEntry {
+  articles: ResearchArticle[];
+  fetchedAt: number;
+  updatedAt: string | null;
+  loading: boolean;
+  refreshing: boolean;
+  error: string | null;
 }
 
 interface RepoStats {
@@ -101,6 +137,13 @@ interface ResearchState {
   error: string | null;
 }
 
+// Last review date per watched repo, surfaced in the repo selector.
+// Populated lazily on first dropdown open + on bootstrap, cached in
+// component state for the session.
+interface LastReviewLookup {
+  [repo: string]: string | null; // ISO timestamp or null
+}
+
 interface InstallStatusState {
   healthy: number;
   stale: number;
@@ -115,19 +158,94 @@ interface DirectoryTreeState {
 }
 
 const MAX_INPUT_CHARS = 2000;
-const QUICK_ACTIONS: ReadonlyArray<{ label: string; prompt: string }> = [
-  { label: "Recent PRs", prompt: "Show me the open pull requests." },
-  {
-    label: "Recent activity",
-    prompt:
-      "Summarize recent activity (commits, PRs, contributors) in the last 30 days.",
-  },
-  { label: "Merge latest PR", prompt: "Merge the most recent open PR." },
-  {
-    label: "Show repo stats",
-    prompt:
-      "Show repository statistics: open PRs, contributors, languages.",
-  },
+// Hide the live count below this length — it's only useful as a
+// "are you about to hit the cap?" hint, not a constant nag.
+const CHAR_COUNT_VISIBLE_THRESHOLD = 500;
+
+// Persistence ----------------------------------------------------------------
+// SessionStorage (NOT localStorage) — fresh tab = fresh state, which is
+// the right contract for a chat workspace. localStorage would survive
+// browser restart and confuse users who expect "I closed the tab, the
+// agent forgot what we were talking about".
+const STORAGE_KEY = "night-pr-chat-state";
+// Bump when the persisted shape changes incompatibly. Stale blobs from
+// older versions are dropped on read.
+const STORAGE_VERSION = 1;
+const BRIEFING_TTL_MS = 60 * 60 * 1000; // 60 min per spec
+const RESEARCH_TTL_MS = 30 * 60 * 1000; // 30 min per spec
+
+// Quick actions — three rows, three columns. The third row is the
+// "actions" row; "Run tests" is shown ONLY when DevPod is connected.
+// Each entry's `prompt` is what we send to /api/chat verbatim — keep
+// them concrete so the model has a clear instruction.
+type QuickAction = {
+  label: string;
+  prompt: string;
+  // When true, the button is hidden unless DevPod is live for the
+  // current user. Used by "Run tests" — meaningless without a
+  // sandbox tunnel to dispatch into.
+  requiresDevpod?: boolean;
+  // When set, the click triggers an in-app behaviour rather than
+  // sending a chat prompt. Currently only "report" piggybacks on
+  // generateReport().
+  action?: "report";
+};
+
+const QUICK_ACTION_ROWS: ReadonlyArray<ReadonlyArray<QuickAction>> = [
+  // Row 1 — PR actions
+  [
+    {
+      label: "📋 Open PRs",
+      prompt:
+        "List all open pull requests with their status, author, and age",
+    },
+    {
+      label: "🔍 Review latest PR",
+      prompt:
+        "Review the most recently opened PR. Give verdict, severity, and top 3 issues",
+    },
+    {
+      label: "🔀 Recent merges",
+      prompt: "Show the last 5 merged PRs with what changed",
+    },
+  ],
+  // Row 2 — Code intelligence
+  [
+    {
+      label: "📊 Repo health",
+      prompt:
+        "Give me a repo health summary: open PRs, recent activity, top contributors, and any concerns",
+    },
+    {
+      label: "🌿 Branches",
+      prompt:
+        "List all branches, their age, and which ones are stale (no commits in 14+ days)",
+    },
+    {
+      label: "👥 Contributors",
+      prompt:
+        "Who are the top contributors this month and what have they been working on",
+    },
+  ],
+  // Row 3 — Actions
+  [
+    {
+      label: "🧪 Run tests",
+      prompt:
+        "Run the sandbox tests on the most recent open PR and tell me whether it's safe to merge",
+      requiresDevpod: true,
+    },
+    {
+      label: "📄 Generate report",
+      prompt: "",
+      action: "report",
+    },
+    {
+      label: "🔎 Find bugs",
+      prompt:
+        "Review the diff of all open PRs and list the top 5 most critical bugs found across all of them",
+    },
+  ],
 ];
 
 // --- Tiny markdown subset -------------------------------------------------
@@ -140,6 +258,24 @@ function escapeHtml(s: string): string {
     .replace(/'/g, "&#39;");
 }
 
+// Render a small subset of Markdown to safe HTML. The output is
+// dropped via dangerouslySetInnerHTML so every input is escapeHtml'd
+// FIRST, then markup is reintroduced in a controlled way.
+//
+// Supported:
+//   * **bold**
+//   * *italic*
+//   * `inline code`
+//   * ```fenced code blocks```
+//   * # / ## / ### headings
+//   * - or * bullet lists
+//   * 1. ordered lists
+//   * GitHub-flavoured pipe tables (header | --- | row body)
+//   * paragraph breaks on blank lines
+//
+// NOT supported (deliberately): inline links (turning user/agent
+// markdown into clickable links is a phishing risk on a chat
+// surface — keep raw text), images, blockquotes, strikethrough.
 function renderMarkdown(raw: string): string {
   let s = escapeHtml(raw);
   s = s.replace(/```([\s\S]*?)```/g, (_m, body: string) => {
@@ -151,57 +287,153 @@ function renderMarkdown(raw: string): string {
 
   const lines = s.split("\n");
   const out: string[] = [];
-  let inList = false;
-  for (const line of lines) {
+  let inUl = false;
+  let inOl = false;
+  function closeLists() {
+    if (inUl) {
+      out.push("</ul>");
+      inUl = false;
+    }
+    if (inOl) {
+      out.push("</ol>");
+      inOl = false;
+    }
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // ----- table block -----
+    // GitHub-style: header row, separator row of |---|, body rows.
+    // We require at least the separator to recognize a table — bare
+    // `| key | val |` lines without a separator are common in chat
+    // (e.g. "use | as a separator") and shouldn't all become tables.
+    const isHeaderCandidate = /^\s*\|.+\|\s*$/.test(line);
+    const sep = lines[i + 1];
+    const isSeparator =
+      typeof sep === "string" && /^\s*\|?\s*[:\-| ]+\|[:\-| ]+\s*\|?\s*$/.test(sep);
+    if (isHeaderCandidate && isSeparator) {
+      closeLists();
+      const parseCells = (l: string): string[] =>
+        l
+          .replace(/^\s*\|/, "")
+          .replace(/\|\s*$/, "")
+          .split("|")
+          .map((c) => c.trim());
+      const headers = parseCells(line);
+      const rows: string[][] = [];
+      let j = i + 2;
+      while (j < lines.length && /^\s*\|.+\|\s*$/.test(lines[j])) {
+        rows.push(parseCells(lines[j]));
+        j++;
+      }
+      out.push('<table class="md-table"><thead><tr>');
+      for (const h of headers) out.push(`<th>${h}</th>`);
+      out.push("</tr></thead><tbody>");
+      for (const row of rows) {
+        out.push("<tr>");
+        for (let k = 0; k < headers.length; k++) {
+          out.push(`<td>${row[k] ?? ""}</td>`);
+        }
+        out.push("</tr>");
+      }
+      out.push("</tbody></table>");
+      i = j - 1; // skip body lines we just consumed
+      continue;
+    }
+
     const h1 = /^\s*#\s+(.+)$/.exec(line);
     const h3 = /^\s*###\s+(.+)$/.exec(line);
     const h2 = /^\s*##\s+(.+)$/.exec(line);
     if (h1) {
-      if (inList) {
-        out.push("</ul>");
-        inList = false;
-      }
+      closeLists();
       out.push(`<h1 class="md-h1">${h1[1]}</h1>`);
       continue;
     }
     if (h3) {
-      if (inList) {
-        out.push("</ul>");
-        inList = false;
-      }
+      closeLists();
       out.push(`<h3 class="md-h3">${h3[1]}</h3>`);
       continue;
     }
     if (h2) {
-      if (inList) {
-        out.push("</ul>");
-        inList = false;
-      }
+      closeLists();
       out.push(`<h2 class="md-h2">${h2[1]}</h2>`);
       continue;
     }
-    const m = /^\s*[-*]\s+(.*)$/.exec(line);
-    if (m) {
-      if (!inList) {
+
+    const ul = /^\s*[-*]\s+(.*)$/.exec(line);
+    const ol = /^\s*\d+\.\s+(.*)$/.exec(line);
+    if (ul) {
+      if (inOl) {
+        out.push("</ol>");
+        inOl = false;
+      }
+      if (!inUl) {
         out.push('<ul class="md-list">');
-        inList = true;
+        inUl = true;
       }
-      out.push(`<li>${m[1]}</li>`);
-    } else {
-      if (inList) {
-        out.push("</ul>");
-        inList = false;
-      }
-      out.push(line);
+      out.push(`<li>${ul[1]}</li>`);
+      continue;
     }
+    if (ol) {
+      if (inUl) {
+        out.push("</ul>");
+        inUl = false;
+      }
+      if (!inOl) {
+        out.push('<ol class="md-list md-list-ordered">');
+        inOl = true;
+      }
+      out.push(`<li>${ol[1]}</li>`);
+      continue;
+    }
+
+    closeLists();
+    out.push(line);
   }
-  if (inList) out.push("</ul>");
+  closeLists();
   return out
     .join("\n")
     .split(/\n{2,}/)
     .map((p) => p.replace(/\n/g, "<br/>"))
     .map((p) => (p.trim() ? `<p>${p}</p>` : ""))
     .join("");
+}
+
+// Append a blinking caret to streaming assistant content. We render
+// it as a span so the caret can animate independently of the
+// surrounding text. Placed AFTER renderMarkdown so the caret never
+// gets swallowed by an in-progress code fence / list / table.
+function appendCaret(html: string): string {
+  return html + '<span class="stream-caret" aria-hidden>▌</span>';
+}
+
+// SessionStorage helpers — single point that owns the JSON shape, so
+// a future schema bump only touches this block.
+function safeReadStorage<T>(): T | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { v?: number; data?: T };
+    if (!parsed || parsed.v !== STORAGE_VERSION) return null;
+    return (parsed.data ?? null) as T | null;
+  } catch {
+    return null;
+  }
+}
+
+function safeWriteStorage<T>(data: T): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ v: STORAGE_VERSION, data }),
+    );
+  } catch {
+    // Quota errors / private mode — silently drop. The page still
+    // works without persistence.
+  }
 }
 
 // --- Display helpers ------------------------------------------------------
@@ -302,17 +534,84 @@ function ChatPageInner() {
 
   const [loading, setLoading] = useState(true);
   const [repos, setRepos] = useState<WatchedRepoLite[]>([]);
+
+  // --- Persistence-backed state ----------------------------------------
+  //
+  // These four are read once on mount from sessionStorage and then
+  // mirrored back on every change. The blob is key=STORAGE_KEY,
+  // shape={selectedRepo, messagesByRepo, briefingsByRepo,
+  // researchByRepo}. See PersistedState below.
+  //
+  // We pre-read the initializer eagerly inside the useState callback
+  // so the first paint already shows the restored repo + messages
+  // (no flicker). Subsequent reads come from React state, never
+  // touching storage.
+  const [hydrated, setHydrated] = useState(false);
   const [selectedRepo, setSelectedRepo] = useState<string>("");
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messagesByRepo, setMessagesByRepo] = useState<
+    Record<string, ChatMessage[]>
+  >({});
+  const [briefingsByRepo, setBriefingsByRepo] = useState<
+    Record<string, BriefingCacheEntry>
+  >({});
+  const [researchByRepo, setResearchByRepo] = useState<
+    Record<string, ResearchCacheEntry>
+  >({});
+
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
-  const [briefing, setBriefing] = useState<BriefingState | null>(null);
   const [roomTransition, setRoomTransition] = useState(false);
   const [globalError, setGlobalError] = useState<string | null>(null);
   const [installError, setInstallError] = useState<string | null>(null);
 
+  // Stats are not persisted (cheap to refetch, GitHub rate limit is
+  // generous, no UX value in surviving a tab switch).
   const [stats, setStats] = useState<RepoStatsState | null>(null);
-  const [research, setResearch] = useState<ResearchState | null>(null);
+  const [lastReviewByRepo, setLastReviewByRepo] = useState<LastReviewLookup>(
+    {},
+  );
+
+  // Derived per-repo views — these replace the old `messages`,
+  // `briefing`, `research` flat-state. Empty/null defaults so the
+  // existing renderers don't have to special-case "no entry yet".
+  const messages = useMemo<ChatMessage[]>(
+    () => messagesByRepo[selectedRepo] ?? [],
+    [messagesByRepo, selectedRepo],
+  );
+  const briefingEntry = briefingsByRepo[selectedRepo] ?? null;
+  const researchEntry = researchByRepo[selectedRepo] ?? null;
+
+  // Adapt the cache shape back to the legacy "BriefingState" /
+  // "ResearchState" the existing render code reads from. We wrap
+  // rather than refactor every consumer because the consumer JSX is
+  // long and stable; only the store shape changed.
+  const briefing: BriefingState | null = useMemo(
+    () =>
+      briefingEntry
+        ? {
+            repo: selectedRepo,
+            content: briefingEntry.content,
+            loading: briefingEntry.loading,
+            error: briefingEntry.error,
+            dismissed: briefingEntry.dismissed,
+          }
+        : null,
+    [briefingEntry, selectedRepo],
+  );
+  const research: ResearchState | null = useMemo(
+    () =>
+      researchEntry
+        ? {
+            repo: selectedRepo,
+            articles: researchEntry.articles,
+            updatedAt: researchEntry.updatedAt,
+            loading: researchEntry.loading,
+            refreshing: researchEntry.refreshing,
+            error: researchEntry.error,
+          }
+        : null,
+    [researchEntry, selectedRepo],
+  );
 
   // Most recently referenced PR number across the chat history +
   // the in-progress input. Updates as the conversation moves so the
@@ -339,6 +638,23 @@ function ChatPageInner() {
     null,
   );
 
+  // Whether DevPod is currently live for the signed-in user. Surfaced
+  // in the header (green/grey dot), the repo dropdown (green dot per
+  // row), and the quick-action gating (the "Run tests" button is
+  // hidden when offline). Polled every 30s alongside the existing
+  // DevPodPanel poll, but we keep our own state so the header doesn't
+  // depend on the panel rendering.
+  const [devpodLive, setDevpodLive] = useState(false);
+
+  // Repo-dropdown open state lifted up so the global Cmd+K / Ctrl+K
+  // shortcut can toggle it from anywhere on the page.
+  const [repoDropdownOpen, setRepoDropdownOpen] = useState(false);
+
+  // Confirmation modal for "Clear chat" — never wipe a conversation
+  // without an explicit confirm; it's surprisingly easy to lose 20
+  // turns of context to a misclick.
+  const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
+
   const [installStatus, setInstallStatus] = useState<InstallStatusState>({
     healthy: 0,
     stale: 0,
@@ -352,12 +668,127 @@ function ChatPageInner() {
   // The DevPod panel polls /api/devpod/status?username=… so we need
   // to surface it here rather than re-querying auth on every poll.
   const [githubUsername, setGithubUsername] = useState<string | null>(null);
+  // Avatar shown next to the user's chat bubbles. Same provenance as
+  // `githubUsername` — Supabase OAuth metadata at sign-in. Falls back
+  // to https://github.com/{login}.png so we never block the bubble
+  // on a missing field.
+  const [userAvatarUrl, setUserAvatarUrl] = useState<string | null>(null);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
-  const briefingAbortRef = useRef<AbortController | null>(null);
   const statsAbortRef = useRef<AbortController | null>(null);
-  const researchAbortRef = useRef<AbortController | null>(null);
+  // Per-repo briefing/research aborts — when the user switches repos
+  // we want to keep the in-flight briefing for the OLD repo running
+  // (so when they switch back, the cache is already populated). The
+  // bootstrap-cleanup path doesn't try to walk these maps; they get
+  // GC'd with the page.
+  const briefingAbortByRepoRef = useRef<Record<string, AbortController>>({});
+  const researchAbortByRepoRef = useRef<Record<string, AbortController>>({});
+
+  // ----- Mount-time hydrate from sessionStorage -----
+  // We read once before any other effect so the first paint already
+  // shows the restored repo + messages. After hydration, every state
+  // mutation flushes back to storage via the persistence effect below.
+  useEffect(() => {
+    type Persisted = {
+      selectedRepo?: string;
+      messagesByRepo?: Record<string, ChatMessage[]>;
+      briefingsByRepo?: Record<string, BriefingCacheEntry>;
+      researchByRepo?: Record<string, ResearchCacheEntry>;
+    };
+    const restored = safeReadStorage<Persisted>();
+    if (restored) {
+      if (typeof restored.selectedRepo === "string") {
+        setSelectedRepo(restored.selectedRepo);
+      }
+      if (restored.messagesByRepo && typeof restored.messagesByRepo === "object") {
+        setMessagesByRepo(restored.messagesByRepo);
+      }
+      if (restored.briefingsByRepo && typeof restored.briefingsByRepo === "object") {
+        // Coerce any stale `loading: true` flags off — a tab refresh
+        // mid-stream would otherwise leave the briefing card stuck
+        // in a skeleton state forever.
+        const sane: Record<string, BriefingCacheEntry> = {};
+        for (const [k, v] of Object.entries(restored.briefingsByRepo)) {
+          sane[k] = { ...v, loading: false };
+        }
+        setBriefingsByRepo(sane);
+      }
+      if (restored.researchByRepo && typeof restored.researchByRepo === "object") {
+        const sane: Record<string, ResearchCacheEntry> = {};
+        for (const [k, v] of Object.entries(restored.researchByRepo)) {
+          sane[k] = { ...v, loading: false, refreshing: false };
+        }
+        setResearchByRepo(sane);
+      }
+    }
+    setHydrated(true);
+  }, []);
+
+  // ----- Persist on change -----
+  // Skipped until hydration completes so the first effect run doesn't
+  // overwrite the just-restored blob with the empty initial state.
+  useEffect(() => {
+    if (!hydrated) return;
+    safeWriteStorage({
+      selectedRepo,
+      messagesByRepo,
+      briefingsByRepo,
+      researchByRepo,
+    });
+  }, [
+    hydrated,
+    selectedRepo,
+    messagesByRepo,
+    briefingsByRepo,
+    researchByRepo,
+  ]);
+
+  // ----- Per-repo mutators -----
+  // All stream-write helpers funnel through these so a stream that
+  // started in repo A doesn't accidentally land in repo B's history
+  // if the user switches mid-stream. The repo to write to is captured
+  // at stream-start, not read from React state at flush time.
+  const setMessagesForRepo = useCallback(
+    (repo: string, updater: (prev: ChatMessage[]) => ChatMessage[]): void => {
+      setMessagesByRepo((prev) => ({
+        ...prev,
+        [repo]: updater(prev[repo] ?? []),
+      }));
+    },
+    [],
+  );
+  const updateBriefingForRepo = useCallback(
+    (repo: string, patch: Partial<BriefingCacheEntry>): void => {
+      setBriefingsByRepo((prev) => {
+        const cur = prev[repo] ?? {
+          content: "",
+          generatedAt: 0,
+          loading: false,
+          error: null,
+          dismissed: false,
+        };
+        return { ...prev, [repo]: { ...cur, ...patch } };
+      });
+    },
+    [],
+  );
+  const updateResearchForRepo = useCallback(
+    (repo: string, patch: Partial<ResearchCacheEntry>): void => {
+      setResearchByRepo((prev) => {
+        const cur = prev[repo] ?? {
+          articles: [],
+          fetchedAt: 0,
+          updatedAt: null,
+          loading: false,
+          refreshing: false,
+          error: null,
+        };
+        return { ...prev, [repo]: { ...cur, ...patch } };
+      });
+    },
+    [],
+  );
 
   // Single helper for "read watched_repos for the signed-in user". We
   // call it on mount AND again after /api/github-app/status runs
@@ -383,6 +814,13 @@ function ChatPageInner() {
           ? meta.preferred_username.trim()
           : null;
     setGithubUsername(gh);
+    const avatar =
+      typeof meta.avatar_url === "string" && meta.avatar_url.trim()
+        ? meta.avatar_url.trim()
+        : gh
+          ? `https://github.com/${gh}.png?size=64`
+          : null;
+    setUserAvatarUrl(avatar);
 
     const { data } = await supabase
       .from("watched_repos")
@@ -452,10 +890,14 @@ function ChatPageInner() {
     void bootstrap();
     return () => {
       cancelled = true;
-      abortRef.current?.abort();
-      briefingAbortRef.current?.abort();
-      statsAbortRef.current?.abort();
-      researchAbortRef.current?.abort();
+      // Snapshot refs at cleanup time — the values may have changed
+      // since the effect ran but for unmount/abort it doesn't matter
+      // which controller we abort, only that we abort the current
+      // one.
+      const stream = abortRef.current;
+      const stats = statsAbortRef.current;
+      stream?.abort();
+      stats?.abort();
     };
   }, [refreshRepos]);
 
@@ -550,83 +992,183 @@ function ChatPageInner() {
     el.scrollTop = el.scrollHeight;
   }, [messages, briefing]);
 
-  // --- briefing -----------------------------------------------------------
-  const fetchBriefing = useCallback(async (repo: string) => {
-    briefingAbortRef.current?.abort();
-    const ac = new AbortController();
-    briefingAbortRef.current = ac;
-    setBriefing({
-      repo,
-      content: "",
-      loading: true,
-      error: null,
-      dismissed: false,
-    });
-    setGlobalError(null);
-    try {
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: "Generate a research briefing for this repository.",
-          repo,
-          history: [],
-          isResearchBriefing: true,
-        }),
-        signal: ac.signal,
-      });
-      if (!res.ok || !res.body) {
-        let detail = `HTTP ${res.status}`;
-        try {
-          const j = (await res.json()) as { error?: string };
-          if (j.error) detail = j.error;
-        } catch {
-          // non-json
+  // ----- DevPod liveness polling -----
+  // Used by:
+  //   * the chat header (green/grey dot next to "DevPod"),
+  //   * the repo dropdown rows (per-repo green dot),
+  //   * the quick-action gating (hide "Run tests" when offline).
+  // 30s cadence matches DevPodPanel's existing poll so we don't pile
+  // requests onto the small status endpoint.
+  useEffect(() => {
+    if (!githubUsername) return;
+    let cancelled = false;
+    async function poll() {
+      try {
+        const res = await fetch(
+          `/api/devpod/status?username=${encodeURIComponent(githubUsername!)}`,
+          { cache: "no-store" },
+        );
+        if (!res.ok) {
+          if (!cancelled) setDevpodLive(false);
+          return;
         }
-        setBriefing((b) =>
-          b && b.repo === repo ? { ...b, loading: false, error: detail } : b,
-        );
-        setGlobalError(
-          "Some repository data unavailable — answers may be limited",
-        );
+        const data = (await res.json()) as { active?: boolean };
+        if (!cancelled) setDevpodLive(!!data.active);
+      } catch {
+        if (!cancelled) setDevpodLive(false);
+      }
+    }
+    void poll();
+    const id = window.setInterval(poll, 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [githubUsername]);
+
+  // ----- Last review date per repo (for the dropdown) -----
+  // Fetched lazily once per session — not persisted. Cheap query
+  // (anon-readable reviews table); we only read created_at on the
+  // most recent row per repo. Filter is OR'd at the table level so a
+  // single round-trip covers every watched repo.
+  useEffect(() => {
+    if (repos.length === 0) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const repoSet = repos.map((r) => r.repo);
+        const { data } = await supabase
+          .from("reviews")
+          .select("repo, created_at")
+          .in("repo", repoSet)
+          .order("created_at", { ascending: false });
+        if (cancelled || !data) return;
+        const out: LastReviewLookup = {};
+        for (const row of data as Array<{ repo: string; created_at: string }>) {
+          if (!(row.repo in out)) out[row.repo] = row.created_at;
+        }
+        setLastReviewByRepo(out);
+      } catch {
+        // best effort
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [repos, supabase]);
+
+  // ----- Global Cmd+K / Ctrl+K to open the repo dropdown -----
+  // Skip when a textarea/input is focused so the user doesn't lose
+  // typing flow. Always preventDefault on hit so Chrome's "search
+  // tabs" UI on macOS Cmd+K doesn't intercept.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key.toLowerCase() !== "k") return;
+      if (!(e.metaKey || e.ctrlKey)) return;
+      const t = e.target as HTMLElement | null;
+      if (
+        t &&
+        (t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          (t as HTMLElement).isContentEditable)
+      ) {
+        // Only intercept if the user isn't actively typing.
         return;
       }
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      let content = "";
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        const frames = buf.split("\n\n");
-        buf = frames.pop() ?? "";
-        for (const frame of frames) {
-          const line = frame.startsWith("data: ") ? frame.slice(6) : frame;
-          if (!line) continue;
-          if (line === "[DONE]") {
-            reader.cancel();
-            setBriefing((b) =>
-              b && b.repo === repo ? { ...b, content, loading: false } : b,
-            );
-            return;
-          }
-          content += line;
-          setBriefing((b) => (b && b.repo === repo ? { ...b, content } : b));
-        }
-      }
-      setBriefing((b) =>
-        b && b.repo === repo ? { ...b, content, loading: false } : b,
-      );
-    } catch (e) {
-      if ((e as Error).name === "AbortError") return;
-      setBriefing((b) =>
-        b && b.repo === repo
-          ? { ...b, loading: false, error: (e as Error).message }
-          : b,
-      );
+      e.preventDefault();
+      setRepoDropdownOpen(true);
     }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
+
+  // --- briefing -----------------------------------------------------------
+  // Streams a fresh briefing for `repo` and writes the result into
+  // briefingsByRepo[repo]. Per-repo abort controllers — switching
+  // repos doesn't kill an in-flight briefing, so by the time the
+  // user switches back the cache is already populated. The TTL check
+  // is the caller's responsibility (see selectedRepo effect below).
+  const fetchBriefing = useCallback(
+    async (repo: string) => {
+      briefingAbortByRepoRef.current[repo]?.abort();
+      const ac = new AbortController();
+      briefingAbortByRepoRef.current[repo] = ac;
+
+      updateBriefingForRepo(repo, {
+        content: "",
+        loading: true,
+        error: null,
+        dismissed: false,
+        generatedAt: 0,
+      });
+      setGlobalError(null);
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: "Generate a research briefing for this repository.",
+            repo,
+            history: [],
+            isResearchBriefing: true,
+          }),
+          signal: ac.signal,
+        });
+        if (!res.ok || !res.body) {
+          let detail = `HTTP ${res.status}`;
+          try {
+            const j = (await res.json()) as { error?: string };
+            if (j.error) detail = j.error;
+          } catch {
+            // non-json
+          }
+          updateBriefingForRepo(repo, { loading: false, error: detail });
+          setGlobalError(
+            "Some repository data unavailable — answers may be limited",
+          );
+          return;
+        }
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        let content = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const frames = buf.split("\n\n");
+          buf = frames.pop() ?? "";
+          for (const frame of frames) {
+            const line = frame.startsWith("data: ") ? frame.slice(6) : frame;
+            if (!line) continue;
+            if (line === "[DONE]") {
+              reader.cancel();
+              updateBriefingForRepo(repo, {
+                content,
+                loading: false,
+                generatedAt: Date.now(),
+              });
+              return;
+            }
+            content += line;
+            updateBriefingForRepo(repo, { content });
+          }
+        }
+        updateBriefingForRepo(repo, {
+          content,
+          loading: false,
+          generatedAt: Date.now(),
+        });
+      } catch (e) {
+        if ((e as Error).name === "AbortError") return;
+        updateBriefingForRepo(repo, {
+          loading: false,
+          error: (e as Error).message,
+        });
+      }
+    },
+    [updateBriefingForRepo],
+  );
 
   // --- stats --------------------------------------------------------------
   const fetchStats = useCallback(async (repo: string) => {
@@ -667,19 +1209,31 @@ function ChatPageInner() {
   }, []);
 
   // --- research ------------------------------------------------------------
+  // Per-repo: keeps any prior `articles` visible while a forced
+  // refresh is in flight (avoids a flicker on the ↻ click). TTL
+  // (RESEARCH_TTL_MS) is enforced by the caller — this function
+  // always hits the API.
   const fetchResearch = useCallback(
     async (repo: string, opts: { force?: boolean } = {}) => {
-      researchAbortRef.current?.abort();
+      researchAbortByRepoRef.current[repo]?.abort();
       const ac = new AbortController();
-      researchAbortRef.current = ac;
-      setResearch((r) => ({
-        repo,
-        articles: r && r.repo === repo ? r.articles : [],
-        updatedAt: r && r.repo === repo ? r.updatedAt : null,
-        loading: !(r && r.repo === repo && r.articles.length > 0),
-        refreshing: !!opts.force,
-        error: null,
-      }));
+      researchAbortByRepoRef.current[repo] = ac;
+
+      setResearchByRepo((prev) => {
+        const cur = prev[repo];
+        return {
+          ...prev,
+          [repo]: {
+            articles: cur?.articles ?? [],
+            updatedAt: cur?.updatedAt ?? null,
+            fetchedAt: cur?.fetchedAt ?? 0,
+            loading: !(cur && cur.articles.length > 0),
+            refreshing: !!opts.force,
+            error: null,
+          },
+        };
+      });
+
       try {
         const url =
           `/api/repo-research?repo=${encodeURIComponent(repo)}` +
@@ -687,170 +1241,239 @@ function ChatPageInner() {
         const res = await fetch(url, { signal: ac.signal });
         if (!res.ok) {
           const j = (await res.json().catch(() => ({}))) as { error?: string };
-          setResearch((r) =>
-            r && r.repo === repo
-              ? {
-                  ...r,
-                  loading: false,
-                  refreshing: false,
-                  error: j.error ?? `HTTP ${res.status}`,
-                }
-              : r,
-          );
+          updateResearchForRepo(repo, {
+            loading: false,
+            refreshing: false,
+            error: j.error ?? `HTTP ${res.status}`,
+          });
           return;
         }
         const data = (await res.json()) as {
           articles: ResearchArticle[];
           updated_at: string;
         };
-        setResearch((r) =>
-          r && r.repo === repo
-            ? {
-                ...r,
-                articles: data.articles ?? [],
-                updatedAt: data.updated_at ?? null,
-                loading: false,
-                refreshing: false,
-                error: null,
-              }
-            : r,
-        );
+        updateResearchForRepo(repo, {
+          articles: data.articles ?? [],
+          updatedAt: data.updated_at ?? null,
+          fetchedAt: Date.now(),
+          loading: false,
+          refreshing: false,
+          error: null,
+        });
       } catch (e) {
         if ((e as Error).name === "AbortError") return;
-        setResearch((r) =>
-          r && r.repo === repo
-            ? {
-                ...r,
-                loading: false,
-                refreshing: false,
-                error: (e as Error).message,
-              }
-            : r,
-        );
+        updateResearchForRepo(repo, {
+          loading: false,
+          refreshing: false,
+          error: (e as Error).message,
+        });
       }
     },
-    [],
+    [updateResearchForRepo],
   );
 
+  // ----- selectedRepo room transition + cache-aware fetches -----
+  //
+  // When switching repos:
+  //   * Stats are not persisted, so always refetch (cheap, no TTL).
+  //   * Briefings are cached for BRIEFING_TTL_MS — only fetch on
+  //     cache miss / staleness. Critical: the legacy effect ran
+  //     fetchBriefing on every selectedRepo change which is what
+  //     made tab switches re-burn Anthropic tokens.
+  //   * Research is cached for RESEARCH_TTL_MS — same rule.
+  //   * Messages are NEVER cleared on switch — the per-repo map
+  //     preserves them. Only an explicit "Clear chat" wipes them.
+  //
+  // The 400ms `roomTransition` overlay is preserved as a visual
+  // affordance ("Entering #{repo} room…") — it's a small cost for a
+  // significant UX improvement on slower networks.
   useEffect(() => {
     if (!selectedRepo) {
-      setBriefing(null);
       setStats(null);
-      setResearch(null);
-      setMessages([]);
       return;
     }
-    abortRef.current?.abort();
-    setMessages([]);
+    // Don't abort: in-flight streams continue writing into the
+    // captured-repo bucket. Only the visible "I'm streaming RIGHT
+    // NOW into the visible repo" indicator is room-local — which
+    // we reset by NOT touching isStreaming here. The correctness
+    // contract is: messagesByRepo[oldRepo] keeps growing until the
+    // stream finishes, then user can switch back to see it.
     setRoomTransition(true);
     setGlobalError(null);
     const t = setTimeout(() => {
       setRoomTransition(false);
-      void fetchBriefing(selectedRepo);
+
+      // Stats: always.
       void fetchStats(selectedRepo);
-      void fetchResearch(selectedRepo);
+
+      // Briefing: cache check.
+      const b = briefingsByRepo[selectedRepo];
+      const briefingFresh =
+        b &&
+        !b.error &&
+        b.content &&
+        Date.now() - b.generatedAt < BRIEFING_TTL_MS;
+      if (!briefingFresh && !(b && b.loading)) {
+        void fetchBriefing(selectedRepo);
+      }
+
+      // Research: cache check.
+      const r = researchByRepo[selectedRepo];
+      const researchFresh =
+        r &&
+        !r.error &&
+        r.articles.length > 0 &&
+        Date.now() - r.fetchedAt < RESEARCH_TTL_MS;
+      if (!researchFresh && !(r && (r.loading || r.refreshing))) {
+        void fetchResearch(selectedRepo);
+      }
     }, 400);
     return () => clearTimeout(t);
+    // briefingsByRepo / researchByRepo intentionally NOT in deps:
+    // we only want the cache check on explicit selectedRepo change,
+    // not on every cache write (which would fire infinitely).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedRepo, fetchBriefing, fetchStats, fetchResearch]);
 
   // --- send / report ------------------------------------------------------
-  async function send(rawPrompt: string) {
-    const prompt = rawPrompt.trim();
-    if (!prompt || isStreaming || !selectedRepo) return;
 
-    const now = Date.now();
-    const userId = crypto.randomUUID();
-    const asstId = crypto.randomUUID();
-    const userMsg: ChatMessage = {
-      id: userId,
-      role: "user",
-      content: prompt,
-      ts: now,
-    };
-    const placeholder: ChatMessage = {
-      id: asstId,
-      role: "assistant",
-      content: "",
-      ts: now,
-    };
-    const history = messages
-      .slice(-10)
-      .filter((m) => m.kind !== "report")
-      .map((m) => ({ role: m.role, content: m.content }));
-    setMessages((m) => [...m, userMsg, placeholder]);
-    setInput("");
-    setIsStreaming(true);
-
-    const ac = new AbortController();
-    abortRef.current = ac;
-    try {
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: prompt,
-          repo: selectedRepo,
-          history,
-        }),
-        signal: ac.signal,
-      });
-
-      if (!res.ok || !res.body) {
-        let detail = `HTTP ${res.status}`;
-        try {
-          const j = (await res.json()) as { error?: string };
-          if (j.error) detail = j.error;
-        } catch {
-          // non-json
-        }
-        appendToAssistant(asstId, `**Error.** ${detail}`);
-        return;
-      }
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        const frames = buf.split("\n\n");
-        buf = frames.pop() ?? "";
-        for (const frame of frames) {
-          const line = frame.startsWith("data: ") ? frame.slice(6) : frame;
-          if (!line) continue;
-          if (line === "[DONE]") {
-            reader.cancel();
-            return;
-          }
-          if (line.startsWith("{")) {
-            try {
-              const parsed = JSON.parse(line) as { error?: string };
-              if (parsed.error) {
-                appendToAssistant(asstId, `\n\n**Error.** ${parsed.error}`);
-                continue;
-              }
-            } catch {
-              // fall through and treat as plain text
-            }
-          }
-          appendToAssistant(asstId, line);
-        }
-      }
-    } catch (e) {
-      if ((e as Error).name === "AbortError") return;
-      appendToAssistant(
-        asstId,
-        `\n\n**Error.** ${(e as Error).message || "Network error."}`,
+  // Per-repo append. The repo argument is captured at stream-start
+  // and never read from the latest selectedRepo, so a tab switch
+  // mid-stream still lands the chunks in the right room's history.
+  const appendToAssistantInRepo = useCallback(
+    (repo: string, id: string, chunk: string) => {
+      setMessagesForRepo(repo, (prev) =>
+        prev.map((m) =>
+          m.id === id ? { ...m, content: m.content + chunk } : m,
+        ),
       );
-    } finally {
-      setIsStreaming(false);
-      abortRef.current = null;
-    }
-  }
+    },
+    [setMessagesForRepo],
+  );
 
-  async function generateReport() {
-    if (isStreaming || !selectedRepo) return;
+  // The repo to write to is captured at the call site and threaded
+  // through so a stream that started in repo A still lands in
+  // messagesByRepo[A] even if the user has since switched to repo B.
+  // The visible message bubble in repo B won't update, but as soon as
+  // the user switches back the full history is intact.
+  const send = useCallback(
+    async (rawPrompt: string) => {
+      const prompt = rawPrompt.trim();
+      const repo = selectedRepo;
+      if (!prompt || isStreaming || !repo) return;
+
+      const now = Date.now();
+      const userMsgId = crypto.randomUUID();
+      const asstId = crypto.randomUUID();
+      const userMsg: ChatMessage = {
+        id: userMsgId,
+        role: "user",
+        content: prompt,
+        ts: now,
+      };
+      const placeholder: ChatMessage = {
+        id: asstId,
+        role: "assistant",
+        content: "",
+        ts: now,
+        retryPrompt: prompt,
+      };
+      const currentMessages = messagesByRepo[repo] ?? [];
+      const history = currentMessages
+        .slice(-10)
+        .filter((m) => m.kind !== "report")
+        .map((m) => ({ role: m.role, content: m.content }));
+      setMessagesForRepo(repo, (prev) => [...prev, userMsg, placeholder]);
+      setInput("");
+      setIsStreaming(true);
+
+      const ac = new AbortController();
+      abortRef.current = ac;
+      // Helper: mark this assistant message as interrupted so the
+      // bubble can render a retry button. Called from any catch path.
+      function flagInterrupted(reason: string) {
+        setMessagesForRepo(repo, (prev) =>
+          prev.map((m) =>
+            m.id === asstId
+              ? { ...m, streamError: reason }
+              : m,
+          ),
+        );
+      }
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: prompt,
+            repo,
+            history,
+          }),
+          signal: ac.signal,
+        });
+
+        if (!res.ok || !res.body) {
+          let detail = `HTTP ${res.status}`;
+          try {
+            const j = (await res.json()) as { error?: string };
+            if (j.error) detail = j.error;
+          } catch {
+            // non-json
+          }
+          flagInterrupted(detail);
+          return;
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const frames = buf.split("\n\n");
+          buf = frames.pop() ?? "";
+          for (const frame of frames) {
+            const line = frame.startsWith("data: ") ? frame.slice(6) : frame;
+            if (!line) continue;
+            if (line === "[DONE]") {
+              reader.cancel();
+              return;
+            }
+            if (line.startsWith("{")) {
+              try {
+                const parsed = JSON.parse(line) as { error?: string };
+                if (parsed.error) {
+                  flagInterrupted(parsed.error);
+                  continue;
+                }
+              } catch {
+                // fall through and treat as plain text
+              }
+            }
+            appendToAssistantInRepo(repo, asstId, line);
+          }
+        }
+      } catch (e) {
+        if ((e as Error).name === "AbortError") return;
+        flagInterrupted((e as Error).message || "Network error.");
+      } finally {
+        setIsStreaming(false);
+        abortRef.current = null;
+      }
+    },
+    [
+      appendToAssistantInRepo,
+      isStreaming,
+      messagesByRepo,
+      selectedRepo,
+      setMessagesForRepo,
+    ],
+  );
+
+  const generateReport = useCallback(async () => {
+    const repo = selectedRepo;
+    if (isStreaming || !repo) return;
     const now = Date.now();
     const reportId = crypto.randomUUID();
     const placeholder: ChatMessage = {
@@ -860,18 +1483,31 @@ function ChatPageInner() {
       ts: now,
       kind: "report",
     };
-    setMessages((m) => [...m, placeholder]);
+    setMessagesForRepo(repo, (prev) => [...prev, placeholder]);
     setIsStreaming(true);
 
     const ac = new AbortController();
     abortRef.current = ac;
+    function flagReportError(detail: string) {
+      setMessagesForRepo(repo, (prev) =>
+        prev.map((m) =>
+          m.id === reportId
+            ? {
+                ...m,
+                content: m.content + `\n\n**Report failed.** ${detail}`,
+                streamError: detail,
+              }
+            : m,
+        ),
+      );
+    }
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           isReport: true,
-          repo: selectedRepo,
+          repo,
         }),
         signal: ac.signal,
       });
@@ -883,7 +1519,7 @@ function ChatPageInner() {
         } catch {
           // non-json
         }
-        appendToAssistant(reportId, `**Report failed.** ${detail}`);
+        flagReportError(detail);
         return;
       }
       const reader = res.body.getReader();
@@ -902,28 +1538,33 @@ function ChatPageInner() {
             reader.cancel();
             return;
           }
-          appendToAssistant(reportId, line);
+          appendToAssistantInRepo(repo, reportId, line);
         }
       }
     } catch (e) {
       if ((e as Error).name === "AbortError") return;
-      appendToAssistant(
-        reportId,
-        `\n\n**Report failed.** ${(e as Error).message || "Network error."}`,
-      );
+      flagReportError((e as Error).message || "Network error.");
     } finally {
       setIsStreaming(false);
       abortRef.current = null;
     }
-  }
+  }, [appendToAssistantInRepo, isStreaming, selectedRepo, setMessagesForRepo]);
 
-  function appendToAssistant(id: string, chunk: string) {
-    setMessages((m) =>
-      m.map((msg) =>
-        msg.id === id ? { ...msg, content: msg.content + chunk } : msg,
-      ),
-    );
-  }
+  // Replays an interrupted stream by deleting the failed assistant
+  // message and re-issuing send() with the same prompt.
+  const retryAssistantMessage = useCallback(
+    (msg: ChatMessage) => {
+      if (!msg.retryPrompt) return;
+      const repo = selectedRepo;
+      // Drop the failed bubble from this repo's history before
+      // re-sending so the user doesn't see two interleaved attempts.
+      setMessagesForRepo(repo, (prev) =>
+        prev.filter((m) => m.id !== msg.id),
+      );
+      void send(msg.retryPrompt);
+    },
+    [selectedRepo, send, setMessagesForRepo],
+  );
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -932,9 +1573,14 @@ function ChatPageInner() {
     }
   }
 
+  // Confirmation-gated. The actual wipe runs from the confirm modal,
+  // not directly from the header button.
   function clearChat() {
     abortRef.current?.abort();
-    setMessages([]);
+    if (selectedRepo) {
+      setMessagesForRepo(selectedRepo, () => []);
+    }
+    setClearConfirmOpen(false);
   }
 
   // --- render: loading ----------------------------------------------------
@@ -955,16 +1601,29 @@ function ChatPageInner() {
         {/* === LEFT: repo dropdown + quick actions === */}
         <aside className="hidden w-full shrink-0 flex-col gap-4 overflow-y-auto pr-1 md:flex md:w-[220px]">
           <Card className="p-3" flush>
-            <div className="px-1 pb-2 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
-              Active room
+            <div className="flex items-center justify-between px-1 pb-2 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
+              <span>Active room</span>
+              <kbd
+                className="rounded-sm border border-border bg-bg-elev px-1 text-[9px] uppercase tracking-[0.14em] text-muted"
+                aria-hidden
+              >
+                ⌘K
+              </kbd>
             </div>
             <RepoDropdown
               repos={repos}
               value={selectedRepo}
-              onChange={setSelectedRepo}
+              onChange={(r) => {
+                setSelectedRepo(r);
+                setRepoDropdownOpen(false);
+              }}
               disabled={isStreaming}
               installUrl={installStatus.installUrl}
               onInstallClick={() => setShowInstallModal(true)}
+              open={repoDropdownOpen}
+              onOpenChange={setRepoDropdownOpen}
+              devpodLive={devpodLive}
+              lastReviewByRepo={lastReviewByRepo}
             />
           </Card>
 
@@ -979,20 +1638,16 @@ function ChatPageInner() {
             <div className="px-1 pb-2 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
               Quick actions
             </div>
-            <div className="flex flex-col gap-1 p-1">
-              {QUICK_ACTIONS.map((a) => (
-                <button
-                  key={a.label}
-                  type="button"
-                  onClick={() => void send(a.prompt)}
-                  disabled={!hasRepo || isStreaming}
-                  className="rounded-sm border border-transparent px-2 py-1.5 text-left text-xs font-mono text-muted transition-colors hover:bg-bg-elev hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-muted"
-                  title={a.prompt}
-                >
-                  {a.label}
-                </button>
-              ))}
-            </div>
+            <QuickActionGrid
+              hasRepo={hasRepo}
+              isStreaming={isStreaming}
+              devpodLive={devpodLive}
+              onAction={(a) => {
+                if (a.action === "report") void generateReport();
+                else void send(a.prompt);
+              }}
+              compact
+            />
           </Card>
 
           {githubUsername && <DevPodPanel githubUsername={githubUsername} />}
@@ -1012,30 +1667,73 @@ function ChatPageInner() {
                   />
                 )}
                 <div className="min-w-0">
-                  <div className="truncate text-sm font-semibold">
+                  <div className="flex items-center gap-1.5 truncate text-sm font-semibold">
                     {hasRepo
-                      ? `#${selectedRepo.split("/")[1] ?? selectedRepo}`
+                      ? selectedRepo.split("/")[1] ?? selectedRepo
                       : "Chat"}
+                    {hasRepo && (
+                      <a
+                        href={`https://github.com/${selectedRepo}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-muted hover:text-text"
+                        title="Open on GitHub"
+                        aria-label="Open repository on GitHub"
+                      >
+                        <svg
+                          xmlns="http://www.w3.org/2000/svg"
+                          width="11"
+                          height="11"
+                          viewBox="0 0 16 16"
+                          fill="currentColor"
+                          aria-hidden
+                        >
+                          <path d="M9 2h5v5h-1V3.7L7.7 9 7 8.3 12.3 3H9V2z" />
+                          <path d="M3 4h4v1H4v7h7V9h1v4H3V4z" />
+                        </svg>
+                      </a>
+                    )}
                   </div>
-                  <div className="truncate text-[11px] font-mono text-muted">
+                  <div className="flex items-center gap-2 truncate text-[11px] font-mono text-muted">
                     {hasRepo ? selectedRepo : "no repository selected"}
+                    {hasRepo && (
+                      <span
+                        title={
+                          devpodLive
+                            ? "DevPod connected"
+                            : "DevPod not connected"
+                        }
+                        className="flex items-center gap-1"
+                      >
+                        <span
+                          className={
+                            "inline-block h-1.5 w-1.5 rounded-full " +
+                            (devpodLive ? "bg-[#4ade80]" : "bg-border")
+                          }
+                          aria-hidden
+                        />
+                        <span className="text-[10px] uppercase tracking-[0.14em]">
+                          DevPod
+                        </span>
+                      </span>
+                    )}
                   </div>
                 </div>
               </div>
               <div className="flex items-center gap-2">
                 <Button
                   size="sm"
-                  variant="default"
+                  variant="primary"
                   onClick={generateReport}
                   disabled={!hasRepo || isStreaming}
                   title="Generate health report"
                 >
-                  Report
+                  Generate report
                 </Button>
                 <Button
                   size="sm"
                   variant="default"
-                  onClick={clearChat}
+                  onClick={() => setClearConfirmOpen(true)}
                   disabled={messages.length === 0 && !isStreaming}
                 >
                   Clear
@@ -1056,6 +1754,10 @@ function ChatPageInner() {
                   disabled={isStreaming}
                   installUrl={installStatus.installUrl}
                   onInstallClick={() => setShowInstallModal(true)}
+                  open={repoDropdownOpen}
+                  onOpenChange={setRepoDropdownOpen}
+                  devpodLive={devpodLive}
+                  lastReviewByRepo={lastReviewByRepo}
                 />
               </div>
 
@@ -1090,9 +1792,7 @@ function ChatPageInner() {
                   <BriefingCard
                     briefing={briefing}
                     onDismiss={() =>
-                      setBriefing(
-                        briefing ? { ...briefing, dismissed: true } : null,
-                      )
+                      updateBriefingForRepo(selectedRepo, { dismissed: true })
                     }
                     onRefresh={() => void fetchBriefing(selectedRepo)}
                   />
@@ -1111,82 +1811,50 @@ function ChatPageInner() {
                 !roomTransition &&
                 messages.length === 0 &&
                 briefing?.dismissed && (
-                  <div className="space-y-3 py-12 text-center">
-                    <div className="font-mono text-[10px] uppercase tracking-[0.22em] text-muted">
-                      Ready
-                    </div>
-                    <div className="text-sm text-muted">
-                      Ask anything about {selectedRepo}.
-                    </div>
-                  </div>
+                  <EmptyRoomQuickStart
+                    repo={selectedRepo}
+                    devpodLive={devpodLive}
+                    onAction={(a) => {
+                      if (a.action === "report") void generateReport();
+                      else void send(a.prompt);
+                    }}
+                  />
                 )}
 
-              {messages.map((m) =>
-                m.kind === "report" ? (
-                  <ReportCard
-                    key={m.id}
-                    message={m}
-                    repo={selectedRepo}
-                    isStreaming={isStreaming}
-                  />
-                ) : (
+              {messages.map((m, idx) => {
+                const isLast = idx === messages.length - 1;
+                if (m.kind === "report") {
+                  return (
+                    <ReportCard
+                      key={m.id}
+                      message={m}
+                      repo={selectedRepo}
+                      isStreaming={isStreaming && isLast}
+                    />
+                  );
+                }
+                return (
                   <MessageBubble
                     key={m.id}
                     message={m}
-                    isStreaming={isStreaming}
+                    isStreaming={isStreaming && isLast}
+                    onRetry={() => retryAssistantMessage(m)}
+                    userAvatarUrl={userAvatarUrl}
+                    userLabel={githubUsername ?? "You"}
                   />
-                ),
-              )}
+                );
+              })}
             </div>
 
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                void send(input);
-              }}
-              className="flex items-end gap-2 border-t border-border bg-bg px-3 py-3"
-            >
-              <div className="flex flex-1 flex-col gap-1">
-                <textarea
-                  value={input}
-                  onChange={(e) =>
-                    setInput(e.target.value.slice(0, MAX_INPUT_CHARS))
-                  }
-                  onKeyDown={handleKeyDown}
-                  placeholder={
-                    !hasRepo
-                      ? "Select a repository first…"
-                      : isStreaming
-                        ? "Waiting for response…"
-                        : "Ask, review, or say 'close pr 42' / 'merge pr 7'…"
-                  }
-                  rows={1}
-                  disabled={isStreaming || !hasRepo}
-                  className="max-h-32 resize-none rounded-sm border border-border bg-card px-3 py-2 text-sm focus:border-white focus:outline-none disabled:opacity-60"
-                  style={{ minHeight: 38 }}
-                />
-                <div className="flex items-center justify-end text-[10px] font-mono text-muted">
-                  <span
-                    className={
-                      input.length >= MAX_INPUT_CHARS - 50
-                        ? "text-[#ff9d4d]"
-                        : ""
-                    }
-                  >
-                    {input.length}/{MAX_INPUT_CHARS}
-                  </span>
-                </div>
-              </div>
-              <Button
-                type="submit"
-                variant="primary"
-                size="md"
-                disabled={isStreaming || !input.trim() || !hasRepo}
-                className="self-start"
-              >
-                {isStreaming ? "…" : "Send"}
-              </Button>
-            </form>
+            <ChatComposer
+              hasRepo={hasRepo}
+              repo={selectedRepo}
+              isStreaming={isStreaming}
+              input={input}
+              onChange={setInput}
+              onSubmit={() => void send(input)}
+              onKeyDown={handleKeyDown}
+            />
           </Card>
         </section>
 
@@ -1240,6 +1908,82 @@ function ChatPageInner() {
           onClose={() => setShowInstallModal(false)}
         />
       )}
+
+      {clearConfirmOpen && hasRepo && (
+        <ConfirmModal
+          title="Clear conversation"
+          body={
+            <>
+              Clear conversation for{" "}
+              <code className="font-mono text-text">{selectedRepo}</code>? This
+              cannot be undone.
+            </>
+          }
+          confirmLabel="Clear chat"
+          onCancel={() => setClearConfirmOpen(false)}
+          onConfirm={clearChat}
+        />
+      )}
+
+      {/* Markup that lands inside dangerouslySetInnerHTML can't be
+          touched by Tailwind classes or styled-jsx component scopes.
+          The pieces below are global by necessity:
+            * .stream-caret — appended by appendCaret() to streaming
+              assistant content.
+            * .md-table     — rendered by renderMarkdown for pipe
+              tables (existing globals.css covers the .md-* heading
+              / list / code rules; tables and ordered lists are new
+              this commit and live here so we don't churn the global
+              stylesheet for a single page's surface). */}
+      <style jsx global>{`
+        @keyframes night-pr-caret-blink {
+          50% {
+            opacity: 0;
+          }
+        }
+        .stream-caret {
+          display: inline-block;
+          margin-left: 2px;
+          color: currentColor;
+          opacity: 0.7;
+          animation: night-pr-caret-blink 1s steps(2, end) infinite;
+          vertical-align: baseline;
+        }
+        .md-content .md-table {
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 0.85em;
+          margin: 0.5rem 0;
+        }
+        .md-content .md-table th,
+        .md-content .md-table td {
+          border: 1px solid var(--color-border);
+          padding: 0.35rem 0.55rem;
+          text-align: left;
+        }
+        .md-content .md-table thead {
+          background: rgba(255, 255, 255, 0.04);
+          color: var(--color-text);
+        }
+        .md-content .md-list-ordered {
+          list-style: decimal;
+        }
+        .report-content .md-table {
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 0.9em;
+          margin: 0.5rem 0;
+        }
+        .report-content .md-table th,
+        .report-content .md-table td {
+          border: 1px solid rgba(0, 0, 0, 0.12);
+          padding: 0.4rem 0.6rem;
+          text-align: left;
+        }
+        .report-content .md-table thead {
+          background: rgba(0, 0, 0, 0.04);
+        }
+      `}</style>
     </Container>
   );
 }
@@ -1248,6 +1992,21 @@ function ChatPageInner() {
 // Repo dropdown — left-sidebar picker (also reused on mobile).
 // =========================================================================
 
+// Searchable repo picker.
+//
+// Controlled `open` so a global Cmd+K can pop it open from anywhere
+// on the page (the parent owns the open state).
+//
+// Each row shows: 32px owner avatar · repo name · owner · last
+// review date · DevPod dot. The DevPod dot is a single boolean for
+// the *current user* — we don't track per-repo DevPod sessions
+// (DevPod sessions belong to a user, not a repo, so the dot is
+// shown next to whichever repo the user has selected to imply
+// "this is the room your DevPod will execute against").
+//
+// Search is purely client-side over the watched_repos list (which is
+// already a small, in-memory array). Matches against full repo path
+// case-insensitively.
 function RepoDropdown({
   repos,
   value,
@@ -1255,6 +2014,10 @@ function RepoDropdown({
   disabled,
   installUrl,
   onInstallClick,
+  open,
+  onOpenChange,
+  devpodLive = false,
+  lastReviewByRepo = {},
 }: {
   repos: WatchedRepoLite[];
   value: string;
@@ -1262,20 +2025,62 @@ function RepoDropdown({
   disabled: boolean;
   installUrl: string | null;
   onInstallClick: () => void;
+  open: boolean;
+  onOpenChange: (next: boolean) => void;
+  devpodLive?: boolean;
+  lastReviewByRepo?: LastReviewLookup;
 }) {
-  const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const searchRef = useRef<HTMLInputElement | null>(null);
+  // Tracks the prior `open` value so we can reset query/activeIdx
+  // ONLY on the open->closed->open transition, not on every render.
+  // Resetting via useState initializer + key-rotation would be
+  // cleaner but would also remount the search input on every Cmd+K,
+  // losing focus mid-keystroke. Tracking via ref keeps focus stable.
+  const wasOpenRef = useRef(false);
+  const [query, setQuery] = useState("");
+  const [activeIdx, setActiveIdx] = useState(0);
 
-  // Close on outside click / Escape. We attach the listener only while
-  // open so we don't run a no-op handler on every render of the page.
+  // Auto-focus search on open. We don't reset query in the effect —
+  // doing so triggers the React 19 set-state-in-effect rule. Instead,
+  // when the dropdown is closed externally and reopened, the parent
+  // owns the lifecycle: the controlled state already snaps back to
+  // false, then to true; we only auto-focus the input on the
+  // transition, leaving the existing query alone (which is what the
+  // user expects on Cmd+K → close → Cmd+K).
+  useEffect(() => {
+    if (open && !wasOpenRef.current) {
+      wasOpenRef.current = true;
+      // Defer to next tick so the input has been rendered.
+      const t = window.setTimeout(() => {
+        searchRef.current?.focus();
+        searchRef.current?.select();
+      }, 0);
+      return () => window.clearTimeout(t);
+    }
+    if (!open) {
+      wasOpenRef.current = false;
+    }
+  }, [open]);
+
+  // Close on outside click / Escape — only while open. The Escape
+  // handler is also tied to query: pressing Escape with a non-empty
+  // query clears it before closing, which is the convention for
+  // every other "search inside dropdown" UI.
   useEffect(() => {
     if (!open) return;
     function onDocClick(e: MouseEvent) {
       if (!containerRef.current) return;
-      if (!containerRef.current.contains(e.target as Node)) setOpen(false);
+      if (!containerRef.current.contains(e.target as Node)) onOpenChange(false);
     }
     function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") setOpen(false);
+      if (e.key === "Escape") {
+        if (query) {
+          setQuery("");
+        } else {
+          onOpenChange(false);
+        }
+      }
     }
     document.addEventListener("mousedown", onDocClick);
     document.addEventListener("keydown", onKey);
@@ -1283,16 +2088,39 @@ function RepoDropdown({
       document.removeEventListener("mousedown", onDocClick);
       document.removeEventListener("keydown", onKey);
     };
-  }, [open]);
+  }, [open, query, onOpenChange]);
 
   const empty = repos.length === 0;
-  // Show only the repo name (everything after the last "/") to keep
-  // the dropdown readable in a 220px sidebar. Full owner/name is in
-  // the tooltip + the chat header for context.
   function shortName(full: string): string {
     const slash = full.lastIndexOf("/");
     return slash >= 0 ? full.slice(slash + 1) : full;
   }
+
+  const filtered = useMemo(() => {
+    if (!query.trim()) return repos;
+    const q = query.trim().toLowerCase();
+    return repos.filter((r) => r.repo.toLowerCase().includes(q));
+  }, [repos, query]);
+
+  function commit(repo: string) {
+    onChange(repo);
+    onOpenChange(false);
+  }
+
+  function onSearchKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActiveIdx((i) => Math.min(i + 1, Math.max(filtered.length - 1, 0)));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActiveIdx((i) => Math.max(i - 1, 0));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      const target = filtered[activeIdx];
+      if (target) commit(target.repo);
+    }
+  }
+
   const label = value
     ? shortName(value)
     : empty
@@ -1303,7 +2131,7 @@ function RepoDropdown({
     <div ref={containerRef} className="relative">
       <button
         type="button"
-        onClick={() => !disabled && !empty && setOpen((v) => !v)}
+        onClick={() => !disabled && !empty && onOpenChange(!open)}
         disabled={disabled || empty}
         className="flex w-full items-center gap-2 rounded-sm border border-border bg-bg px-2.5 py-2 text-left text-xs transition-colors hover:border-border-strong disabled:cursor-not-allowed disabled:opacity-50"
         title={label}
@@ -1324,13 +2152,23 @@ function RepoDropdown({
           </span>
         )}
         <span className="min-w-0 flex-1 truncate font-mono">{label}</span>
+        {value && devpodLive && (
+          <span
+            className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-[#4ade80]"
+            title="DevPod connected"
+            aria-label="DevPod connected"
+          />
+        )}
         <svg
           xmlns="http://www.w3.org/2000/svg"
           width="10"
           height="10"
           viewBox="0 0 16 16"
           fill="currentColor"
-          className={"shrink-0 text-muted transition-transform " + (open ? "rotate-180" : "")}
+          className={
+            "shrink-0 text-muted transition-transform " +
+            (open ? "rotate-180" : "")
+          }
         >
           <path d="M3 6l5 5 5-5H3z" />
         </svg>
@@ -1354,53 +2192,100 @@ function RepoDropdown({
       {open && (
         <div
           role="listbox"
-          className="absolute left-0 right-0 z-30 mt-1 max-h-72 overflow-y-auto rounded-sm border border-border bg-bg shadow-lg"
+          className="absolute left-0 right-0 z-30 mt-1 overflow-hidden rounded-sm border border-border bg-bg shadow-lg"
         >
-          {repos.map((r) => {
-            const active = r.repo === value;
-            return (
-              <button
-                key={r.repo}
-                type="button"
-                role="option"
-                aria-selected={active}
-                onClick={() => {
-                  onChange(r.repo);
-                  setOpen(false);
-                }}
-                className={
-                  "flex w-full items-center gap-2 px-2.5 py-2 text-left text-xs transition-colors " +
-                  (active
-                    ? "bg-bg-elev text-text"
-                    : "text-muted hover:bg-bg-elev hover:text-text")
-                }
-                title={r.repo}
-              >
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={repoAvatarUrl(r.repo)}
-                  alt=""
-                  className="h-5 w-5 shrink-0 rounded-full border border-border bg-card"
-                />
-                <span className="truncate font-mono">{shortName(r.repo)}</span>
-                {active && (
-                  <span className="ml-auto text-[9px] font-mono uppercase tracking-[0.14em] text-muted">
-                    active
-                  </span>
-                )}
-              </button>
-            );
-          })}
+          <div className="border-b border-border bg-bg-elev p-2">
+            <input
+              ref={searchRef}
+              value={query}
+              onChange={(e) => {
+                setQuery(e.target.value);
+                setActiveIdx(0);
+              }}
+              onKeyDown={onSearchKeyDown}
+              placeholder="Search repositories…"
+              className="w-full rounded-sm border border-border bg-bg px-2 py-1.5 text-xs focus:border-white focus:outline-none"
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </div>
+          <div className="max-h-72 overflow-y-auto">
+            {filtered.length === 0 ? (
+              <div className="px-2.5 py-3 text-center text-[11px] text-muted">
+                No repositories match
+                <span className="font-mono"> &ldquo;{query}&rdquo;</span>
+              </div>
+            ) : (
+              filtered.map((r, idx) => {
+                const active = r.repo === value;
+                const isHighlight = idx === activeIdx;
+                const owner = repoOwner(r.repo);
+                const name = shortName(r.repo);
+                const lastReview = lastReviewByRepo[r.repo] ?? null;
+                return (
+                  <button
+                    key={r.repo}
+                    type="button"
+                    role="option"
+                    aria-selected={active}
+                    onMouseEnter={() => setActiveIdx(idx)}
+                    onClick={() => commit(r.repo)}
+                    className={
+                      "flex w-full items-center gap-2.5 px-2.5 py-2 text-left text-xs transition-colors " +
+                      (isHighlight
+                        ? "bg-bg-elev text-text"
+                        : active
+                          ? "bg-bg-elev/60 text-text"
+                          : "text-muted hover:bg-bg-elev hover:text-text")
+                    }
+                    title={r.repo}
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={`https://github.com/${owner}.png?size=32`}
+                      alt=""
+                      className="h-7 w-7 shrink-0 rounded-full border border-border bg-card"
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-1.5">
+                        <span className="truncate font-mono text-text">
+                          {name}
+                        </span>
+                        {active && devpodLive && (
+                          <span
+                            className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-[#4ade80]"
+                            title="DevPod connected"
+                            aria-hidden
+                          />
+                        )}
+                      </div>
+                      <div className="truncate text-[10px] font-mono text-muted">
+                        {owner}
+                        {lastReview ? (
+                          <span> · last review {formatAgo(lastReview)}</span>
+                        ) : null}
+                      </div>
+                    </div>
+                    {active && (
+                      <span className="text-[9px] font-mono uppercase tracking-[0.14em] text-muted">
+                        active
+                      </span>
+                    )}
+                  </button>
+                );
+              })
+            )}
+          </div>
           {installUrl && (
             <button
               type="button"
               onClick={() => {
-                setOpen(false);
+                onOpenChange(false);
                 onInstallClick();
               }}
               className="block w-full border-t border-border px-2.5 py-2 text-left text-xs text-muted hover:bg-bg-elev hover:text-text"
             >
-              + Add more via GitHub App
+              + Connect more repos
             </button>
           )}
         </div>
@@ -1505,27 +2390,20 @@ function NoRoomState({
   onInstall: () => void;
 }) {
   return (
-    <div className="flex flex-col items-center justify-center gap-5 py-16 text-center sm:py-24">
-      <div
-        className="flex h-16 w-16 items-center justify-center rounded-full border border-border bg-bg-elev"
-        aria-hidden
-      >
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          width="28"
-          height="28"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.5"
-          className="text-muted"
-        >
-          <path d="M3 3h12a3 3 0 0 1 3 3v15l-4-3-4 3-4-3-4 3V3z" />
-        </svg>
+    <div className="flex flex-col items-center justify-center gap-8 py-12 text-center sm:py-16">
+      <div className="space-y-3">
+        <div className="text-3xl">🌙</div>
+        <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">
+          Night PR Reviewer
+        </h1>
+        <p className="text-xs text-muted sm:text-sm">
+          Your autonomous code review agent
+        </p>
       </div>
+
       {repoCount === 0 ? (
         <div className="space-y-2">
-          <div className="text-base font-semibold">
+          <div className="text-sm font-semibold">
             No repositories connected
           </div>
           <p className="max-w-sm text-xs text-muted">
@@ -1537,16 +2415,18 @@ function NoRoomState({
             onClick={onInstall}
             className="mt-1 inline-flex items-center gap-2 rounded-sm bg-white px-4 py-2 font-mono text-xs uppercase tracking-[0.14em] text-black hover:bg-white/90"
           >
-            Install GitHub App →
+            Connect a repo →
           </button>
         </div>
       ) : (
         <div className="space-y-2">
-          <div className="text-base font-semibold">
+          <div className="text-sm font-semibold">
             Select a repository to start
           </div>
           <p className="text-xs text-muted">
-            Pick a room from the dropdown in the sidebar.
+            Pick a room from the dropdown in the sidebar (or press
+            <kbd className="mx-1 rounded-sm border border-border bg-bg-elev px-1 font-mono text-[10px] tracking-wide">⌘K</kbd>
+            ).
           </p>
           {installLoaded && healthy === 0 && stale > 0 && (
             <button
@@ -1559,6 +2439,47 @@ function NoRoomState({
           )}
         </div>
       )}
+
+      {/* Three product-pillar cards. Pure marketing copy — they
+          don't link anywhere because the relevant CTA (install /
+          select a repo) is right above. */}
+      <div className="grid w-full max-w-2xl grid-cols-1 gap-3 px-2 sm:grid-cols-3 sm:px-0">
+        <FeatureCard
+          icon="⚡"
+          title="Instant reviews"
+          body="Reviews land in ~30 seconds of opening a pull request."
+        />
+        <FeatureCard
+          icon="🧠"
+          title="AI-powered"
+          body="A 4-node LangGraph pipeline cross-checks every verdict."
+        />
+        <FeatureCard
+          icon="🧪"
+          title="Sandbox testing"
+          body="Live preview URLs and real test runs from your DevPod."
+        />
+      </div>
+    </div>
+  );
+}
+
+function FeatureCard({
+  icon,
+  title,
+  body,
+}: {
+  icon: string;
+  title: string;
+  body: string;
+}) {
+  return (
+    <div className="flex flex-col items-start gap-1 rounded-sm border border-border bg-bg-elev p-3 text-left">
+      <div className="text-xl" aria-hidden>
+        {icon}
+      </div>
+      <div className="text-sm font-semibold">{title}</div>
+      <p className="text-[11px] leading-relaxed text-muted">{body}</p>
     </div>
   );
 }
@@ -2256,16 +3177,31 @@ function ReportCard({
 // Message bubble
 // =========================================================================
 
+// Renders a single chat turn. The render contract:
+//   * User turns are right-aligned, white bubble, "You" label.
+//   * Assistant turns are left-aligned, dark bubble, 🌙 + "Agent" label.
+//   * `isStreaming` only applies to the LAST message — the parent
+//     gates this so older messages don't flash a cursor.
+//   * `streamError` (set by the parent on stream failure) renders an
+//     in-bubble "Response interrupted. Try again." banner with a
+//     retry button that re-issues `retryPrompt`.
 function MessageBubble({
   message,
   isStreaming,
+  onRetry,
+  userAvatarUrl,
+  userLabel,
 }: {
   message: ChatMessage;
   isStreaming: boolean;
+  onRetry?: () => void;
+  userAvatarUrl?: string | null;
+  userLabel?: string;
 }) {
   const isUser = message.role === "user";
   const isPendingAssistant =
-    !isUser && message.content === "" && isStreaming;
+    !isUser && message.content === "" && isStreaming && !message.streamError;
+  const isStreamingThis = !isUser && isStreaming && !message.streamError;
   const [copied, setCopied] = useState(false);
 
   async function copy() {
@@ -2278,46 +3214,122 @@ function MessageBubble({
     }
   }
 
+  // Render markdown plus an optional streaming caret. Always re-runs
+  // on every chunk because `message.content` changes — partial
+  // markdown therefore renders progressively.
+  const html = useMemo(() => {
+    const rendered = renderMarkdown(message.content);
+    return isStreamingThis && message.content
+      ? appendCaret(rendered)
+      : rendered;
+  }, [message.content, isStreamingThis]);
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
-      className={"flex flex-col " + (isUser ? "items-end" : "items-start")}
+      className={
+        "flex gap-2 " +
+        (isUser ? "flex-row-reverse items-start" : "flex-row items-start")
+      }
     >
+      {/* Avatar */}
+      {isUser ? (
+        userAvatarUrl ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={userAvatarUrl}
+            alt=""
+            className="mt-0.5 h-7 w-7 shrink-0 rounded-full border border-border bg-card"
+          />
+        ) : (
+          <span
+            aria-hidden
+            className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-border bg-bg-elev text-[10px] font-mono text-muted"
+          >
+            {(userLabel ?? "Y").slice(0, 1).toUpperCase()}
+          </span>
+        )
+      ) : (
+        <span
+          aria-hidden
+          className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-border bg-bg-elev text-sm"
+          title="Night PR Reviewer"
+        >
+          🌙
+        </span>
+      )}
+
       <div
         className={
-          "max-w-[85%] rounded-md px-3.5 py-2.5 text-sm sm:max-w-[80%] shadow-[0_1px_0_rgba(255,255,255,0.04)_inset] " +
-          (isUser
-            ? "bg-white text-black"
-            : "border border-border bg-bg-elev text-white")
+          "group relative flex min-w-0 flex-col " +
+          (isUser ? "items-end" : "items-start")
         }
       >
-        {isPendingAssistant ? (
-          <TypingDots />
-        ) : isUser ? (
-          <div className="whitespace-pre-wrap break-words">
-            {message.content}
-          </div>
-        ) : (
+        <div
+          className={
+            "flex items-center gap-2 px-1 pb-1 text-[10px] font-mono uppercase tracking-[0.14em] text-muted " +
+            (isUser ? "flex-row-reverse" : "")
+          }
+        >
+          <span>{isUser ? userLabel ?? "You" : "Agent"}</span>
+          <span aria-hidden>·</span>
+          <span>{formatTime(message.ts)}</span>
+        </div>
+
+        <div
+          className={
+            "relative max-w-[85%] rounded-md px-3.5 py-2.5 text-sm sm:max-w-[80%] " +
+            (isUser
+              ? "bg-white text-black"
+              : "border border-border bg-bg-elev text-white") +
+            " shadow-[0_1px_0_rgba(255,255,255,0.04)_inset]"
+          }
+        >
+          {isPendingAssistant ? (
+            <TypingDots />
+          ) : isUser ? (
+            <div className="whitespace-pre-wrap break-words">
+              {message.content}
+            </div>
+          ) : (
+            <div
+              className="md-content break-words"
+              dangerouslySetInnerHTML={{ __html: html }}
+            />
+          )}
+
+          {/* Copy on hover (assistant only). Anchors to the bubble
+              corner so user messages stay aligned. */}
+          {!isUser && !isPendingAssistant && message.content && (
+            <button
+              type="button"
+              onClick={copy}
+              className="absolute right-1 top-1 rounded-sm border border-border bg-bg/80 px-1.5 py-0.5 text-[9px] font-mono uppercase tracking-[0.14em] text-muted opacity-0 transition-opacity hover:text-white group-hover:opacity-100"
+              aria-label={copied ? "Copied" : "Copy"}
+            >
+              {copied ? "Copied" : "Copy"}
+            </button>
+          )}
+        </div>
+
+        {message.streamError && (
           <div
-            className="md-content break-words"
-            dangerouslySetInnerHTML={{ __html: renderMarkdown(message.content) }}
-          />
-        )}
-      </div>
-      <div className="mt-1 flex items-center gap-2 px-1">
-        <span className="font-mono text-[10px] text-muted">
-          {formatTime(message.ts)}
-        </span>
-        {!isUser && !isPendingAssistant && message.content && (
-          <button
-            type="button"
-            onClick={copy}
-            className="font-mono text-[10px] text-muted hover:text-white transition-colors"
+            className="mt-1.5 flex items-center gap-2 rounded-sm border border-[#ff9d4d]/40 bg-[#ff9d4d]/10 px-2.5 py-1 text-[11px] text-[#ff9d4d]"
+            role="alert"
           >
-            {copied ? "copied" : "copy"}
-          </button>
+            <span>Response interrupted. Try again.</span>
+            {onRetry && message.retryPrompt && (
+              <button
+                type="button"
+                onClick={onRetry}
+                className="rounded-sm border border-[#ff9d4d]/50 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-[0.14em] hover:bg-[#ff9d4d]/15"
+              >
+                Retry
+              </button>
+            )}
+          </div>
         )}
       </div>
     </motion.div>
@@ -2356,6 +3368,277 @@ function TypingDots() {
           }
         }
       `}</style>
+    </div>
+  );
+}
+
+// =========================================================================
+// Quick action grid — 3 rows × 3 columns (compact mode collapses to a
+// single column of buttons for the 220px sidebar). The "Run tests"
+// action is filtered out unless DevPod is connected.
+// =========================================================================
+
+function QuickActionGrid({
+  hasRepo,
+  isStreaming,
+  devpodLive,
+  onAction,
+  compact = false,
+}: {
+  hasRepo: boolean;
+  isStreaming: boolean;
+  devpodLive: boolean;
+  onAction: (a: QuickAction) => void;
+  compact?: boolean;
+}) {
+  // Flatten + filter the rows so the compact (sidebar) mode renders
+  // a vertical list while the wide (empty-room) mode keeps the
+  // 3×3 grid.
+  const visible = QUICK_ACTION_ROWS.flatMap((row) =>
+    row.filter((a) => !a.requiresDevpod || devpodLive),
+  );
+  if (compact) {
+    return (
+      <div className="flex flex-col gap-1 p-1">
+        {visible.map((a) => (
+          <button
+            key={a.label}
+            type="button"
+            onClick={() => onAction(a)}
+            disabled={!hasRepo || isStreaming}
+            className="rounded-sm border border-transparent px-2 py-1.5 text-left text-xs font-mono text-muted transition-colors hover:bg-bg-elev hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-muted"
+            title={a.action === "report" ? "Generate health report" : a.prompt}
+          >
+            {a.label}
+          </button>
+        ))}
+      </div>
+    );
+  }
+  return (
+    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+      {visible.map((a) => (
+        <button
+          key={a.label}
+          type="button"
+          onClick={() => onAction(a)}
+          disabled={!hasRepo || isStreaming}
+          className="flex h-full flex-col items-start gap-1 rounded-sm border border-border bg-bg-elev px-3 py-2.5 text-left text-xs font-mono text-text transition-colors hover:border-border-strong hover:bg-card disabled:cursor-not-allowed disabled:opacity-40"
+          title={a.action === "report" ? "Generate health report" : a.prompt}
+        >
+          <span className="text-sm font-semibold">{a.label}</span>
+          {a.action !== "report" && (
+            <span className="line-clamp-2 text-[10px] font-normal leading-snug text-muted">
+              {a.prompt}
+            </span>
+          )}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// =========================================================================
+// Empty-room quick start — shown when a repo IS selected but the
+// briefing has been dismissed and no messages exist yet. Mirrors the
+// empty-state spec ("Ask me anything about {repo}").
+// =========================================================================
+
+function EmptyRoomQuickStart({
+  repo,
+  devpodLive,
+  onAction,
+}: {
+  repo: string;
+  devpodLive: boolean;
+  onAction: (a: QuickAction) => void;
+}) {
+  return (
+    <div className="space-y-5 py-8">
+      <div className="flex flex-col items-center gap-2 text-center">
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={repoAvatarUrl(repo)}
+          alt=""
+          className="h-12 w-12 rounded-full border border-border bg-card"
+        />
+        <div className="text-sm font-semibold">
+          Ask me anything about{" "}
+          <span className="font-mono">{repo}</span>
+        </div>
+        <div className="text-[11px] text-muted">
+          Pick a quick action below or type your own question.
+        </div>
+      </div>
+      <QuickActionGrid
+        hasRepo={true}
+        isStreaming={false}
+        devpodLive={devpodLive}
+        onAction={onAction}
+      />
+    </div>
+  );
+}
+
+// =========================================================================
+// ChatComposer — the input area at the bottom of the chat pane.
+// Auto-resizes up to 5 lines, surfaces a character count only past
+// CHAR_COUNT_VISIBLE_THRESHOLD, swaps the Send button copy for a
+// spinner while a stream is running.
+// =========================================================================
+
+function ChatComposer({
+  hasRepo,
+  repo,
+  isStreaming,
+  input,
+  onChange,
+  onSubmit,
+  onKeyDown,
+}: {
+  hasRepo: boolean;
+  repo: string;
+  isStreaming: boolean;
+  input: string;
+  onChange: (v: string) => void;
+  onSubmit: () => void;
+  onKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+}) {
+  const ref = useRef<HTMLTextAreaElement | null>(null);
+
+  // Auto-resize: re-measure on every value change. We cap at ~5 lines
+  // (~120px); past that the textarea scrolls. Reset to "auto" first
+  // so shrinking works when the user deletes text.
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "auto";
+    const next = Math.min(el.scrollHeight, 120);
+    el.style.height = `${next}px`;
+  }, [input]);
+
+  const placeholder = !hasRepo
+    ? "Select a repository first"
+    : isStreaming
+      ? "Waiting for response…"
+      : `Ask anything about ${repo} or type a command…`;
+
+  const showCharCount = input.length > CHAR_COUNT_VISIBLE_THRESHOLD;
+  const nearLimit = input.length >= MAX_INPUT_CHARS - 50;
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        onSubmit();
+      }}
+      className="flex items-end gap-2 border-t border-border bg-bg px-3 py-3"
+    >
+      <div className="flex flex-1 flex-col gap-1">
+        <textarea
+          ref={ref}
+          value={input}
+          onChange={(e) => onChange(e.target.value.slice(0, MAX_INPUT_CHARS))}
+          onKeyDown={onKeyDown}
+          placeholder={placeholder}
+          rows={1}
+          disabled={isStreaming || !hasRepo}
+          className="resize-none rounded-sm border border-border bg-card px-3 py-2 text-sm focus:border-white focus:outline-none disabled:opacity-60"
+          style={{ minHeight: 38, maxHeight: 120 }}
+        />
+        {showCharCount && (
+          <div className="flex items-center justify-end text-[10px] font-mono text-muted">
+            <span className={nearLimit ? "text-[#ff9d4d]" : ""}>
+              {input.length}/{MAX_INPUT_CHARS}
+            </span>
+          </div>
+        )}
+      </div>
+      <Button
+        type="submit"
+        variant="primary"
+        size="md"
+        disabled={isStreaming || !input.trim() || !hasRepo}
+        className="self-start"
+        title={isStreaming ? "Streaming…" : "Send (Enter)"}
+      >
+        {isStreaming ? <ButtonSpinner /> : "Send"}
+      </Button>
+    </form>
+  );
+}
+
+function ButtonSpinner() {
+  return (
+    <span
+      aria-hidden
+      className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent"
+    />
+  );
+}
+
+// =========================================================================
+// Confirmation modal — used by the "Clear chat" button. Shares the
+// chrome of InstallAppModal but leaner; an InstallAppModal is too
+// heavy for an OK/Cancel.
+// =========================================================================
+
+function ConfirmModal({
+  title,
+  body,
+  confirmLabel,
+  onCancel,
+  onConfirm,
+}: {
+  title: string;
+  body: React.ReactNode;
+  confirmLabel: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") onCancel();
+      if (e.key === "Enter") onConfirm();
+    }
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.body.style.overflow = prev;
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [onCancel, onConfirm]);
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="confirm-modal-title"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm px-4"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onCancel();
+      }}
+    >
+      <div className="w-full max-w-sm rounded-md border border-border bg-bg shadow-2xl">
+        <header className="border-b border-border px-5 py-4">
+          <h2
+            id="confirm-modal-title"
+            className="text-base font-semibold leading-tight"
+          >
+            {title}
+          </h2>
+        </header>
+        <div className="px-5 py-4 text-sm leading-relaxed">{body}</div>
+        <footer className="flex items-center justify-end gap-2 border-t border-border px-5 py-3">
+          <Button size="sm" variant="default" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button size="sm" variant="primary" onClick={onConfirm}>
+            {confirmLabel}
+          </Button>
+        </footer>
+      </div>
     </div>
   );
 }

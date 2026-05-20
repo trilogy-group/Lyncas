@@ -74,9 +74,9 @@ For code diffs, use markdown code blocks.
 When asked to review a PR, give a structured review: verdict (approve/request changes), severity (1-10), key bugs found, and a recommendation.
 If the relevant data isn't in the REPOSITORY DATA block, say so plainly rather than guessing.
 
-WRITE OPERATIONS — when the user asks you to close, reopen, comment on, or merge a PR, include the appropriate ACTION block at the END of your response on its own line. The user does not see the ACTION line — it is parsed server-side and the platform executes the action for you, then appends a confirmation message.
+WRITE OPERATIONS — when the user asks you to close, reopen, comment on, or merge a PR, include the appropriate ACTION block(s) at the END of your response, each on its own line. The user does not see the ACTION lines — they are parsed server-side and the platform executes each action for you, then appends a confirmation message.
 
-Supported actions (one per response, exactly):
+Supported actions:
   ACTION: CLOSE_PR {number}
   ACTION: OPEN_PR {number}
   ACTION: COMMENT_PR {number} {your comment text on one line}
@@ -84,9 +84,13 @@ Supported actions (one per response, exactly):
 
 Rules:
 - Use ACTION blocks ONLY when the user explicitly requests the action ("close pr 42", "merge this pr", etc.). Do not invent actions.
-- Always confirm BEFORE merging. For "merge pr 42" requests, first reply with "Are you sure you want to merge PR #42? Reply 'yes, merge' to proceed." and DO NOT include ACTION: MERGE_PR. Only include ACTION: MERGE_PR after the user explicitly confirms ("yes, merge", "confirmed", etc.).
+- Always confirm BEFORE merging. For "merge pr 42" requests, first reply with "Are you sure you want to merge PR #42? Reply 'yes, merge' to proceed." and DO NOT include ACTION: MERGE_PR. Only include ACTION: MERGE_PR after the user explicitly confirms ("yes, merge", "confirmed", etc.). The same confirmation rule applies to bulk merges — never emit ACTION: MERGE_PR for multiple PRs without an explicit confirmation in the prior turn.
 - For COMMENT_PR, the comment text follows the number on the SAME line. Keep it under 1000 characters and use plain text (no triple backticks — they break the parser). Markdown without code fences is fine.
-- One ACTION per response, max.
+- When closing/opening multiple PRs, include one ACTION block per PR at the end of your response. Example for closing 3 PRs:
+    ACTION: CLOSE_PR 38
+    ACTION: CLOSE_PR 37
+    ACTION: CLOSE_PR 33
+  Put each ACTION on its own line with no blank lines between them. The platform executes them in order and appends one confirmation per PR.
 - The user sees only your prose. Do not refer to "the ACTION block" in your prose.`;
 }
 
@@ -721,10 +725,20 @@ async function fetchGitHubContext(
 }
 
 // --- Action execution ----------------------------------------------------
-// Parses + executes ONE ACTION block, returns a confirmation string that
-// the streaming layer appends to the assistant's response. Failures are
-// surfaced as user-visible warnings instead of swallowing — the user
-// asked for this action and deserves to know if GitHub rejected it.
+// Parses + executes ACTION blocks emitted by Claude at the tail of a
+// response. The streaming layer hides everything from the first
+// `ACTION:` marker onward so the user never sees the raw markers;
+// here we walk the hidden region line-by-line, parse each ACTION:
+// line, and execute them in source order. Failures are surfaced as
+// user-visible warnings instead of swallowing — the user asked for
+// these actions and deserves to know if GitHub rejected any.
+//
+// Multiple ACTIONs in one response are supported (bulk close /
+// reopen / comment). The system prompt asks for one ACTION per
+// line with no blank lines between them; we're tolerant of stray
+// non-ACTION lines (they're just skipped by parseAction) but we
+// preserve the order so confirmations match the user's mental
+// model of "what got done, in the order I asked".
 
 type ActionKind = "CLOSE_PR" | "OPEN_PR" | "COMMENT_PR" | "MERGE_PR";
 
@@ -980,28 +994,70 @@ async function streamFromAnthropic(opts: {
         controller_: ReadableStreamDefaultController<Uint8Array>,
       ): Promise<void> {
         if (actionStart === -1) return;
-        const actionRegion = accum.slice(actionStart).trim();
-        // Take just the first line (everything up to the next newline)
-        // — Claude is instructed to put one ACTION per response with
-        // the body inline; multi-line would be a malformed action.
-        const firstLine = actionRegion.split("\n")[0];
-        const parsed = parseAction(firstLine);
-        if (!parsed) return;
+
+        // Walk every line in the captured action region. Lines that
+        // don't parse as an ACTION are silently skipped — Claude is
+        // instructed to keep ACTIONs contiguous at the end, but a
+        // stray prose line shouldn't abort the bulk operation.
+        const actionRegion = accum.slice(actionStart);
+        const parsed: ParsedAction[] = [];
+        for (const rawLine of actionRegion.split("\n")) {
+          const line = rawLine.trim();
+          if (!line) continue;
+          const p = parseAction(line);
+          if (p) parsed.push(p);
+        }
+        if (parsed.length === 0) return;
+
+        // Dedupe by (kind, number) so a model that emitted the same
+        // ACTION twice doesn't double-close a PR. Comment_PR isn't
+        // collapsed (two different comments to the same PR is a
+        // legitimate, if rare, request).
+        const seen = new Set<string>();
+        const actions: ParsedAction[] = [];
+        for (const p of parsed) {
+          const key =
+            p.kind === "COMMENT_PR"
+              ? `${p.kind}#${p.number}#${p.comment}`
+              : `${p.kind}#${p.number}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          actions.push(p);
+        }
+
         if (!allowActions || !writeToken) {
-          // Action stripped but not executed — leave a discreet hint
-          // so the user knows their request didn't run.
-          controller_.enqueue(
-            encoder.encode(
-              `data: \n\n_(${parsed.kind} #${parsed.number} not executed — no write token for this repo.)_\n\n`,
-            ),
-          );
+          // Actions stripped but not executed — leave one discreet
+          // hint per planned action so the user knows what was
+          // suppressed and why.
+          const lines = actions
+            .map(
+              (a) =>
+                `_(${a.kind} #${a.number} not executed — no write token for this repo.)_`,
+            )
+            .join("\n");
+          controller_.enqueue(encoder.encode(`data: \n\n${lines}\n\n`));
           return;
         }
-        const result = await executeAction(repo, writeToken, parsed);
-        if (result) {
-          // Two-line break before the confirmation so it visually
-          // separates from the response prose.
-          controller_.enqueue(encoder.encode(`data: \n\n${result}\n\n`));
+
+        // Execute sequentially. We deliberately do NOT Promise.all
+        // these: GitHub's secondary rate-limit punishes burst
+        // writes against the same repo, and sequential execution
+        // also gives the user a deterministic confirmation order
+        // matching the order the model emitted (which mirrored
+        // the order they asked for). Each result is emitted
+        // immediately so a slow nth action doesn't hide the
+        // earlier confirmations.
+        const confirmations: string[] = [];
+        for (const action of actions) {
+          const result = await executeAction(repo, writeToken, action);
+          if (result) confirmations.push(result);
+        }
+        if (confirmations.length > 0) {
+          // One blank line between confirmations keeps the markdown
+          // renderer from collapsing them into a single paragraph.
+          controller_.enqueue(
+            encoder.encode(`data: \n\n${confirmations.join("\n\n")}\n\n`),
+          );
         }
       }
 

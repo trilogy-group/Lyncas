@@ -6,7 +6,7 @@ import {
 import { resolveGithubToken } from "@/lib/github-token";
 import {
   normalizeGithubUsername,
-  resolveUserIdByUsername,
+  resolveUserIdByAuthUsername,
   verifyConnectToken,
 } from "@/lib/devpod";
 import { getSandboxResultsForRepo } from "@/lib/queries";
@@ -1091,8 +1091,12 @@ interface AuthedPrincipal {
 // header is absent/invalid. The token is the same composite the
 // /api/devpod/token route hands out:
 //   <github_username>:<DEVPOD_CONNECT_SECRET>
-// We lower-case the username, then look up the matching
-// user_profiles row via the security-definer RPC from migration 014.
+// We lower-case the username, verify the secret half against
+// DEVPOD_CONNECT_SECRET in constant time, then look up the
+// matching auth.users row by raw_user_meta_data->>'user_name'
+// via the migration-016 security-definer RPC. We use the auth.users
+// path (not user_profiles) so the npr CLI works even when the
+// profile-row upsert hasn't run yet.
 async function resolveDevpodAuth(
   request: NextRequest,
 ): Promise<AuthedPrincipal | null> {
@@ -1108,7 +1112,7 @@ async function resolveDevpodAuth(
   if (!verifyConnectToken(headerValue, claimedUsername, serverSecret)) {
     return null;
   }
-  const userId = await resolveUserIdByUsername(claimedUsername);
+  const userId = await resolveUserIdByAuthUsername(claimedUsername);
   if (!userId) return null;
   return { id: userId, source: "devpod" };
 }
@@ -1164,26 +1168,37 @@ export async function POST(request: NextRequest) {
 
   // 3. AuthZ + token resolution.
   //
-  // We used to do this in two queries (one to confirm ownership, one
-  // to load the credential). resolveGithubToken does both in a single
-  // user_id-scoped lookup of watched_repos: if the user doesn't own
-  // a row for this repo, the SELECT returns no row, and the helper
-  // lands on `source: "env"` (or `"none"` if PR_REVIEWER_PAT is also
-  // unset). We then check ownership separately so a user without a
-  // connection still sees a 403 instead of silently using the
-  // deploy-wide PAT to read someone else's public repo.
+  // Two paths diverge here:
+  //
+  //   * JWT (dashboard) — the user MUST have a watched_repos row for
+  //     this repo. resolveGithubToken would happily fall through to
+  //     PR_REVIEWER_PAT for any repo (which is correct for non-write
+  //     reads), but for the dashboard we want a hard 403 instead of
+  //     letting the user silently query someone else's public repo
+  //     using the deploy-wide PAT.
+  //
+  //   * DevPod token (npr CLI) — the user is authenticated by
+  //     possession of <github_username>:<DEVPOD_CONNECT_SECRET>, and
+  //     the CLI is meant to work in any git checkout the user has
+  //     locally. We deliberately skip the watched_repos ownership
+  //     check: if the user has connected the repo we'll mint an
+  //     installation token below; if not, resolveGithubToken falls
+  //     through to PR_REVIEWER_PAT, which on EC2 has read access to
+  //     everything we care about. Result: `npr` works in any repo.
   const supabase = await createSupabaseServerClient();
-  const { data: ownership } = await supabase
-    .from("watched_repos")
-    .select("id")
-    .eq("user_id", user.id)
-    .eq("repo", repo)
-    .maybeSingle();
-  if (!ownership) {
-    return jsonError(
-      "You haven't connected this repo. Install the GitHub App from the chat page first.",
-      403,
-    );
+  if (user.source === "jwt") {
+    const { data: ownership } = await supabase
+      .from("watched_repos")
+      .select("id")
+      .eq("user_id", user.id)
+      .eq("repo", repo)
+      .maybeSingle();
+    if (!ownership) {
+      return jsonError(
+        "You haven't connected this repo. Install the GitHub App from the chat page first.",
+        403,
+      );
+    }
   }
 
   // 4. Anthropic

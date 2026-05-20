@@ -111,6 +111,39 @@ export async function resolveUserIdByUsername(
   return null;
 }
 
+// Same shape as resolveUserIdByUsername, but reads auth.users
+// directly via the migration-016 security-definer function. Use
+// this when you need to authenticate a github_username regardless
+// of whether the user_profiles upsert has run — e.g. the X-DevPod-
+// Token path on /api/chat, where the CLI's user MUST resolve even
+// in the rare race where their profile row hasn't landed yet.
+//
+// Why a second helper instead of replacing resolveUserIdByUsername:
+// the existing /register and /ping paths intentionally write
+// `user_id=null` when the profile row is missing (the CLI does
+// not have to wait for a OAuth-callback race to finish). Pointing
+// those routes at auth.users would change that contract; we keep
+// the user_profiles helper for them and add this one only for
+// callers that need the canonical source.
+export async function resolveUserIdByAuthUsername(
+  github_username: string,
+): Promise<string | null> {
+  if (!github_username) return null;
+  const supabase = await createSupabaseServerClient();
+  const { data, error } = await supabase.rpc(
+    "devpod_user_id_by_auth_username",
+    { p_username: github_username },
+  );
+  if (error) {
+    console.warn(
+      `[devpod] auth.users lookup for github_username='${github_username}' failed: ${error.message}`,
+    );
+    return null;
+  }
+  if (typeof data === "string" && data.length > 0) return data;
+  return null;
+}
+
 // Notify the local Openclaw gateway (if any) that a new DevPod is
 // online. Fire-and-forget — Openclaw not running is the steady state
 // for deployments that aren't using it, so any error here is logged

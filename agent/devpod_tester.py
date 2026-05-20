@@ -2,9 +2,12 @@
 devpod_tester.py — sandbox-test a PR by driving the user's DevPod
 MCP server through a sequence of commands:
 
-  1. Obtain a working tree   — shallow-clone the repo into the
-                               fixed path /tmp/pr-test (wiped on
-                               every run). Then
+  1. Obtain a working tree   — shallow-clone the repo into
+                               /tmp/pr-test-<n> (per-PR; wiped
+                               on every run AND at tail cleanup
+                               so two consecutive PRs cannot
+                               share a stale `.next` or
+                               `node_modules`). Then
                                `git fetch pull/<n>/head:pr-branch`
                                + `git checkout pr-branch` + echo
                                CLONE_SUCCESS. The marker is the
@@ -125,14 +128,22 @@ APP_PORT_CANDIDATES = (3000, 8000, 8080, 5000)
 # without re-commenting historical PRs.
 SANDBOX_COMMENT_MARKER = "<!-- night-pr-reviewer:sandbox:v2 -->"
 
-# Where we clone the PR into on the DevPod. Fixed absolute path (not
-# a per-PR subdir) because the spec calls for `/tmp/pr-test` as the
-# canonical destination. Trade-off: two sandbox runs for two
-# different PRs on the same DevPod will now clobber each other —
-# acceptable given the v2 contract is one PR at a time per
-# workspace. If parallel PR testing comes back, suffix this with
-# the PR number again.
-SANDBOX_CLONE_DIR = "/tmp/pr-test"
+# Where we clone the PR into on the DevPod. Per-PR subdirectory
+# under /tmp so two concurrent runs (and back-to-back runs that
+# share the same DevPod) can never collide on each other's build
+# artifacts. The previous v2 design used a single shared
+# `/tmp/pr-test` and we observed stale `.next` directories from a
+# prior PR contaminating the next run — even though the clone
+# command `rm -rf`s the target, an intermediate failure could
+# leave the dir half-wiped, and an aborted run never ran the
+# cleanup at all.
+#
+# Cleanup runs at the tail of every run() invocation (via
+# _cleanup_command), so steady-state /tmp footprint per PR is
+# zero. The compose helper below is the single source of truth
+# for the path.
+def _clone_dir(pr_number: int) -> str:
+    return f"/tmp/pr-test-{pr_number}"
 
 # Sentinel printed at the tail of the clone command. The MCP server
 # returns success=True whenever the chained command exits 0, but
@@ -197,8 +208,8 @@ def _post_execute(tunnel_url: str, body: dict[str, Any]) -> dict[str, Any]:
 
 def _checkout_command(repo: str, pr_number: int, github_token: str) -> str:
     """Return the single shell command that:
-       a) wipes /tmp/pr-test from any prior run,
-       b) shallow-clones the PR's repo into /tmp/pr-test,
+       a) wipes the per-PR /tmp/pr-test-<n> from any prior run,
+       b) shallow-clones the PR's repo into that path,
        c) fetches the PR head into a local pr-branch and checks it
           out,
        d) prints CLONE_SUCCESS on the final line.
@@ -210,47 +221,42 @@ def _checkout_command(repo: str, pr_number: int, github_token: str) -> str:
     CLONE_SUCCESS from printing, which the caller treats as
     clone_success=False.
 
-    The previous version had a workspace-copy fast-path
-    (cp -r $DEVPOD_WORKSPACE_FOLDER pr-test) that skipped the clone
-    when the DevPod was already inside a working tree. The v2
-    spec drops it: the clone destination is hard-coded to
-    /tmp/pr-test and the command must be exactly as documented at
-    the top of this module. The fast-path's only win was saving
-    one shallow clone per run; clone of a small Next.js repo is
-    sub-second on tmpfs so it isn't worth the conditional.
+    Per-PR directory: every PR gets its own /tmp/pr-test-<n>
+    subdirectory so two consecutive runs cannot leak build
+    artifacts (notably Next.js `.next`) into one another's
+    workspace. The cleanup helper at the tail of run() removes
+    this directory whether the run succeeded or failed.
 
     Token leakage: the github_token appears in the clone URL. The
     MCP server runs subprocesses with shell=True so the token is
     visible in /proc/<pid>/cmdline for the duration of the clone.
     Acceptable for the v1 sandbox model (the DevPod is the user's
     own machine)."""
+    workdir = _clone_dir(pr_number)
     clone_url = (
         f"https://x-access-token:{github_token}@github.com/{repo}.git"
         if github_token
         else f"https://github.com/{repo}.git"
     )
     return (
-        f"rm -rf {SANDBOX_CLONE_DIR} && "
-        f'git clone --depth=1 "{clone_url}" {SANDBOX_CLONE_DIR} && '
-        f"cd {SANDBOX_CLONE_DIR} && "
+        f"rm -rf {workdir} && "
+        f'git clone --depth=1 "{clone_url}" {workdir} && '
+        f"cd {workdir} && "
         f"git fetch origin pull/{pr_number}/head:pr-branch && "
         f"git checkout pr-branch && "
         f"echo {CLONE_SUCCESS_MARKER}"
     )
 
 
-def _install_command() -> str:
+def _install_command(pr_number: int) -> str:
     """Best-effort dependency install across the three supported
     stacks. The shell `(a || b || c || echo)` chain matches the
     user's spec: try npm, then pip, then `go mod download`, then
     no-op. The trailing `echo no deps` keeps the exit code zero so
-    we don't confuse a missing manifest with an install failure.
-
-    `cd` target is the fixed SANDBOX_CLONE_DIR — there's no per-PR
-    isolation directory in v2; see _checkout_command for the
-    rationale."""
+    we don't confuse a missing manifest with an install failure."""
+    workdir = _clone_dir(pr_number)
     return (
-        f"cd {SANDBOX_CLONE_DIR} && "
+        f"cd {workdir} && "
         f"( [ -f package.json ] && npm install --no-audit --no-fund 2>&1 || "
         f"  [ -f requirements.txt ] && pip install -r requirements.txt 2>&1 || "
         f"  [ -f go.mod ] && go mod download 2>&1 || "
@@ -258,7 +264,33 @@ def _install_command() -> str:
     )
 
 
-def _start_app_command() -> str:
+def _verify_build_command(pr_number: int) -> str:
+    """Belt-and-braces build-artifact check, run RIGHT BEFORE
+    start_app. If the dedicated build step earlier in the
+    pipeline ran cleanly we expect /tmp/pr-test-<n>/.next to
+    exist for Next.js projects — `ls` exits 0 and we echo
+    BUILD_EXISTS. Otherwise (build step skipped because the MCP
+    server is too old, or build succeeded but the artifact was
+    cleaned up between steps), we run `npm run build` inline as
+    a recovery so start_app has something to serve.
+
+    The check is gated on package.json so we don't try
+    `npm run build` on a Python / Go project. The MCP server's
+    run_command timeout is 120s; that's enough for an incremental
+    rebuild but tight for a full cold build — the dedicated build
+    step (180s) should already have produced the artifact in the
+    happy path, so this is purely a safety net."""
+    workdir = _clone_dir(pr_number)
+    return (
+        f"cd {workdir} && "
+        f"( [ -f package.json ] && "
+        f"  ( ls {workdir}/.next >/dev/null 2>&1 && echo BUILD_EXISTS "
+        f"    || npm run build 2>&1 ) "
+        f"  || echo 'not a node project — skipping build verification' )"
+    )
+
+
+def _start_app_command(pr_number: int) -> str:
     """Try canonical entrypoints across Next.js, Python, and Go.
     We set PORT=3000 as a hint for tools that honor it (npm scripts,
     Next.js, Express) but DO NOT force the app to that port — most
@@ -270,8 +302,9 @@ def _start_app_command() -> str:
     Next.js / React apps are the most common stack. `go run .` is
     last because compiling Go on every start adds 5–15s, which
     eats into the 8s bind window."""
+    workdir = _clone_dir(pr_number)
     return (
-        f"cd {SANDBOX_CLONE_DIR} && "
+        f"cd {workdir} && "
         f"export PORT=3000 && "
         f"( npm start 2>&1 "
         f"  || python app.py 2>&1 "
@@ -279,6 +312,17 @@ def _start_app_command() -> str:
         f"  || go run . 2>&1 "
         f'  || echo "no entrypoint detected" )'
     )
+
+
+def _cleanup_command(pr_number: int) -> str:
+    """Shell expression that wipes the per-PR clone directory.
+    Posted to the MCP server at the tail of run(), even on the
+    early-exit clone-failure path, so /tmp doesn't accumulate
+    half-finished trees across PRs. We don't fail the run on a
+    cleanup error — the worst case is one stale directory that
+    the next PR's checkout step will rm -rf anyway."""
+    workdir = _clone_dir(pr_number)
+    return f"rm -rf {workdir}"
 
 
 def _port_detect_command() -> str:
@@ -777,7 +821,35 @@ def run() -> dict[str, Any]:
     started_at = time.time()
     print(f"[sandbox] starting PR {repo}#{pr_number} on {tunnel_url}")
 
-    cwd = SANDBOX_CLONE_DIR
+    cwd = _clone_dir(pr_number)
+
+    def _cleanup() -> None:
+        """Best-effort wipe of the per-PR clone directory. Always
+        called before run() returns (both success and failure
+        paths). Failures are logged at debug-noise level — the
+        next PR's _checkout_command does its own rm -rf so a
+        missed cleanup is recoverable, not load-bearing."""
+        try:
+            resp = _post_execute(
+                tunnel_url,
+                {
+                    "type": "run_command",
+                    "repo": repo,
+                    "command": _cleanup_command(pr_number),
+                },
+            )
+            if resp.get("exit_code") not in (0, None):
+                err = (resp.get("stderr") or resp.get("error") or "")[:200]
+                print(
+                    f"[sandbox] cleanup of {cwd} failed: {err}",
+                    file=sys.stderr,
+                )
+        except Exception as e:
+            print(
+                f"[sandbox] cleanup unexpectedly raised: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
 
     # --- Step A: clone + checkout ---------------------------------------
     # Single shell expression; the MCP server reports success=True
@@ -887,6 +959,9 @@ def run() -> dict[str, Any]:
                 f"{type(e).__name__}: {e}",
                 file=sys.stderr,
             )
+        # Still clean up: a half-clone may have left a partial tree
+        # behind that the next PR's checkout would have to wipe.
+        _cleanup()
         print(
             f"[sandbox] PR {repo}#{pr_number} — clone failed, "
             f"skipping install/tests/build/app"
@@ -903,7 +978,7 @@ def run() -> dict[str, Any]:
             {
                 "type": "run_command",
                 "repo": repo,
-                "command": _install_command(),
+                "command": _install_command(pr_number),
             },
         )
         install_success = bool(
@@ -998,12 +1073,39 @@ def run() -> dict[str, Any]:
     if clone_success and install_success and (
         not build_attempted or build_success
     ):
+        # Belt-and-braces: confirm a build artifact actually
+        # exists before launching the app. For Next.js this
+        # means /tmp/pr-test-<n>/.next; missing → run
+        # `npm run build` inline. Result is consumed only for
+        # logging — start_app proceeds either way (a non-Next
+        # project hits the "skipping build verification" branch
+        # and falls through harmlessly).
+        verify_resp = _post_execute(
+            tunnel_url,
+            {
+                "type": "run_command",
+                "repo": repo,
+                "command": _verify_build_command(pr_number),
+            },
+        )
+        verify_stdout = (verify_resp.get("stdout", "") or "").strip()
+        if "BUILD_EXISTS" in verify_stdout:
+            print(f"[sandbox] build verified at {cwd}/.next")
+        elif verify_stdout:
+            # Either we rebuilt inline or this isn't a Node
+            # project. Both are fine; we just record what
+            # happened for the operator log.
+            print(
+                f"[sandbox] build verify: "
+                f"{verify_stdout.splitlines()[-1][:200]}"
+            )
+
         start_resp = _post_execute(
             tunnel_url,
             {
                 "type": "start_app",
                 "repo": repo,
-                "command": _start_app_command(),
+                "command": _start_app_command(pr_number),
                 "cwd": cwd,
             },
         )
@@ -1139,6 +1241,13 @@ def run() -> dict[str, Any]:
     )
     print(f"[sandbox] App URL: {app_url or 'App not started'}")
     print(f"[sandbox] Verdict: {verdict} ({duration_ms}ms)")
+
+    # Tail cleanup so /tmp doesn't accumulate per-PR directories.
+    # Called LAST so we keep the tree around long enough for the
+    # GitHub comment to capture build/test/log output via the
+    # earlier steps. Cleanup failure is non-fatal — the next PR's
+    # checkout will rm -rf the dir anyway.
+    _cleanup()
 
     return summary
 

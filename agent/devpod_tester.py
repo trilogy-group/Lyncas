@@ -127,6 +127,14 @@ MAX_OUTPUT_BYTES = 16 * 1024
 def _app_port(pr_number: int) -> int:
     return 3000 + (pr_number % 100)
 
+
+# How long the per-PR clone tree (and therefore the live preview
+# URL backed by it) is kept alive after the sandbox finishes.
+# Chosen as 2 hours: long enough for a human reviewer to click
+# through from the PR comment after a CI run, short enough that
+# a chatty repo doesn't accumulate stale trees in /tmp.
+PREVIEW_PRESERVE_SEC = 2 * 60 * 60
+
 # Marker comment so a re-run on the same PR (e.g. force-push, then
 # webhook fires again) replaces the prior sandbox comment cleanly
 # rather than stacking. Mirrors the REVIEW_MARKER pattern in
@@ -334,14 +342,47 @@ def _start_app_command(pr_number: int) -> str:
 
 
 def _cleanup_command(pr_number: int) -> str:
-    """Shell expression that wipes the per-PR clone directory.
-    Posted to the MCP server at the tail of run(), even on the
-    early-exit clone-failure path, so /tmp doesn't accumulate
-    half-finished trees across PRs. We don't fail the run on a
-    cleanup error — the worst case is one stale directory that
-    the next PR's checkout step will rm -rf anyway."""
+    """Detached, *delayed* wipe of the per-PR clone directory.
+
+    The sandbox's whole point is to give the reviewer a live
+    preview URL on the PR comment — the cloudflared tunnel only
+    stays useful for as long as the running app can still read
+    its source / static assets from disk. Running an immediate
+    `rm -rf` here kills the preview the moment the sandbox
+    "succeeds", which defeats the feature.
+
+    Fix: fork a background bash that sleeps for
+    PREVIEW_PRESERVE_SEC seconds (2h) and only THEN wipes the
+    tree. The MCP server's `subprocess.run(shell=True)` invokes
+    a wrapping shell that returns the instant `&` fires, so the
+    sandbox finishes promptly while the cleanup proceeds out of
+    band.
+
+    The running app process (npm start / python / go) is
+    deliberately NOT killed alongside the rm. The spec is "let
+    the preview keep working for ~2 hours". After the rm fires
+    the running process will start 404'ing on lazy chunk loads
+    (Next.js) or asset reads — which is the desired graceful
+    decay; the OS reaps the process when it eventually crashes
+    on a failed read.
+
+    Caveats worth knowing:
+      * The 7200s sleep + the bash + the rm survive the original
+        MCP request because of `nohup` + `&`. They are NOT
+        guaranteed to survive a full DevPod restart — if the
+        user disconnects within 2h, the cleanup may never run
+        and the next sandbox will rm the stale tree at clone
+        time anyway.
+      * Without explicit `>/dev/null 2>&1 </dev/null` the
+        detached process inherits the parent's pipes; sleep + rm
+        don't write so no SIGPIPE in practice. Adding the
+        redirects is a textbook defensive tweak but not
+        strictly required for correctness here."""
     workdir = _clone_dir(pr_number)
-    return f"rm -rf {workdir}"
+    return (
+        f'nohup bash -c "sleep {PREVIEW_PRESERVE_SEC} && '
+        f'rm -rf {workdir}" &'
+    )
 
 
 def _port_detect_command(pr_number: int) -> str:
@@ -843,19 +884,35 @@ def run() -> dict[str, Any]:
 
     cwd = _clone_dir(pr_number)
 
-    def _cleanup() -> None:
-        """Best-effort wipe of the per-PR clone directory. Always
-        called before run() returns (both success and failure
-        paths). Failures are logged at debug-noise level — the
-        next PR's _checkout_command does its own rm -rf so a
-        missed cleanup is recoverable, not load-bearing."""
+    def _cleanup(*, immediate: bool = False) -> None:
+        """Schedule a delayed wipe of the per-PR clone directory.
+
+        Default behavior schedules the rm for 2h from now via
+        _cleanup_command (see its docstring for why the delay
+        exists — preserving the live preview URL).
+
+        `immediate=True` is the escape hatch for the early-exit
+        clone-failure path: there's no app running and no preview
+        URL to preserve, so we can rm the (possibly half-cloned)
+        tree right now instead of waiting 2 hours. Saves /tmp
+        space on a DevPod that's getting hammered by failing PRs.
+
+        Failures are logged but never raised — the next PR's
+        _checkout_command does its own rm -rf so a missed
+        cleanup is recoverable, not load-bearing."""
+        workdir = _clone_dir(pr_number)
+        cmd = (
+            f"rm -rf {workdir}"
+            if immediate
+            else _cleanup_command(pr_number)
+        )
         try:
             resp = _post_execute(
                 tunnel_url,
                 {
                     "type": "run_command",
                     "repo": repo,
-                    "command": _cleanup_command(pr_number),
+                    "command": cmd,
                 },
             )
             if resp.get("exit_code") not in (0, None):
@@ -979,9 +1036,10 @@ def run() -> dict[str, Any]:
                 f"{type(e).__name__}: {e}",
                 file=sys.stderr,
             )
-        # Still clean up: a half-clone may have left a partial tree
-        # behind that the next PR's checkout would have to wipe.
-        _cleanup()
+        # Clean up immediately: there's no app running and therefore
+        # no preview URL to preserve, so skip the 2-hour delay and
+        # free the (possibly half-cloned) tree right now.
+        _cleanup(immediate=True)
         print(
             f"[sandbox] PR {repo}#{pr_number} — clone failed, "
             f"skipping install/tests/build/app"
@@ -1260,12 +1318,18 @@ def run() -> dict[str, Any]:
         f"{'/failed' if build_attempted and not build_success else ''}"
     )
     print(f"[sandbox] App URL: {app_url or 'App not started'}")
+    if app_url:
+        # Only mention the preservation window when a preview URL
+        # actually exists — printing it on a no_tests / build_failed
+        # run would mislead the operator into thinking there's
+        # something live to click on.
+        print("[sandbox] preview will be available for ~2 hours")
     print(f"[sandbox] Verdict: {verdict} ({duration_ms}ms)")
 
-    # Tail cleanup so /tmp doesn't accumulate per-PR directories.
-    # Called LAST so we keep the tree around long enough for the
-    # GitHub comment to capture build/test/log output via the
-    # earlier steps. Cleanup failure is non-fatal — the next PR's
+    # Schedule the delayed cleanup so /tmp gets reclaimed once the
+    # preview window has expired. Called LAST so we keep the tree
+    # around for the earlier steps' file reads (build/test/log
+    # capture). Cleanup failure is non-fatal — the next PR's
     # checkout will rm -rf the dir anyway.
     _cleanup()
 

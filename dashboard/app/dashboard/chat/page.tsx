@@ -388,15 +388,63 @@ function renderMarkdown(raw: string): string {
       continue;
     }
 
+    // ----- blank line inside a list -----
+    // When the model emits `- one\n\n- two\n\n- three`, the naive
+    // parser would close the <ul> on every blank line and reopen it
+    // on the next bullet, producing three sibling <ul> blocks each
+    // wrapped in its own <p> by the post-processor — i.e. a full
+    // paragraph margin between bullets. Detect "blank line followed
+    // by another bullet" and stay inside the list. We push the
+    // blank as a literal line so the surrounding `<br>` collapse
+    // logic still works for non-list contexts.
+    if ((inUl || inOl) && line.trim() === "") {
+      let k = i + 1;
+      while (k < lines.length && lines[k].trim() === "") k++;
+      const next = lines[k] ?? "";
+      const nextIsUl = /^\s*[-*]\s+/.test(next);
+      const nextIsOl = /^\s*\d+\.\s+/.test(next);
+      if ((inUl && nextIsUl) || (inOl && nextIsOl)) {
+        // Skip the blank — we're still in the same list. Don't
+        // jump `i`; the blank line itself produces nothing.
+        continue;
+      }
+    }
+
     closeLists();
     out.push(line);
   }
   closeLists();
+
+  // Post-processing:
+  //   1. Split into paragraphs on blank lines.
+  //   2. For chunks that are block-level (start with <ul>, <ol>,
+  //      <table>, <pre>, <h{1,2,3}>): emit the chunk verbatim with
+  //      newlines collapsed (NOT converted to <br/> — that would
+  //      inject invalid `<br>` between `<li>` siblings, rendering as
+  //      extra vertical space in every browser we care about).
+  //   3. For text chunks: convert intra-paragraph newlines to <br/>
+  //      and wrap in <p>.
+  //
+  // The old version wrapped every chunk in <p> and br-substituted
+  // newlines globally; that produced both a paragraph margin around
+  // every list AND spurious <br>s inside the list, which together
+  // looked like "an empty line after every bullet".
+  const BLOCK_PREFIX_RE =
+    /^\s*<(ul|ol|table|pre|h1|h2|h3|blockquote|div)\b/i;
   return out
     .join("\n")
     .split(/\n{2,}/)
-    .map((p) => p.replace(/\n/g, "<br/>"))
-    .map((p) => (p.trim() ? `<p>${p}</p>` : ""))
+    .map((p) => {
+      const trimmed = p.trim();
+      if (!trimmed) return "";
+      if (BLOCK_PREFIX_RE.test(trimmed)) {
+        // Strip the layout newlines we inserted while assembling —
+        // they have no semantic value once the block-level tags are
+        // there to do the spacing for us.
+        return trimmed.replace(/\n+/g, "");
+      }
+      return `<p>${trimmed.replace(/\n/g, "<br/>")}</p>`;
+    })
     .join("");
 }
 
@@ -1949,16 +1997,50 @@ function ChatPageInner() {
           animation: night-pr-caret-blink 1s steps(2, end) infinite;
           vertical-align: baseline;
         }
+        /* ----- Chat bubble markdown overrides ------------------------ */
+        /* The bubbles set .font-mono so the cumulative inherited font   */
+        /* is IBM Plex Mono. We also tighten a few of the .md-content    */
+        /* defaults from globals.css because mono at 13px reads dense    */
+        /* and the legacy 1.5 line-height + 0.35rem paragraph margins    */
+        /* opened up too much vertical space between bullets and prose.  */
+        .md-content {
+          line-height: 1.45;
+        }
+        .md-content p {
+          margin: 0 0 0.25rem 0;
+        }
+        .md-content p:last-child {
+          margin-bottom: 0;
+        }
+        .md-content .md-list {
+          margin: 0.15rem 0;
+          padding-left: 1.1rem;
+        }
+        .md-content .md-list li {
+          margin: 0.02rem 0;
+          line-height: 1.4;
+        }
+        /* Adjacent lists (e.g. when a fence interrupts the flow) sit  */
+        /* flush rather than each one inheriting the paragraph margin. */
+        .md-content .md-list + .md-list {
+          margin-top: 0;
+        }
+        .md-content .md-h1,
+        .md-content .md-h2,
+        .md-content .md-h3 {
+          margin-top: 0.6rem;
+          margin-bottom: 0.25rem;
+        }
         .md-content .md-table {
           width: 100%;
           border-collapse: collapse;
-          font-size: 0.85em;
-          margin: 0.5rem 0;
+          font-size: 0.9em;
+          margin: 0.4rem 0;
         }
         .md-content .md-table th,
         .md-content .md-table td {
           border: 1px solid var(--color-border);
-          padding: 0.35rem 0.55rem;
+          padding: 0.3rem 0.5rem;
           text-align: left;
         }
         .md-content .md-table thead {
@@ -3280,7 +3362,7 @@ function MessageBubble({
 
         <div
           className={
-            "relative max-w-[85%] rounded-md px-3.5 py-2.5 text-sm sm:max-w-[80%] " +
+            "relative max-w-[85%] rounded-md px-3.5 py-2.5 font-mono text-[13px] leading-snug sm:max-w-[80%] " +
             (isUser
               ? "bg-white text-black"
               : "border border-border bg-bg-elev text-white") +
@@ -3543,7 +3625,7 @@ function ChatComposer({
           placeholder={placeholder}
           rows={1}
           disabled={isStreaming || !hasRepo}
-          className="resize-none rounded-sm border border-border bg-card px-3 py-2 text-sm focus:border-white focus:outline-none disabled:opacity-60"
+          className="resize-none rounded-sm border border-border bg-card px-3 py-2 font-mono text-[13px] leading-snug focus:border-white focus:outline-none disabled:opacity-60"
           style={{ minHeight: 38, maxHeight: 120 }}
         />
         {showCharCount && (

@@ -62,6 +62,23 @@ const APP_BIND_TIMEOUT_SEC = 8;
 // comment there for why we probe rather than force a single port.
 const APP_PORT_CANDIDATES = [3000, 8000, 8080, 5000] as const;
 
+// Where we clone the PR into on the DevPod. Mirrors
+// SANDBOX_CLONE_DIR in agent/devpod_tester.py — both paths must
+// agree on the destination or the webhook-driven run and the
+// chat-button-driven run will drift (the agent persists with
+// /tmp/pr-test as cwd while the dashboard re-runs would persist
+// with $HOME/pr-test-N as cwd, and a follow-up re-test would not
+// find the prior tree).
+const SANDBOX_CLONE_DIR = "/tmp/pr-test";
+
+// Sentinel printed at the tail of the clone command. The dashboard
+// route applies the same stricter rule as the Python script: an
+// exit-zero from git is not by itself proof of a clean checkout
+// (codespaces-base has been seen leaving partial trees on a
+// mid-fetch network blip). The marker on stdout is the only thing
+// that promotes the clone to clone_success=true.
+const CLONE_SUCCESS_MARKER = "CLONE_SUCCESS";
+
 interface MCPResponse {
   stdout?: string;
   stderr?: string;
@@ -163,34 +180,31 @@ async function postExecute(
 // Compose the same one-line shell expression used by
 // agent/devpod_tester.py._checkout_command. Centralizing the literal
 // would mean a shared file, which the build doesn't import — keep
-// this in sync with the Python helper if the workspace-copy
-// fast-path ever changes.
+// this in sync with the Python helper. v2 dropped the workspace-copy
+// fast-path; both runners now use a deterministic clone into
+// SANDBOX_CLONE_DIR and require the CLONE_SUCCESS marker on
+// stdout to promote the run to clone_success=true.
 function checkoutCommand(
   repo: string,
   prNumber: number,
   ghToken: string | null,
 ): string {
-  const targetDir = `"$HOME/pr-test-${prNumber}"`;
   const cloneUrl = ghToken
     ? `https://x-access-token:${ghToken}@github.com/${repo}.git`
     : `https://github.com/${repo}.git`;
   return [
-    `rm -rf ${targetDir}`,
-    `WORKSPACE="\${DEVPOD_WORKSPACE_FOLDER:-}"`,
-    `( [ -n "$WORKSPACE" ] && [ -d "$WORKSPACE/.git" ] && ` +
-      `cp -r "$WORKSPACE" ${targetDir} ` +
-      `|| git clone --depth=1 "${cloneUrl}" ${targetDir} )`,
-    `cd ${targetDir}`,
-    `(git branch -D pr-branch 2>/dev/null || true)`,
+    `rm -rf ${SANDBOX_CLONE_DIR}`,
+    `git clone --depth=1 "${cloneUrl}" ${SANDBOX_CLONE_DIR}`,
+    `cd ${SANDBOX_CLONE_DIR}`,
     `git fetch origin pull/${prNumber}/head:pr-branch`,
     `git checkout pr-branch`,
+    `echo ${CLONE_SUCCESS_MARKER}`,
   ].join(" && ");
 }
 
-function installCommand(prNumber: number): string {
-  const work = `"$HOME/pr-test-${prNumber}"`;
+function installCommand(): string {
   return (
-    `cd ${work} && ` +
+    `cd ${SANDBOX_CLONE_DIR} && ` +
     `( [ -f package.json ] && npm install --no-audit --no-fund 2>&1 || ` +
     `[ -f requirements.txt ] && pip install -r requirements.txt 2>&1 || ` +
     `[ -f go.mod ] && go mod download 2>&1 || ` +
@@ -198,10 +212,9 @@ function installCommand(prNumber: number): string {
   );
 }
 
-function startAppCommand(prNumber: number): string {
-  const work = `"$HOME/pr-test-${prNumber}"`;
+function startAppCommand(): string {
   return (
-    `cd ${work} && ` +
+    `cd ${SANDBOX_CLONE_DIR} && ` +
     `export PORT=3000 && ` +
     `( npm start 2>&1 ` +
     `|| python app.py 2>&1 ` +
@@ -320,27 +333,45 @@ export async function POST(request: NextRequest) {
 
       try {
         // ----- Step 1: clone / copy + checkout -----
+        // Marker check mirrors agent/devpod_tester.py: an exit-zero
+        // from git alone is not sufficient — codespaces-base has
+        // been observed leaving partial trees on mid-fetch network
+        // blips. Stdout must contain CLONE_SUCCESS for the clone to
+        // promote to success.
         emitStep("clone", "running");
         const checkout = await postExecute(session.tunnel_url, {
           type: "run_command",
           repo,
           command: checkoutCommand(repo, prNumber, resolved.token),
         });
-        const cloneSuccess =
+        const cloneExitZero =
           checkout.success === true || checkout.exit_code === 0;
+        const cloneMarkerSeen = (checkout.stdout ?? "").includes(
+          CLONE_SUCCESS_MARKER,
+        );
+        const cloneSuccess = cloneExitZero && cloneMarkerSeen;
+        const cloneError = cloneSuccess
+          ? undefined
+          : !cloneMarkerSeen && cloneExitZero
+            ? "clone command exited 0 but CLONE_SUCCESS marker missing — likely a partial checkout"
+            : (checkout.error ?? checkout.stderr);
         emitStep("clone", cloneSuccess ? "done" : "error", {
           success: cloneSuccess,
-          ...(cloneSuccess ? {} : { error: checkout.error ?? checkout.stderr }),
+          ...(cloneSuccess ? {} : { error: cloneError }),
         });
 
         // ----- Step 2: install -----
+        // Gated on cloneSuccess — same contract the agent enforces.
+        // A failed clone means downstream steps cannot produce
+        // meaningful signal, so we short-circuit straight to the
+        // verdict computation below.
         let installSuccess = false;
         if (cloneSuccess) {
           emitStep("install", "running");
           const install = await postExecute(session.tunnel_url, {
             type: "run_command",
             repo,
-            command: installCommand(prNumber),
+            command: installCommand(),
           });
           installSuccess =
             install.success === true || install.exit_code === 0;
@@ -360,7 +391,7 @@ export async function POST(request: NextRequest) {
           const testResp = await postExecute(session.tunnel_url, {
             type: "run_tests",
             repo,
-            cwd: `~/pr-test-${prNumber}`,
+            cwd: SANDBOX_CLONE_DIR,
           });
           const blob =
             (testResp.stdout ?? "") +
@@ -392,7 +423,7 @@ export async function POST(request: NextRequest) {
           const buildResp = await postExecute(session.tunnel_url, {
             type: "build",
             repo,
-            cwd: `~/pr-test-${prNumber}`,
+            cwd: SANDBOX_CLONE_DIR,
           });
           const errStr = (buildResp.error ?? "").toLowerCase();
           if (errStr.includes("unknown type")) {
@@ -434,8 +465,8 @@ export async function POST(request: NextRequest) {
           const start = await postExecute(session.tunnel_url, {
             type: "start_app",
             repo,
-            command: startAppCommand(prNumber),
-            cwd: `~/pr-test-${prNumber}`,
+            command: startAppCommand(),
+            cwd: SANDBOX_CLONE_DIR,
           });
           appStarted = start.started === true;
 

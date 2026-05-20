@@ -2,10 +2,20 @@
 devpod_tester.py — sandbox-test a PR by driving the user's DevPod
 MCP server through a sequence of commands:
 
-  1. Obtain a working tree   — copy the user's live workspace if it
-                               exists, otherwise shallow-clone.
-                               Then `git fetch pull/<n>/head:pr-branch`
-                               + `git checkout pr-branch`.
+  1. Obtain a working tree   — shallow-clone the repo into the
+                               fixed path /tmp/pr-test (wiped on
+                               every run). Then
+                               `git fetch pull/<n>/head:pr-branch`
+                               + `git checkout pr-branch` + echo
+                               CLONE_SUCCESS. The marker is the
+                               sole proof that the entire chain
+                               ran end-to-end; missing marker →
+                               clone_success=False → early exit
+                               (no install / tests / build / app),
+                               but we still post a PR comment +
+                               persist the result row so the
+                               dashboard doesn't show a stuck
+                               "running…" spinner.
   2. Install dependencies     — npm install / pip install -r ... whichever
                                manifests are present. Best-effort.
   3. Run the test suite       — MCP server's run_tests handler auto-detects
@@ -115,6 +125,24 @@ APP_PORT_CANDIDATES = (3000, 8000, 8080, 5000)
 # without re-commenting historical PRs.
 SANDBOX_COMMENT_MARKER = "<!-- night-pr-reviewer:sandbox:v2 -->"
 
+# Where we clone the PR into on the DevPod. Fixed absolute path (not
+# a per-PR subdir) because the spec calls for `/tmp/pr-test` as the
+# canonical destination. Trade-off: two sandbox runs for two
+# different PRs on the same DevPod will now clobber each other —
+# acceptable given the v2 contract is one PR at a time per
+# workspace. If parallel PR testing comes back, suffix this with
+# the PR number again.
+SANDBOX_CLONE_DIR = "/tmp/pr-test"
+
+# Sentinel printed at the tail of the clone command. The MCP server
+# returns success=True whenever the chained command exits 0, but
+# `git checkout` is finicky enough (detached HEAD, dirty trees,
+# permission issues on certain DevPod base images) that we want a
+# stricter "I actually got through every step" signal. The presence
+# of this exact string in stdout is the only thing that promotes
+# the clone to clone_success=True.
+CLONE_SUCCESS_MARKER = "CLONE_SUCCESS"
+
 # How long to wait (post-`start_app`) for the app to actually bind a
 # port. MCP server's start_app already sleeps 3s; we add another 5s
 # of polling for a total of ~8s before we give up. Next.js cold
@@ -168,65 +196,69 @@ def _post_execute(tunnel_url: str, body: dict[str, Any]) -> dict[str, Any]:
 # --- Step builders --------------------------------------------------------
 
 def _checkout_command(repo: str, pr_number: int, github_token: str) -> str:
-    """Return a single shell command that:
-       a) tries to copy the live DevPod workspace into ~/pr-test-<n>,
-       b) falls back to a shallow clone if the workspace isn't there,
-       c) fetches the PR head into a local pr-branch and checks it out.
+    """Return the single shell command that:
+       a) wipes /tmp/pr-test from any prior run,
+       b) shallow-clones the PR's repo into /tmp/pr-test,
+       c) fetches the PR head into a local pr-branch and checks it
+          out,
+       d) prints CLONE_SUCCESS on the final line.
 
     The command is intentionally one chained shell expression so the
     MCP server's per-call 120s timeout covers the whole sequence; a
-    multi-call version would need three round trips and three
-    timeouts. Side-effect of the chain: any non-zero exit fails the
-    whole step and we surface it as clone_success=False.
+    multi-call version would need multiple round trips and multiple
+    timeouts. Any non-zero exit in the chain prevents
+    CLONE_SUCCESS from printing, which the caller treats as
+    clone_success=False.
+
+    The previous version had a workspace-copy fast-path
+    (cp -r $DEVPOD_WORKSPACE_FOLDER pr-test) that skipped the clone
+    when the DevPod was already inside a working tree. The v2
+    spec drops it: the clone destination is hard-coded to
+    /tmp/pr-test and the command must be exactly as documented at
+    the top of this module. The fast-path's only win was saving
+    one shallow clone per run; clone of a small Next.js repo is
+    sub-second on tmpfs so it isn't worth the conditional.
 
     Token leakage: the github_token appears in the clone URL. The
     MCP server runs subprocesses with shell=True so the token is
     visible in /proc/<pid>/cmdline for the duration of the clone.
     Acceptable for the v1 sandbox model (the DevPod is the user's
-    own machine), and the workspace-copy fast path skips the clone
-    entirely when the user is working inside a real workspace."""
-    target_dir = f'"$HOME/pr-test-{pr_number}"'
-    workspace_expr = '"${DEVPOD_WORKSPACE_FOLDER:-}"'
+    own machine)."""
     clone_url = (
         f"https://x-access-token:{github_token}@github.com/{repo}.git"
         if github_token
         else f"https://github.com/{repo}.git"
     )
     return (
-        # Always start from a clean target dir so re-running the
-        # sandbox on the same PR doesn't pick up stale state.
-        f'rm -rf {target_dir} && '
-        f'WORKSPACE={workspace_expr} && '
-        # Copy fast-path (DevPod workspace exists & is a git repo).
-        # Otherwise shallow-clone with the installation token.
-        f'( [ -n "$WORKSPACE" ] && [ -d "$WORKSPACE/.git" ] && '
-        f'  cp -r "$WORKSPACE" {target_dir} '
-        f'  || git clone --depth=1 "{clone_url}" {target_dir} ) && '
-        f'cd {target_dir} && '
-        # Drop any half-checked-out pr-branch from a prior run.
-        f'(git branch -D pr-branch 2>/dev/null || true) && '
-        f'git fetch origin pull/{pr_number}/head:pr-branch && '
-        f'git checkout pr-branch'
+        f"rm -rf {SANDBOX_CLONE_DIR} && "
+        f'git clone --depth=1 "{clone_url}" {SANDBOX_CLONE_DIR} && '
+        f"cd {SANDBOX_CLONE_DIR} && "
+        f"git fetch origin pull/{pr_number}/head:pr-branch && "
+        f"git checkout pr-branch && "
+        f"echo {CLONE_SUCCESS_MARKER}"
     )
 
 
-def _install_command(pr_number: int) -> str:
+def _install_command() -> str:
     """Best-effort dependency install across the three supported
     stacks. The shell `(a || b || c || echo)` chain matches the
     user's spec: try npm, then pip, then `go mod download`, then
     no-op. The trailing `echo no deps` keeps the exit code zero so
-    we don't confuse a missing manifest with an install failure."""
-    work = f'"$HOME/pr-test-{pr_number}"'
+    we don't confuse a missing manifest with an install failure.
+
+    `cd` target is the fixed SANDBOX_CLONE_DIR — there's no per-PR
+    isolation directory in v2; see _checkout_command for the
+    rationale."""
     return (
-        f'cd {work} && '
-        f'( [ -f package.json ] && npm install --no-audit --no-fund 2>&1 || '
-        f'  [ -f requirements.txt ] && pip install -r requirements.txt 2>&1 || '
-        f'  [ -f go.mod ] && go mod download 2>&1 || '
+        f"cd {SANDBOX_CLONE_DIR} && "
+        f"( [ -f package.json ] && npm install --no-audit --no-fund 2>&1 || "
+        f"  [ -f requirements.txt ] && pip install -r requirements.txt 2>&1 || "
+        f"  [ -f go.mod ] && go mod download 2>&1 || "
         f'  echo "no deps detected" )'
     )
 
 
-def _start_app_command(pr_number: int) -> str:
+def _start_app_command() -> str:
     """Try canonical entrypoints across Next.js, Python, and Go.
     We set PORT=3000 as a hint for tools that honor it (npm scripts,
     Next.js, Express) but DO NOT force the app to that port — most
@@ -238,14 +270,13 @@ def _start_app_command(pr_number: int) -> str:
     Next.js / React apps are the most common stack. `go run .` is
     last because compiling Go on every start adds 5–15s, which
     eats into the 8s bind window."""
-    work = f'"$HOME/pr-test-{pr_number}"'
     return (
-        f'cd {work} && '
-        f'export PORT=3000 && '
-        f'( npm start 2>&1 '
-        f'  || python app.py 2>&1 '
-        f'  || python main.py 2>&1 '
-        f'  || go run . 2>&1 '
+        f"cd {SANDBOX_CLONE_DIR} && "
+        f"export PORT=3000 && "
+        f"( npm start 2>&1 "
+        f"  || python app.py 2>&1 "
+        f"  || python main.py 2>&1 "
+        f"  || go run . 2>&1 "
         f'  || echo "no entrypoint detected" )'
     )
 
@@ -746,9 +777,15 @@ def run() -> dict[str, Any]:
     started_at = time.time()
     print(f"[sandbox] starting PR {repo}#{pr_number} on {tunnel_url}")
 
-    cwd = os.path.expanduser(f"~/pr-test-{pr_number}")
+    cwd = SANDBOX_CLONE_DIR
 
-    # --- Step A: clone / copy + checkout ---------------------------------
+    # --- Step A: clone + checkout ---------------------------------------
+    # Single shell expression; the MCP server reports success=True
+    # iff every step exited 0. We additionally require the
+    # CLONE_SUCCESS marker on stdout because git checkout can
+    # silently leave a detached/dirty tree (rare but seen on the
+    # codespaces-base image) — without the marker we have no proof
+    # the chain ran all the way through.
     checkout_resp = _post_execute(
         tunnel_url,
         {
@@ -759,17 +796,103 @@ def run() -> dict[str, Any]:
             ),
         },
     )
-    clone_success = bool(
+    clone_stdout = checkout_resp.get("stdout", "") or ""
+    clone_stderr = checkout_resp.get("stderr", "") or ""
+    clone_exit_zero = bool(
         checkout_resp.get("success") is True
         or checkout_resp.get("exit_code") == 0
     )
+    clone_marker_seen = CLONE_SUCCESS_MARKER in clone_stdout
+    clone_success = clone_exit_zero and clone_marker_seen
+
     if not clone_success:
-        err = (
-            checkout_resp.get("stderr")
-            or checkout_resp.get("error")
-            or ""
+        # Compose the diagnostic message we want to surface in the
+        # GitHub comment + the stderr log. We deliberately keep
+        # this string short — the full transcript already lives in
+        # test_output via the persistence below.
+        if not clone_marker_seen and clone_exit_zero:
+            reason = (
+                "clone command exited 0 but CLONE_SUCCESS marker "
+                "was missing from stdout — likely a partial "
+                "checkout (network glitch mid-fetch, dirty tree, "
+                "or permission issue)"
+            )
+        else:
+            reason = (
+                clone_stderr.strip()
+                or checkout_resp.get("error")
+                or "git clone / fetch / checkout failed"
+            )
+        print(
+            f"[sandbox] checkout failed: {reason[:500]}",
+            file=sys.stderr,
         )
-        print(f"[sandbox] checkout failed: {err[:500]}", file=sys.stderr)
+
+        # --- Early exit on clone failure ----------------------------
+        # Spec: "If not [CLONE_SUCCESS] → set clone_success=False,
+        # post error comment, exit early. Never proceed to install
+        # if clone failed."
+        # We still walk the persist + comment path because the
+        # dashboard's "running…" spinner has to land somewhere and
+        # the rules say "Always post the GitHub comment even if
+        # some steps fail."
+        duration_ms = int((time.time() - started_at) * 1000)
+        early_summary: dict[str, Any] = {
+            "verdict": "error",
+            "overall": "error",
+            "tests_passed": 0,
+            "tests_failed": 0,
+            "no_tests": False,
+            "test_output": _truncate(
+                f"[clone failed] {reason}\n\n"
+                f"stdout:\n{clone_stdout[:4000]}\n\n"
+                f"stderr:\n{clone_stderr[:4000]}"
+            ),
+            "build_attempted": False,
+            "build_success": False,
+            "build_output": "",
+            "app_started": False,
+            "app_port": None,
+            "app_url": None,
+            "clone_success": False,
+            "install_success": False,
+            "install_output": "",
+            "duration_ms": duration_ms,
+            "workspace_id": workspace_id,
+        }
+        _upsert_result(
+            {
+                "repo": repo,
+                "pr_number": pr_number,
+                "user_id": _user_id_for_repo(repo),
+                "session_id": session_id,
+                "tests_passed": 0,
+                "tests_failed": 0,
+                "test_output": early_summary["test_output"],
+                "app_url": None,
+                "app_started": False,
+                "clone_success": False,
+                "install_success": False,
+                "overall": "error",
+                "duration_ms": duration_ms,
+            }
+        )
+        try:
+            _post_pr_comment(
+                repo, pr_number, _format_pr_comment(early_summary)
+            )
+        except Exception as e:
+            print(
+                f"[sandbox] PR comment unexpectedly raised: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+        print(
+            f"[sandbox] PR {repo}#{pr_number} — clone failed, "
+            f"skipping install/tests/build/app"
+        )
+        print(f"[sandbox] Verdict: error ({duration_ms}ms)")
+        return early_summary
 
     # --- Step B: install dependencies (best-effort) ---------------------
     install_success = False
@@ -780,7 +903,7 @@ def run() -> dict[str, Any]:
             {
                 "type": "run_command",
                 "repo": repo,
-                "command": _install_command(pr_number),
+                "command": _install_command(),
             },
         )
         install_success = bool(
@@ -880,7 +1003,7 @@ def run() -> dict[str, Any]:
             {
                 "type": "start_app",
                 "repo": repo,
-                "command": _start_app_command(pr_number),
+                "command": _start_app_command(),
                 "cwd": cwd,
             },
         )

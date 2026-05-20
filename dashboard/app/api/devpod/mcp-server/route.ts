@@ -70,6 +70,7 @@ def register(token, tunnel_url, workspace_id, port):
         "capabilities": {
             "run_command": True,
             "run_tests": True,
+            "build": True,
             "start_app": True,
             "expose_port": True
         }
@@ -170,6 +171,55 @@ class MCPHandler(BaseHTTPRequestHandler):
                     "exit_code": result.returncode,
                     "success": result.returncode == 0,
                     "test_runner": "auto-detected"
+                })
+
+            elif cmd_type == "build":
+                # Per-language build detection. Mirrors the
+                # auto-detect pattern in run_tests above. Timeout
+                # is 180s because Next.js builds (npm run build)
+                # routinely take 60–120s on cold caches; the spec
+                # caps us at 180s so a runaway webpack doesn't tie
+                # up the DevPod.
+                cwd = body.get("cwd", os.path.expanduser("~"))
+                pkg = os.path.join(cwd, "package.json")
+                if os.path.exists(pkg):
+                    # Cheap-and-cheerful "does it have a build
+                    # script" check — avoids depending on jq.
+                    try:
+                        with open(pkg, "r") as f:
+                            has_build = '"build"' in f.read()
+                    except Exception:
+                        has_build = False
+                    cmd = (
+                        "npm run build 2>&1"
+                        if has_build
+                        else "echo 'no build script in package.json'"
+                    )
+                elif os.path.exists(os.path.join(cwd, "go.mod")):
+                    cmd = "go build ./... 2>&1"
+                elif (
+                    os.path.exists(os.path.join(cwd, "pyproject.toml"))
+                    or os.path.exists(os.path.join(cwd, "setup.py"))
+                ):
+                    # Python projects don't have a universal
+                    # pre-run build step. Treat as a no-op
+                    # success so the sandbox keeps walking the
+                    # pipeline; the app start will surface real
+                    # import errors if any.
+                    cmd = "echo 'Python project — no build step required'"
+                else:
+                    cmd = "echo 'no build needed'"
+
+                result = subprocess.run(
+                    cmd, shell=True, capture_output=True,
+                    text=True, timeout=180, cwd=cwd
+                )
+                self._json(200, {
+                    "stdout": result.stdout[-20000:],
+                    "stderr": result.stderr[-2000:],
+                    "exit_code": result.returncode,
+                    "success": result.returncode == 0,
+                    "build_runner": "auto-detected"
                 })
 
             elif cmd_type == "expose_port":

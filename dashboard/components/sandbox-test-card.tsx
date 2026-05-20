@@ -4,9 +4,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import type {
   DevpodStatusResponse,
-  SandboxOverall,
   SandboxProgressEvent,
   SandboxStep,
+  SandboxVerdict,
 } from "@/lib/types";
 
 // SandboxTestCard
@@ -24,6 +24,20 @@ import type {
 //     final results card. The user can dismiss the card or re-run.
 //   * If the chat page navigates to a different PR / repo, the card
 //     resets — we don't carry state across PRs.
+//
+// New in v2 (build + multi-stack support):
+//   * "Build" is its own step row (between Tests and App) — a passing
+//     test suite with a broken `npm run build` still blocks merge,
+//     so we make it visible as a first-class signal.
+//   * The live-preview URL is a prominent button (not buried in a
+//     paragraph of muted text) when the app booted with a reachable
+//     port. Mirrors the GitHub PR comment's "🔗 Open Live Preview".
+//   * The build output collapses into a <details>/<pre> block when
+//     the build failed, so the user can see the webpack/tsc stderr
+//     without leaving the chat.
+//   * The overall verdict gets a color-coded pill instead of a bare
+//     emoji: green for `pass*`, yellow for `no_tests`, red for the
+//     two failure verdicts, grey for `error`.
 
 const STEPS: ReadonlyArray<{
   step: Exclude<SandboxStep, "complete">;
@@ -32,28 +46,42 @@ const STEPS: ReadonlyArray<{
   { step: "clone", label: "Clone PR branch" },
   { step: "install", label: "Install dependencies" },
   { step: "tests", label: "Run tests" },
-  { step: "app", label: "Start app" },
-  { step: "expose", label: "Expose preview URL" },
+  { step: "build", label: "Build" },
+  { step: "app", label: "Start app & open preview" },
 ];
 
 interface FinalResult {
-  overall: SandboxOverall | null;
+  // The rich verdict from the SSE complete event. Persisted DB
+  // overall is a strict subset of this; we don't try to recover
+  // pass_no_preview / tests_failed / build_failed from the DB on
+  // page reload because the upsert mapped them down already.
+  verdict: SandboxVerdict | null;
   passed: number;
   failed: number;
   url: string | null;
   duration_ms: number | null;
   cloneSuccess: boolean | null;
+  installSuccess: boolean | null;
+  testsSuccess: boolean | null;
+  buildAttempted: boolean;
+  buildSuccess: boolean | null;
+  buildOutput: string | null;
   appStarted: boolean | null;
   error: string | null;
 }
 
 const INITIAL_FINAL: FinalResult = {
-  overall: null,
+  verdict: null,
   passed: 0,
   failed: 0,
   url: null,
   duration_ms: null,
   cloneSuccess: null,
+  installSuccess: null,
+  testsSuccess: null,
+  buildAttempted: false,
+  buildSuccess: null,
+  buildOutput: null,
   appStarted: null,
   error: null,
 };
@@ -75,6 +103,61 @@ function StepDot({ status }: { status: StepStatus }) {
   );
 }
 
+// Verdict → visual mapping for the final results pill.
+// Color buckets:
+//   green  — pass, pass_no_preview (build + tests both green)
+//   yellow — no_tests (build OK; tests absent)
+//   red    — build_failed, tests_failed
+//   grey   — error (clone / install bombed; the run never reached
+//                   a meaningful PR-relevant signal)
+function verdictStyle(v: SandboxVerdict | null): {
+  pillClass: string;
+  icon: string;
+  label: string;
+} {
+  switch (v) {
+    case "pass":
+      return {
+        pillClass:
+          "border-emerald-500/40 bg-emerald-500/10 text-emerald-200",
+        icon: "✅",
+        label: "Pass — preview live",
+      };
+    case "pass_no_preview":
+      return {
+        pillClass:
+          "border-emerald-500/40 bg-emerald-500/10 text-emerald-200",
+        icon: "✅",
+        label: "Pass — preview unavailable",
+      };
+    case "no_tests":
+      return {
+        pillClass: "border-amber-500/40 bg-amber-500/10 text-amber-200",
+        icon: "🟡",
+        label: "Build OK — no tests found",
+      };
+    case "tests_failed":
+      return {
+        pillClass: "border-rose-500/40 bg-rose-500/10 text-rose-200",
+        icon: "❌",
+        label: "Tests failed",
+      };
+    case "build_failed":
+      return {
+        pillClass: "border-rose-500/40 bg-rose-500/10 text-rose-200",
+        icon: "❌",
+        label: "Build failed",
+      };
+    case "error":
+    default:
+      return {
+        pillClass: "border-border bg-muted/20 text-muted",
+        icon: "⚠️",
+        label: "Sandbox error",
+      };
+  }
+}
+
 interface SandboxTestCardProps {
   repo: string;
   prNumber: number;
@@ -88,13 +171,14 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
       clone: "pending",
       install: "pending",
       tests: "pending",
+      build: "pending",
       app: "pending",
-      expose: "pending",
       complete: "pending",
     }),
   );
   const [final, setFinal] = useState<FinalResult>(INITIAL_FINAL);
   const [dismissed, setDismissed] = useState(false);
+  const [buildExpanded, setBuildExpanded] = useState(false);
 
   // One-shot liveness probe. The DevPod sidebar polls every 30s, so
   // we don't need to repeat that work here — a single check on
@@ -119,38 +203,38 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
     };
   }, [repo, prNumber]);
 
+  const resetSteps = useCallback(
+    (): Record<SandboxStep, StepStatus> => ({
+      clone: "pending",
+      install: "pending",
+      tests: "pending",
+      build: "pending",
+      app: "pending",
+      complete: "pending",
+    }),
+    [],
+  );
+
   // Reset state when the chat moves to a different PR.
   const lastKeyRef = useRef("");
   useEffect(() => {
     const k = `${repo}#${prNumber}`;
     if (lastKeyRef.current && lastKeyRef.current !== k) {
       setRunning(false);
-      setStepStates({
-        clone: "pending",
-        install: "pending",
-        tests: "pending",
-        app: "pending",
-        expose: "pending",
-        complete: "pending",
-      });
+      setStepStates(resetSteps());
       setFinal(INITIAL_FINAL);
       setDismissed(false);
+      setBuildExpanded(false);
     }
     lastKeyRef.current = k;
-  }, [repo, prNumber]);
+  }, [repo, prNumber, resetSteps]);
 
   const start = useCallback(async () => {
     setRunning(true);
     setDismissed(false);
     setFinal(INITIAL_FINAL);
-    setStepStates({
-      clone: "pending",
-      install: "pending",
-      tests: "pending",
-      app: "pending",
-      expose: "pending",
-      complete: "pending",
-    });
+    setBuildExpanded(false);
+    setStepStates(resetSteps());
 
     let res: Response;
     try {
@@ -160,7 +244,11 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
         body: JSON.stringify({ repo, pr_number: prNumber }),
       });
     } catch (e) {
-      setFinal((f) => ({ ...f, error: (e as Error).message, overall: "error" }));
+      setFinal((f) => ({
+        ...f,
+        error: (e as Error).message,
+        verdict: "error",
+      }));
       setRunning(false);
       return;
     }
@@ -172,7 +260,7 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
       } catch {
         // non-json
       }
-      setFinal((f) => ({ ...f, error: msg, overall: "error" }));
+      setFinal((f) => ({ ...f, error: msg, verdict: "error" }));
       setRunning(false);
       return;
     }
@@ -203,7 +291,7 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
           if (evt.step === "complete") {
             setFinal((prev) => ({
               ...prev,
-              overall: evt.overall ?? "error",
+              verdict: evt.overall ?? prev.verdict ?? "error",
               url: evt.url ?? prev.url,
               duration_ms: evt.duration_ms ?? prev.duration_ms,
               error: evt.error ?? prev.error,
@@ -231,13 +319,44 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
               url: evt.url ?? prev.url,
               cloneSuccess:
                 evt.step === "clone" ? !!evt.success : prev.cloneSuccess,
-              appStarted: evt.step === "app" ? !!evt.success : prev.appStarted,
+              installSuccess:
+                evt.step === "install" ? !!evt.success : prev.installSuccess,
+              testsSuccess:
+                evt.step === "tests" ? !!evt.success : prev.testsSuccess,
+              buildAttempted:
+                evt.step === "build"
+                  ? prev.buildAttempted || !!evt.success || evt.success === false
+                  : prev.buildAttempted,
+              buildSuccess:
+                evt.step === "build" ? !!evt.success : prev.buildSuccess,
+              buildOutput:
+                evt.step === "build"
+                  ? evt.build_output ?? prev.buildOutput
+                  : prev.buildOutput,
+              appStarted:
+                evt.step === "app" ? !!evt.success : prev.appStarted,
             }));
           } else if (evt.status === "error") {
             setStepStates((s) => ({ ...s, [evt.step]: "error" }));
             setFinal((prev) => ({
               ...prev,
               error: evt.error ?? prev.error,
+              cloneSuccess:
+                evt.step === "clone" ? false : prev.cloneSuccess,
+              installSuccess:
+                evt.step === "install" ? false : prev.installSuccess,
+              testsSuccess:
+                evt.step === "tests" ? false : prev.testsSuccess,
+              buildAttempted:
+                evt.step === "build" ? true : prev.buildAttempted,
+              buildSuccess:
+                evt.step === "build" ? false : prev.buildSuccess,
+              buildOutput:
+                evt.step === "build"
+                  ? evt.build_output ?? prev.buildOutput
+                  : prev.buildOutput,
+              appStarted:
+                evt.step === "app" ? false : prev.appStarted,
             }));
           }
         }
@@ -246,17 +365,20 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
       setFinal((f) => ({
         ...f,
         error: (e as Error).message,
-        overall: f.overall ?? "error",
+        verdict: f.verdict ?? "error",
       }));
     } finally {
       setRunning(false);
     }
-  }, [repo, prNumber]);
+  }, [repo, prNumber, resetSteps]);
 
   if (!live || dismissed) return null;
 
   const showResults =
-    !running && (final.overall || final.error || final.passed || final.failed);
+    !running &&
+    (final.verdict || final.error || final.passed || final.failed);
+
+  const vstyle = verdictStyle(final.verdict);
 
   return (
     <motion.div
@@ -273,8 +395,8 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
             Run tests on PR #{prNumber}
           </div>
           <div className="mt-0.5 text-xs text-muted">
-            Clones, installs, tests, and (if green) starts a live preview in
-            your DevPod.
+            Clones, installs, tests, builds, and (if green) starts a live
+            preview in your DevPod.
           </div>
         </div>
         {!running && !showResults && (
@@ -319,58 +441,128 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
       )}
 
       {showResults && (
-        <div className="mt-3 space-y-1.5 text-xs">
+        <div className="mt-3 space-y-2 text-xs">
           {final.error && (
             <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-2 py-1.5 text-rose-200">
               {final.error}
             </div>
           )}
-          <div className="flex items-center gap-2 text-foreground">
-            {final.overall === "pass" && <span>✅</span>}
-            {final.overall === "fail" && <span>❌</span>}
-            {final.overall === "no_tests" && <span>🟡</span>}
-            {final.overall === "error" && <span>⚠️</span>}
-            <span>
-              Tests: {final.passed} passed
-              {final.failed > 0 ? `, ${final.failed} failed` : ""}
-            </span>
-          </div>
-          {final.url && (
-            <div className="text-foreground">
-              🔗 Live preview:{" "}
-              <a
-                href={final.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="underline decoration-dotted"
-              >
-                {final.url}
-              </a>
-            </div>
-          )}
-          <div className="text-muted">
-            📊 Overall:{" "}
-            {final.overall === "pass"
-              ? "Pass"
-              : final.overall === "fail"
-                ? "Fail"
-                : final.overall === "no_tests"
-                  ? "No tests"
-                  : "Error"}
+
+          {/* Color-coded overall verdict pill */}
+          <div
+            className={`inline-flex items-center gap-2 rounded-md border px-2 py-1 ${vstyle.pillClass}`}
+          >
+            <span>{vstyle.icon}</span>
+            <span className="font-medium">{vstyle.label}</span>
             {final.duration_ms != null && (
-              <span className="ml-1 text-muted">
+              <span className="text-[10px] opacity-70">
                 · {(final.duration_ms / 1000).toFixed(1)}s
               </span>
             )}
           </div>
-          <button
-            onClick={() => void start()}
-            className="mt-2 inline-flex rounded-md border border-border px-2 py-1 text-[10px] uppercase tracking-wider text-muted transition hover:text-foreground"
-          >
-            Run again
-          </button>
+
+          {/* Per-step summary rows */}
+          <div className="space-y-1 pt-1 text-foreground">
+            <SummaryRow
+              ok={final.cloneSuccess}
+              label="Clone"
+            />
+            <SummaryRow
+              ok={final.installSuccess}
+              label="Install"
+            />
+            <SummaryRow
+              ok={final.testsSuccess}
+              label={`Tests — ${final.passed} passed${
+                final.failed > 0 ? `, ${final.failed} failed` : ""
+              }`}
+            />
+            <SummaryRow
+              ok={final.buildAttempted ? final.buildSuccess : null}
+              label={
+                final.buildAttempted
+                  ? final.buildSuccess
+                    ? "Build"
+                    : "Build — failed"
+                  : "Build — skipped"
+              }
+            />
+            <SummaryRow
+              ok={final.appStarted}
+              label={
+                final.appStarted
+                  ? final.url
+                    ? "App — running with preview"
+                    : "App — started, preview unavailable"
+                  : "App — not started"
+              }
+            />
+          </div>
+
+          {/* Prominent live-preview button */}
+          {final.url && (
+            <a
+              href={final.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="mt-1 inline-flex items-center gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/15 px-3 py-1.5 text-xs font-medium text-emerald-100 transition hover:bg-emerald-500/25"
+            >
+              🔗 Open Live Preview
+              <span className="text-[10px] opacity-70">↗</span>
+            </a>
+          )}
+
+          {/* Collapsible build output — render when there's any
+              build output to show. Auto-expanded on build_failed
+              so the user doesn't have to click to see the stderr
+              that already broke their PR. */}
+          {final.buildAttempted && final.buildOutput && (
+            <div className="rounded-md border border-border bg-background/40">
+              <button
+                onClick={() => setBuildExpanded((v) => !v)}
+                className="flex w-full items-center justify-between px-2 py-1.5 text-[11px] uppercase tracking-wider text-muted transition hover:text-foreground"
+              >
+                <span>
+                  Build output {final.buildSuccess === false && "(failed)"}
+                </span>
+                <span>
+                  {buildExpanded || final.buildSuccess === false ? "▾" : "▸"}
+                </span>
+              </button>
+              {(buildExpanded || final.buildSuccess === false) && (
+                <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-b-md bg-background/60 px-2 py-1.5 font-mono text-[10px] leading-relaxed text-foreground/90">
+                  {final.buildOutput}
+                </pre>
+              )}
+            </div>
+          )}
+
+          <div className="pt-1">
+            <button
+              onClick={() => void start()}
+              className="inline-flex rounded-md border border-border px-2 py-1 text-[10px] uppercase tracking-wider text-muted transition hover:text-foreground"
+            >
+              Run again
+            </button>
+          </div>
         </div>
       )}
     </motion.div>
+  );
+}
+
+function SummaryRow({
+  ok,
+  label,
+}: {
+  ok: boolean | null;
+  label: string;
+}) {
+  const icon = ok === true ? "✅" : ok === false ? "❌" : "⏭";
+  return (
+    <div className="flex items-center gap-2">
+      <span className="w-4 text-center">{icon}</span>
+      <span>{label}</span>
+    </div>
   );
 }

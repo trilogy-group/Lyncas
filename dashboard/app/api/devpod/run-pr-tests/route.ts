@@ -4,27 +4,42 @@ import {
   getUser,
 } from "@/lib/supabase/server";
 import { resolveGithubToken } from "@/lib/github-token";
-import type {
-  SandboxOverall,
-  SandboxProgressEvent,
-  SandboxStep,
+import {
+  verdictToDbOverall,
+  type SandboxProgressEvent,
+  type SandboxStep,
+  type SandboxVerdict,
 } from "@/lib/types";
 
 // POST /api/devpod/run-pr-tests
 //
-// Drives the same five-step sandbox sequence as agent/devpod_tester.py,
-// but on demand from the dashboard chat UI's "🧪 Run sandbox test"
-// button. Streams progress as Server-Sent Events so the user sees
-// per-step "running" → "done" transitions instead of a single
-// long-pending request.
+// Drives the same sandbox sequence as agent/devpod_tester.py, but on
+// demand from the dashboard chat UI's "🧪 Run sandbox test" button.
+// Streams progress as Server-Sent Events so the user sees per-step
+// "running" → "done" transitions instead of a single long-pending
+// request.
+//
+// Step order, mirroring the Python flow:
+//   1. clone     — copy/clone the PR branch
+//   2. install   — best-effort dependency install
+//   3. tests     — auto-detected test runner
+//   4. build     — `npm run build` / `go build` / no-op for Python
+//   5. app       — start_app + multi-port probe + expose_port (the
+//                  pre-v2 "expose" step is folded into this one
+//                  because emitting two events for one user-visible
+//                  thing was just noise).
+//   6. complete  — terminal event with the rich verdict + duration_ms
 //
 // Auth: Supabase JWT. Looks up the caller's own active DevPod session
-// + GitHub installation token for the repo, then fans out 5
-// sequential MCP /execute calls.
+// + GitHub installation token for the repo, then fans out sequential
+// MCP /execute calls.
 //
 // On completion, upserts pr_sandbox_results so the chat report
 // (isReport=true) and the chat sidebar can read the result back
-// later without rerunning the suite.
+// later without rerunning the suite. The DB column is bounded to
+// the legacy 4-value enum by migration 015's CHECK, so the rich
+// verdict gets mapped down via verdictToDbOverall() before insert —
+// the SSE stream + the UI keep the richer information.
 //
 // We deliberately do NOT call /api/devpod/execute internally — that
 // endpoint is JWT-auth, route-level, and would round-trip the
@@ -35,9 +50,17 @@ import type {
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-const MCP_TIMEOUT_MS = 180_000; // matches devpod_tester.py STEP_TIMEOUT
+// Tunnel-side per-step timeout cap (the slowest MCP server-side
+// cap is 300s on run_tests; we wait a hair longer so a server-side
+// timeout reaches us as a clean error rather than as an aborted
+// fetch). The build step is bounded server-side at 180s.
+const MCP_TIMEOUT_MS = 360_000;
 const MAX_OUTPUT_BYTES = 16 * 1024;
-const APP_PORT = 3001;
+const APP_BIND_TIMEOUT_SEC = 8;
+
+// Mirrors APP_PORT_CANDIDATES in agent/devpod_tester.py — see the
+// comment there for why we probe rather than force a single port.
+const APP_PORT_CANDIDATES = [3000, 8000, 8080, 5000] as const;
 
 interface MCPResponse {
   stdout?: string;
@@ -50,6 +73,7 @@ interface MCPResponse {
   pid?: number;
   port?: number;
   test_runner?: string;
+  build_runner?: string;
 }
 
 interface RequestBody {
@@ -169,20 +193,61 @@ function installCommand(prNumber: number): string {
     `cd ${work} && ` +
     `( [ -f package.json ] && npm install --no-audit --no-fund 2>&1 || ` +
     `[ -f requirements.txt ] && pip install -r requirements.txt 2>&1 || ` +
+    `[ -f go.mod ] && go mod download 2>&1 || ` +
     `echo "no deps detected" )`
   );
 }
 
-function startAppCommand(prNumber: number, port: number): string {
+function startAppCommand(prNumber: number): string {
   const work = `"$HOME/pr-test-${prNumber}"`;
   return (
     `cd ${work} && ` +
-    `export PORT=${port} && ` +
-    `( npm start 2>/dev/null ` +
-    `|| python app.py 2>/dev/null ` +
-    `|| python main.py 2>/dev/null ` +
+    `export PORT=3000 && ` +
+    `( npm start 2>&1 ` +
+    `|| python app.py 2>&1 ` +
+    `|| python main.py 2>&1 ` +
+    `|| go run . 2>&1 ` +
     `|| echo "no entrypoint detected" )`
   );
+}
+
+// Returns a shell expression that polls each candidate port once
+// per second for up to APP_BIND_TIMEOUT_SEC seconds and prints the
+// first responding port to stdout. Mirrors the Python equivalent
+// in devpod_tester.py — see comment there for the rationale.
+function portDetectCommand(): string {
+  const ports = APP_PORT_CANDIDATES.join(" ");
+  return (
+    `for i in $(seq 1 ${APP_BIND_TIMEOUT_SEC}); do ` +
+    `  for p in ${ports}; do ` +
+    `    if curl -sI --max-time 1 "http://localhost:$p" ` +
+    `      >/dev/null 2>&1; then ` +
+    `      echo $p; exit 0; ` +
+    `    fi; ` +
+    `  done; ` +
+    `  sleep 1; ` +
+    `done; ` +
+    `exit 1`
+  );
+}
+
+function computeVerdict(args: {
+  cloneSuccess: boolean;
+  installSuccess: boolean;
+  testsPassed: number;
+  testsFailed: number;
+  noTests: boolean;
+  buildAttempted: boolean;
+  buildSuccess: boolean;
+  appStarted: boolean;
+  appUrl: string | null;
+}): SandboxVerdict {
+  if (!args.cloneSuccess || !args.installSuccess) return "error";
+  if (args.buildAttempted && !args.buildSuccess) return "build_failed";
+  if (args.testsFailed > 0) return "tests_failed";
+  if (args.noTests) return "no_tests";
+  if (args.appStarted && args.appUrl) return "pass";
+  return "pass_no_preview";
 }
 
 export async function POST(request: NextRequest) {
@@ -268,7 +333,7 @@ export async function POST(request: NextRequest) {
           ...(cloneSuccess ? {} : { error: checkout.error ?? checkout.stderr }),
         });
 
-        // ----- Step 2: install (best-effort; never blocks tests) -----
+        // ----- Step 2: install -----
         let installSuccess = false;
         if (cloneSuccess) {
           emitStep("install", "running");
@@ -279,14 +344,18 @@ export async function POST(request: NextRequest) {
           });
           installSuccess =
             install.success === true || install.exit_code === 0;
-          emitStep("install", "done", { success: installSuccess });
+          emitStep("install", installSuccess ? "done" : "error", {
+            success: installSuccess,
+            ...(installSuccess ? {} : { error: install.stderr ?? install.error }),
+          });
         }
 
         // ----- Step 3: run tests -----
         let testsPassed = 0;
         let testsFailed = 0;
         let testOutput = "";
-        if (cloneSuccess) {
+        let noTests = false;
+        if (cloneSuccess && installSuccess) {
           emitStep("tests", "running");
           const testResp = await postExecute(session.tunnel_url, {
             type: "run_tests",
@@ -299,6 +368,9 @@ export async function POST(request: NextRequest) {
           ({ passed: testsPassed, failed: testsFailed } =
             countPassedFailed(blob));
           testOutput = blob;
+          noTests =
+            looksLikeNoTests(blob) ||
+            (testsPassed === 0 && testsFailed === 0);
           emitStep("tests", "done", {
             passed: testsPassed,
             failed: testsFailed,
@@ -306,46 +378,131 @@ export async function POST(request: NextRequest) {
           });
         }
 
-        // ----- Step 4: start app (only if tests cleanly passed) -----
+        // ----- Step 4: build -----
+        // Attempted whenever clone + install both passed; the
+        // MCP server's build handler auto-detects npm / go / py
+        // and times out at 180s. An older MCP server returns
+        // {"error":"unknown type: build"} and we soft-skip that
+        // case so unupgraded DevPods don't get red-flagged.
+        let buildAttempted = false;
+        let buildSuccess = false;
+        let buildOutput = "";
+        if (cloneSuccess && installSuccess) {
+          emitStep("build", "running");
+          const buildResp = await postExecute(session.tunnel_url, {
+            type: "build",
+            repo,
+            cwd: `~/pr-test-${prNumber}`,
+          });
+          const errStr = (buildResp.error ?? "").toLowerCase();
+          if (errStr.includes("unknown type")) {
+            // MCP server too old — emit `done` with success=true
+            // so the UI doesn't show this as a failure. The card
+            // also reads buildAttempted to suppress the row.
+            emitStep("build", "done", {
+              success: true,
+              build_output: "(MCP server too old; build skipped)",
+            });
+          } else {
+            buildAttempted = true;
+            buildSuccess =
+              buildResp.success === true || buildResp.exit_code === 0;
+            buildOutput =
+              (buildResp.stdout ?? "") +
+              (buildResp.stderr ? "\n" + buildResp.stderr : "");
+            emitStep("build", buildSuccess ? "done" : "error", {
+              success: buildSuccess,
+              build_output: truncate(buildOutput, 4_000),
+              ...(buildSuccess ? {} : { error: buildResp.error }),
+            });
+          }
+        }
+
+        // ----- Step 5: start app + detect port + expose -----
+        // Skipped when build was attempted and failed: a broken
+        // build won't yield a meaningful preview, and the user
+        // would just see a 502 cloudflared page.
         let appStarted = false;
-        if (cloneSuccess && testsFailed === 0 && testsPassed > 0) {
+        let appUrl: string | null = null;
+        let appPort: number | null = null;
+        if (
+          cloneSuccess &&
+          installSuccess &&
+          (!buildAttempted || buildSuccess)
+        ) {
           emitStep("app", "running");
           const start = await postExecute(session.tunnel_url, {
             type: "start_app",
             repo,
-            command: startAppCommand(prNumber, APP_PORT),
+            command: startAppCommand(prNumber),
             cwd: `~/pr-test-${prNumber}`,
           });
           appStarted = start.started === true;
-          emitStep("app", "done", { success: appStarted });
-        }
 
-        // ----- Step 5: expose port -----
-        let appUrl: string | null = null;
-        if (appStarted) {
-          emitStep("expose", "running");
-          const expose = await postExecute(session.tunnel_url, {
-            type: "expose_port",
-            repo,
-            port: APP_PORT,
+          if (appStarted) {
+            const probe = await postExecute(session.tunnel_url, {
+              type: "run_command",
+              repo,
+              command: portDetectCommand(),
+            });
+            const probeOut = (probe.stdout ?? "").trim();
+            if (probe.exit_code === 0 && probeOut) {
+              const last = probeOut
+                .split(/\n/)
+                .map((s) => s.trim())
+                .filter(Boolean)
+                .pop();
+              const n = last ? Number(last) : NaN;
+              if (Number.isFinite(n)) appPort = n;
+            }
+
+            if (appPort) {
+              const expose = await postExecute(session.tunnel_url, {
+                type: "expose_port",
+                repo,
+                port: appPort,
+              });
+              appUrl = typeof expose.url === "string" ? expose.url : null;
+            }
+          }
+
+          emitStep("app", appStarted ? "done" : "error", {
+            success: appStarted,
+            url: appUrl,
           });
-          appUrl = typeof expose.url === "string" ? expose.url : null;
-          emitStep("expose", "done", { url: appUrl, success: !!appUrl });
         }
 
-        // Aggregate
-        let overall: SandboxOverall;
-        if (!cloneSuccess) overall = "error";
-        else if (looksLikeNoTests(testOutput)) overall = "no_tests";
-        else if (testsFailed > 0) overall = "fail";
-        else if (testsPassed > 0) overall = "pass";
-        else overall = "no_tests";
-
+        // ----- Aggregate -----
+        const verdict = computeVerdict({
+          cloneSuccess,
+          installSuccess,
+          testsPassed,
+          testsFailed,
+          noTests,
+          buildAttempted,
+          buildSuccess,
+          appStarted,
+          appUrl,
+        });
+        const overallDb = verdictToDbOverall(verdict);
         const duration_ms = Date.now() - startedAt;
 
         // Persist. Best-effort — a DB error here must not eat the
-        // SSE "complete" event the UI is waiting for.
+        // SSE "complete" event the UI is waiting for. We map the
+        // rich verdict to the legacy enum because migration 015's
+        // CHECK constraint forbids the new values; the rich
+        // verdict survives in the SSE stream + the card.
         try {
+          // Encode the build status into the test_output column
+          // so the dashboard's chat report can still see "build
+          // passed/failed" even though we don't have a column
+          // for it. Mirrors devpod_tester.py.
+          const persistedTestOutput = buildAttempted
+            ? `[build: ${buildSuccess ? "pass" : "FAIL"}]\n` +
+              (buildOutput ? `${buildOutput.slice(0, 2000)}\n---\n` : "") +
+              testOutput
+            : testOutput;
+
           await supabase
             .from("pr_sandbox_results")
             .upsert(
@@ -356,12 +513,12 @@ export async function POST(request: NextRequest) {
                 session_id: session.id,
                 tests_passed: testsPassed,
                 tests_failed: testsFailed,
-                test_output: truncate(testOutput),
+                test_output: truncate(persistedTestOutput),
                 app_url: appUrl,
                 app_started: appStarted,
                 clone_success: cloneSuccess,
                 install_success: installSuccess,
-                overall,
+                overall: overallDb,
                 duration_ms,
               },
               { onConflict: "repo,pr_number" },
@@ -372,8 +529,10 @@ export async function POST(request: NextRequest) {
           );
         }
 
-        emitStep("complete", "done", {
-          overall,
+        emit({
+          step: "complete",
+          status: "done",
+          overall: verdict,
           duration_ms,
           url: appUrl,
         });

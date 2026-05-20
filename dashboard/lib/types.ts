@@ -462,7 +462,40 @@ export interface DevpodStatusResponse {
 // or /api/devpod/run-pr-tests (chat-button-driven), upsert-keyed on
 // (repo, pr_number) so the latest run wins.
 
+// DB-persisted overall — bounded by the CHECK constraint on
+// pr_sandbox_results.overall (migration 015). Rich live verdicts
+// emitted by /api/devpod/run-pr-tests are mapped down to this set
+// via verdictToDbOverall() before the row is upserted.
 export type SandboxOverall = "pass" | "fail" | "no_tests" | "error";
+
+// Live verdict used in SSE events, the in-card final result, and
+// the GitHub PR comment posted by agent/devpod_tester.py. Richer
+// than the persisted column because we want the UI to distinguish
+// "build failed" from "tests failed" from "preview unavailable",
+// even though the DB collapses those down to {fail, pass, error}.
+export type SandboxVerdict =
+  | "pass"
+  | "pass_no_preview"
+  | "tests_failed"
+  | "build_failed"
+  | "no_tests"
+  | "error";
+
+export function verdictToDbOverall(v: SandboxVerdict): SandboxOverall {
+  switch (v) {
+    case "pass":
+    case "pass_no_preview":
+      return "pass";
+    case "tests_failed":
+    case "build_failed":
+      return "fail";
+    case "no_tests":
+      return "no_tests";
+    case "error":
+    default:
+      return "error";
+  }
+}
 
 export interface SandboxResult {
   id: string;
@@ -485,12 +518,20 @@ export interface SandboxResult {
 // SSE event shape emitted by /api/devpod/run-pr-tests. Each step
 // emits at least a "running" event before the corresponding "done"
 // event so the UI can flip a per-step spinner on / off.
+//
+// Step ordering: clone → install → tests → build → app → complete.
+// The "build" step was added so the dashboard can distinguish a
+// PR whose tests pass but whose `npm run build` fails (very common
+// failure mode on Next.js PRs touching TS / config / generated
+// types). The "expose" event was folded into "app": expose_port
+// runs as the tail of the app step and the resulting URL is
+// surfaced in app's "done" event.
 export type SandboxStep =
   | "clone"
   | "install"
   | "tests"
+  | "build"
   | "app"
-  | "expose"
   | "complete";
 
 export interface SandboxProgressEvent {
@@ -501,7 +542,13 @@ export interface SandboxProgressEvent {
   passed?: number;
   failed?: number;
   url?: string | null;
-  overall?: SandboxOverall;
+  // The complete event carries the rich verdict; intermediate
+  // events do not.
+  overall?: SandboxVerdict;
   duration_ms?: number;
   error?: string;
+  // build-step "done" carries `success` for green/red and a short
+  // stderr-style excerpt that the card renders in a collapsible
+  // <pre>.
+  build_output?: string;
 }

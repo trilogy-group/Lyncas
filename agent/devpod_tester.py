@@ -1,6 +1,6 @@
 """
 devpod_tester.py — sandbox-test a PR by driving the user's DevPod
-MCP server through five sequential commands:
+MCP server through a sequence of commands:
 
   1. Obtain a working tree   — copy the user's live workspace if it
                                exists, otherwise shallow-clone.
@@ -10,24 +10,40 @@ MCP server through five sequential commands:
                                manifests are present. Best-effort.
   3. Run the test suite       — MCP server's run_tests handler auto-detects
                                the runner based on lockfiles.
-  4. Start the app (optional) — if tests passed and a default-ish entry
-                               point looks runnable, start it on port 3001
-                               so we don't collide with whatever the user
-                               is already running on 3000.
-  5. Expose the running app   — cloudflared tunnel → public URL.
+  4. Build                    — npm run build / go build / no-op for Python.
+                               Auto-detected by the MCP server's "build"
+                               handler with a 180s timeout (Next.js cold
+                               builds routinely take 60–120s).
+  5. Start the app (optional) — try canonical entrypoints across the three
+                               supported stacks (Next.js, Python, Go) and
+                               let the app pick its own port.
+  6. Detect & expose the port — probe ports 3000 → 8000 → 8080 → 5000 in
+                               that order; whichever responds first gets
+                               cloudflared'd. Default 3000 covers Next.js;
+                               8000/8080 cover Django/FastAPI/Go; 5000
+                               covers Flask. App-start timeout is 8s so
+                               Next.js cold starts have room.
 
-Then the result row is upserted into pr_sandbox_results so the dashboard
-can render "tests passed / failed / live preview URL".
+Then a structured comment is posted to the PR (rules: "Always post the
+GitHub comment even if some steps fail", "use the installation token in
+GITHUB_TOKEN") and the result row is upserted into pr_sandbox_results
+so the dashboard can render the verdict.
 
-Backward-compat contract (RULES section in the spec):
+Backward-compat contract (RULES in the spec):
   * If DEVPOD_TUNNEL_URL is unset, we exit cleanly with a one-line log.
     The webhook handler dispatches us speculatively even when no DevPod
     is live (because the lookup is best-effort and may race with a
     /disconnect), so a no-op exit must be the steady state.
   * If any individual MCP step times out / errors, we still write a
-    pr_sandbox_results row with overall='error' and a captured failure
-    message — never throw. Otherwise the dashboard's "running…" spinner
-    would be stuck on a row that never appeared.
+    pr_sandbox_results row with a captured failure message AND still
+    attempt to post the GitHub comment — never throw. Otherwise the
+    dashboard's "running…" spinner would be stuck on a row that never
+    appeared.
+  * We persist the legacy 4-value `overall` enum (pass / fail /
+    no_tests / error) because the migration 015 CHECK constraint
+    forbids the richer verdict set (pass_no_preview, tests_failed,
+    build_failed). The richer verdict is preserved in the GitHub
+    comment + the test_output column for postmortem.
 
 Env contract:
   PR_FILTER_REPO          owner/repo
@@ -35,12 +51,19 @@ Env contract:
   DEVPOD_TUNNEL_URL       https://…trycloudflare.com (set by webhook)
   DEVPOD_SESSION_ID       devpod_sessions.id uuid (optional; recorded
                           on the result row when present)
-  GITHUB_TOKEN_PAT        for the cloning fallback path
+  GITHUB_TOKEN            installation token for posting the PR comment
+                          (set by the webhook handler from the
+                          installation that delivered the event).
+                          Falls back to GITHUB_TOKEN_PAT if unset so
+                          local manual runs still work.
+  GITHUB_TOKEN_PAT        for the cloning fallback path AND comment
+                          fallback when GITHUB_TOKEN is missing.
   SUPABASE_URL / SUPABASE_SERVICE_KEY
                           required to persist the result row. Without
-                          them we still print the summary to stdout so
-                          a webhook log inspection can recover the
-                          outcome manually.
+                          them we still print the summary to stdout and
+                          still post the GitHub comment so a webhook
+                          log inspection can recover the outcome
+                          manually.
 """
 
 from __future__ import annotations
@@ -67,20 +90,38 @@ except ImportError:
 # --- Config ---------------------------------------------------------------
 
 # Per-step HTTP timeout. The MCP server's own caps are 120s for
-# run_command / 300s for run_tests; we wait a bit longer than the
-# longest server-side cap so a server-side timeout reaches us as a
-# clean error rather than as an aborted urllib read.
+# run_command, 300s for run_tests, 180s for build (new). We wait a
+# little longer than the longest server-side cap so a server-side
+# timeout reaches us as a clean error rather than as an aborted
+# urllib read.
 STEP_TIMEOUT_SEC = 360
 
 # Output truncation when persisting to Supabase. Keeps the row bounded
-# and matches the dashboard's pre-allocation comment in 015.
+# and matches the dashboard's pre-allocation comment in migration 015.
 MAX_OUTPUT_BYTES = 16 * 1024
 
-# Port the started app is exposed on. 3001 (not 3000) to avoid
-# colliding with the user's main dev server in the same DevPod.
-APP_PORT = 3001
+# Ports to probe (in order) when looking for the running app. Default
+# 3000 covers Next.js, 8000 covers Django/FastAPI, 8080 covers
+# generic Java/Go servers, 5000 covers Flask. We deliberately do NOT
+# force PORT=3001 like the old single-port flow — many Python apps
+# ignore $PORT and bind to a hard-coded default, so probing is the
+# only reliable strategy.
+APP_PORT_CANDIDATES = (3000, 8000, 8080, 5000)
 
-DASHBOARD_DEFAULT_REPO_DIR_FALLBACK = "/workspaces"
+# Marker comment so a re-run on the same PR (e.g. force-push, then
+# webhook fires again) replaces the prior sandbox comment cleanly
+# rather than stacking. Mirrors the REVIEW_MARKER pattern in
+# pr_reviewer.py — version-stamped so we can change the layout
+# without re-commenting historical PRs.
+SANDBOX_COMMENT_MARKER = "<!-- night-pr-reviewer:sandbox:v2 -->"
+
+# How long to wait (post-`start_app`) for the app to actually bind a
+# port. MCP server's start_app already sleeps 3s; we add another 5s
+# of polling for a total of ~8s before we give up. Next.js cold
+# starts on a sleepy DevPod can hit 5–6s.
+APP_BIND_TIMEOUT_SEC = 8
+
+GITHUB_API = "https://api.github.com"
 
 
 # --- HTTP helper ----------------------------------------------------------
@@ -170,32 +211,69 @@ def _checkout_command(repo: str, pr_number: int, github_token: str) -> str:
 
 
 def _install_command(pr_number: int) -> str:
-    """Best-effort dependency install. The shell `(a || b || echo)`
-    chain matches the user's spec: try npm, then pip, then no-op.
-    The trailing `echo no deps` keeps the exit code zero so we don't
-    confuse a missing manifest with an install failure."""
+    """Best-effort dependency install across the three supported
+    stacks. The shell `(a || b || c || echo)` chain matches the
+    user's spec: try npm, then pip, then `go mod download`, then
+    no-op. The trailing `echo no deps` keeps the exit code zero so
+    we don't confuse a missing manifest with an install failure."""
     work = f'"$HOME/pr-test-{pr_number}"'
     return (
         f'cd {work} && '
         f'( [ -f package.json ] && npm install --no-audit --no-fund 2>&1 || '
         f'  [ -f requirements.txt ] && pip install -r requirements.txt 2>&1 || '
+        f'  [ -f go.mod ] && go mod download 2>&1 || '
         f'  echo "no deps detected" )'
     )
 
 
-def _start_app_command(pr_number: int, port: int) -> str:
-    """Try a few canonical entrypoints, set PORT for tools that honor
-    it. The MCP server returns after 3s of `Popen` so this only
-    confirms "did the process stay up briefly", not "is the app
-    healthy". The expose_port step is what surfaces a usable URL."""
+def _start_app_command(pr_number: int) -> str:
+    """Try canonical entrypoints across Next.js, Python, and Go.
+    We set PORT=3000 as a hint for tools that honor it (npm scripts,
+    Next.js, Express) but DO NOT force the app to that port — most
+    Python frameworks ignore $PORT and bind to their own default,
+    which is exactly why _port_detect_command probes a sequence
+    rather than a single port.
+
+    Ordering matters here: `npm start` is checked first because
+    Next.js / React apps are the most common stack. `go run .` is
+    last because compiling Go on every start adds 5–15s, which
+    eats into the 8s bind window."""
     work = f'"$HOME/pr-test-{pr_number}"'
     return (
         f'cd {work} && '
-        f'export PORT={port} && '
-        f'( npm start 2>/dev/null '
-        f'  || python app.py 2>/dev/null '
-        f'  || python main.py 2>/dev/null '
+        f'export PORT=3000 && '
+        f'( npm start 2>&1 '
+        f'  || python app.py 2>&1 '
+        f'  || python main.py 2>&1 '
+        f'  || go run . 2>&1 '
         f'  || echo "no entrypoint detected" )'
+    )
+
+
+def _port_detect_command() -> str:
+    """Poll once per second for up to APP_BIND_TIMEOUT_SEC seconds,
+    probing each candidate port. First responder wins. Prints the
+    detected port on stdout if found, then exits 0; otherwise
+    exits 1 with no output.
+
+    Why a single shell loop rather than four separate
+    expose_port calls: cloudflared takes ~1s per tunnel handshake
+    even on a port nothing is listening on, so attempting all four
+    sequentially burns ~4s of the 8s budget on tunnels we'll throw
+    away. A local curl probe is sub-100ms and lets us reserve the
+    expose step for the one port we actually want."""
+    ports = " ".join(str(p) for p in APP_PORT_CANDIDATES)
+    return (
+        f'for i in $(seq 1 {APP_BIND_TIMEOUT_SEC}); do '
+        f'  for p in {ports}; do '
+        f'    if curl -sI --max-time 1 "http://localhost:$p" '
+        f'      >/dev/null 2>&1; then '
+        f'      echo $p; exit 0; '
+        f'    fi; '
+        f'  done; '
+        f'  sleep 1; '
+        f'done; '
+        f'exit 1'
     )
 
 
@@ -255,6 +333,51 @@ def _looks_like_no_tests(stdout: str, stderr: str) -> bool:
         "found 0 test",
     )
     return any(n in blob for n in needles)
+
+
+def _compute_verdict(
+    *,
+    clone_success: bool,
+    install_success: bool,
+    tests_passed: int,
+    tests_failed: int,
+    no_tests: bool,
+    build_attempted: bool,
+    build_success: bool,
+    app_started: bool,
+    app_url: str | None,
+) -> str:
+    """Map the per-step outcomes to one of the six rich verdicts
+    documented in the spec. The order of conditions matters: a
+    failed build is more PR-relevant than failed tests (because a
+    build failure blocks merge regardless), so we surface
+    'build_failed' even if tests also failed."""
+    if not clone_success or not install_success:
+        return "error"
+    if build_attempted and not build_success:
+        return "build_failed"
+    if tests_failed > 0:
+        return "tests_failed"
+    if no_tests:
+        return "no_tests"
+    # Everything green up through build + tests; differentiate
+    # pass with vs without a live preview URL.
+    if app_started and app_url:
+        return "pass"
+    return "pass_no_preview"
+
+
+def _verdict_to_db_overall(verdict: str) -> str:
+    """Collapse the rich verdict to the legacy enum that migration
+    015's CHECK constraint accepts. Kept in lockstep with the
+    TypeScript verdictToDbOverall() in dashboard/lib/types.ts."""
+    if verdict in ("pass", "pass_no_preview"):
+        return "pass"
+    if verdict in ("tests_failed", "build_failed"):
+        return "fail"
+    if verdict == "no_tests":
+        return "no_tests"
+    return "error"
 
 
 # --- Supabase write -------------------------------------------------------
@@ -333,6 +456,259 @@ def _user_id_for_repo(repo: str) -> str | None:
     return None
 
 
+# --- GitHub comment -------------------------------------------------------
+
+def _github_request(
+    method: str,
+    path: str,
+    token: str,
+    body: dict[str, Any] | None = None,
+) -> tuple[int, dict[str, Any] | list[Any] | None]:
+    """Minimal urllib-based GitHub API call. Returns
+    (status_code, parsed_body|None). We avoid `requests` here to
+    keep devpod_tester.py stdlib-only — the script is meant to be
+    runnable from a thin systemd unit without the full agent venv.
+    `requests` is in the venv anyway, but the rest of this module
+    is urllib-based and mixing the two for one call would be
+    inconsistent."""
+    url = GITHUB_API.rstrip("/") + path
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+            "User-Agent": "night-pr-reviewer-sandbox",
+        },
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+            parsed: Any = None
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError:
+                    parsed = None
+            return r.status, parsed
+    except urllib.error.HTTPError as e:
+        # Read the body for diagnostics; otherwise we'd hide the
+        # actual API error reason behind a bare HTTP code.
+        try:
+            raw = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = ""
+        print(
+            f"[sandbox] github {method} {path} -> {e.code}: {raw[:300]}",
+            file=sys.stderr,
+        )
+        return e.code, None
+    except Exception as e:
+        print(
+            f"[sandbox] github {method} {path} -> "
+            f"{type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+        return 0, None
+
+
+def _existing_sandbox_comment_id(
+    repo: str, pr_number: int, token: str
+) -> int | None:
+    """Find a prior sandbox comment by its marker so we can update
+    it in place rather than spamming the PR on every re-run.
+    Mirrors pr_reviewer.already_reviewed() but returns the comment
+    id instead of a bool because we want to PATCH it."""
+    status, data = _github_request(
+        "GET",
+        f"/repos/{repo}/issues/{pr_number}/comments?per_page=100",
+        token,
+    )
+    if status != 200 or not isinstance(data, list):
+        return None
+    for c in data:
+        if isinstance(c, dict) and SANDBOX_COMMENT_MARKER in (
+            c.get("body") or ""
+        ):
+            cid = c.get("id")
+            if isinstance(cid, int):
+                return cid
+    return None
+
+
+def _verdict_header(verdict: str, app_url: str | None) -> str:
+    """One-line summary line that the GitHub comment leads with.
+    Emoji + short label tailored to each verdict; the trailing
+    parenthetical only appears for the pass_no_preview case
+    because it's the only "pass" that needs an explanation."""
+    table = {
+        "pass": "✅ Sandbox PASSED — build OK, tests OK, app running",
+        "pass_no_preview": (
+            "✅ Sandbox PASSED "
+            "(build OK, tests OK — preview URL unavailable)"
+        ),
+        "tests_failed": "❌ Sandbox FAILED — tests failed",
+        "build_failed": "❌ Sandbox FAILED — build failed",
+        "no_tests": "🟡 Sandbox build OK — no tests found",
+        "error": "⚠️ Sandbox ERROR — could not run",
+    }
+    line = table.get(verdict, f"Sandbox: {verdict}")
+    if verdict == "pass" and app_url:
+        line += f" — {app_url}"
+    return line
+
+
+def _step_row(label: str, ok: bool | None, *, skipped: bool = False) -> str:
+    """One table row for the GitHub comment's step summary."""
+    if skipped:
+        return f"| {label} | ⏭ skipped |"
+    icon = "✅" if ok else ("❌" if ok is False else "—")
+    return f"| {label} | {icon} |"
+
+
+def _format_pr_comment(summary: dict[str, Any]) -> str:
+    """Build the markdown body posted to the PR.
+
+    Format intent (kept stable so PRs can be diff'd over time):
+      1. Hidden marker (for idempotent update-in-place).
+      2. ### header with bolded verdict line.
+      3. Per-step status table.
+      4. Optional 'Open Live Preview' link if app_url is set.
+      5. Collapsible <details> for build output (only when
+         build was attempted, even on success — operators want a
+         "is the build cache cold?" lookup).
+      6. Collapsible <details> for test output.
+      7. Footer with duration + workspace id."""
+    verdict = summary["verdict"]
+    app_url = summary.get("app_url")
+    workspace_id = summary.get("workspace_id") or "unknown"
+    duration_ms = summary.get("duration_ms") or 0
+
+    lines: list[str] = [SANDBOX_COMMENT_MARKER, ""]
+    lines.append(f"### {_verdict_header(verdict, app_url)}")
+    lines.append("")
+    lines.append("| Step | Status |")
+    lines.append("| --- | --- |")
+    lines.append(_step_row("Clone", summary.get("clone_success")))
+    lines.append(_step_row("Install", summary.get("install_success")))
+    if summary.get("no_tests"):
+        lines.append(_step_row("Tests", None, skipped=True))
+    else:
+        tp = summary.get("tests_passed") or 0
+        tf = summary.get("tests_failed") or 0
+        lines.append(
+            f"| Tests | {'✅' if tf == 0 and tp > 0 else '❌'} "
+            f"{tp} passed, {tf} failed |"
+        )
+    if summary.get("build_attempted"):
+        lines.append(_step_row("Build", summary.get("build_success")))
+    else:
+        lines.append(_step_row("Build", None, skipped=True))
+    if summary.get("app_started"):
+        if app_url:
+            lines.append(f"| App | ✅ running at port {summary.get('app_port', '?')} |")
+        else:
+            lines.append("| App | ✅ started — preview URL unavailable |")
+    else:
+        lines.append(_step_row("App", None, skipped=True))
+
+    if app_url:
+        lines.append("")
+        lines.append(f"🔗 **[Open Live Preview]({app_url})**")
+    elif summary.get("app_started"):
+        lines.append("")
+        lines.append("⚠️ App started but preview URL unavailable.")
+
+    if summary.get("build_attempted"):
+        out = (summary.get("build_output") or "").strip()
+        if out:
+            lines.append("")
+            lines.append("<details><summary>Build output</summary>")
+            lines.append("")
+            lines.append("```")
+            lines.append(out[-6000:])
+            lines.append("```")
+            lines.append("")
+            lines.append("</details>")
+
+    test_out = (summary.get("test_output") or "").strip()
+    if test_out:
+        lines.append("")
+        lines.append("<details><summary>Test output</summary>")
+        lines.append("")
+        lines.append("```")
+        lines.append(test_out[-6000:])
+        lines.append("```")
+        lines.append("")
+        lines.append("</details>")
+
+    lines.append("")
+    lines.append(
+        f"*Sandbox ran in {duration_ms}ms on EC2 · "
+        f"DevPod workspace: {workspace_id}*"
+    )
+    return "\n".join(lines)
+
+
+def _post_pr_comment(repo: str, pr_number: int, body: str) -> None:
+    """Post (or update in place if a prior sandbox comment exists)
+    the verdict on the PR. Uses GITHUB_TOKEN (installation token,
+    set by the webhook handler from the App installation that
+    delivered the PR event); falls back to GITHUB_TOKEN_PAT for
+    manual local invocations.
+
+    Rules: "Always post the GitHub comment even if some steps fail"
+    — so this is called from every code path that reaches verdict
+    computation, including the early-error path where clone failed.
+    Failure to post is logged but never raised."""
+    token = (
+        os.environ.get("GITHUB_TOKEN", "").strip()
+        or os.environ.get("GITHUB_TOKEN_PAT", "").strip()
+    )
+    if not token:
+        print(
+            "[sandbox] no GITHUB_TOKEN / GITHUB_TOKEN_PAT — "
+            "skipping PR comment",
+            file=sys.stderr,
+        )
+        return
+
+    existing_id = _existing_sandbox_comment_id(repo, pr_number, token)
+    if existing_id is not None:
+        status, _ = _github_request(
+            "PATCH",
+            f"/repos/{repo}/issues/comments/{existing_id}",
+            token,
+            {"body": body},
+        )
+        if status in (200, 201):
+            print(
+                f"[sandbox] updated PR comment {existing_id} on "
+                f"{repo}#{pr_number}"
+            )
+            return
+        # Fall through to creating a new comment if update failed;
+        # better a duplicate than no comment at all.
+
+    status, _ = _github_request(
+        "POST",
+        f"/repos/{repo}/issues/{pr_number}/comments",
+        token,
+        {"body": body},
+    )
+    if status in (200, 201):
+        print(f"[sandbox] posted PR comment on {repo}#{pr_number}")
+    else:
+        print(
+            f"[sandbox] PR comment post failed (HTTP {status})",
+            file=sys.stderr,
+        )
+
+
 # --- Orchestrator ---------------------------------------------------------
 
 def run() -> dict[str, Any]:
@@ -340,12 +716,17 @@ def run() -> dict[str, Any]:
     pr_str = os.environ.get("PR_FILTER_NUMBER", "").strip()
     tunnel_url = os.environ.get("DEVPOD_TUNNEL_URL", "").strip()
     session_id = os.environ.get("DEVPOD_SESSION_ID", "").strip() or None
-    github_token = os.environ.get("GITHUB_TOKEN_PAT", "").strip()
+    github_token_for_clone = os.environ.get("GITHUB_TOKEN_PAT", "").strip()
+    workspace_id = (
+        os.environ.get("DEVPOD_WORKSPACE_ID", "").strip()
+        or os.environ.get("DEVPOD_WORKSPACE_FOLDER", "").strip()
+        or ""
+    )
 
     if not tunnel_url:
         # Backward-compat exit per the rules: no DevPod, no work.
-        # The webhook dispatches us regardless of session state, so a
-        # silent steady-state exit must be the norm.
+        # The webhook dispatches us regardless of session state, so
+        # a silent steady-state exit must be the norm.
         print("[sandbox] DEVPOD_TUNNEL_URL not set — nothing to do")
         return {"overall": "skipped"}
 
@@ -365,13 +746,17 @@ def run() -> dict[str, Any]:
     started_at = time.time()
     print(f"[sandbox] starting PR {repo}#{pr_number} on {tunnel_url}")
 
+    cwd = os.path.expanduser(f"~/pr-test-{pr_number}")
+
     # --- Step A: clone / copy + checkout ---------------------------------
     checkout_resp = _post_execute(
         tunnel_url,
         {
             "type": "run_command",
             "repo": repo,
-            "command": _checkout_command(repo, pr_number, github_token),
+            "command": _checkout_command(
+                repo, pr_number, github_token_for_clone
+            ),
         },
     )
     clone_success = bool(
@@ -414,13 +799,14 @@ def run() -> dict[str, Any]:
     tests_passed = 0
     tests_failed = 0
     test_output = ""
-    if clone_success:
+    no_tests = False
+    if clone_success and install_success:
         test_resp = _post_execute(
             tunnel_url,
             {
                 "type": "run_tests",
                 "repo": repo,
-                "cwd": os.path.expanduser(f"~/pr-test-{pr_number}"),
+                "cwd": cwd,
             },
         )
         stdout = test_resp.get("stdout", "") or ""
@@ -429,65 +815,167 @@ def run() -> dict[str, Any]:
         test_output = stdout + ("\n" + stderr if stderr else "")
         if test_resp.get("error"):
             test_output += f"\n[sandbox] mcp error: {test_resp['error']}"
+        no_tests = _looks_like_no_tests(stdout, stderr) or (
+            tests_passed == 0 and tests_failed == 0
+        )
 
-    # --- Step D: start app (only if tests passed cleanly) ---------------
+    # --- Step D: build (Next.js / Go / Python no-op) --------------------
+    # Always attempt when clone+install both succeeded, regardless of
+    # test outcome — a passing test suite with a broken `npm run build`
+    # is still a broken PR.
+    build_attempted = False
+    build_success = False
+    build_output = ""
+    if clone_success and install_success:
+        build_attempted = True
+        build_resp = _post_execute(
+            tunnel_url,
+            {
+                "type": "build",
+                "repo": repo,
+                "cwd": cwd,
+            },
+        )
+        # Forward-compat: if the user is running an older MCP server
+        # that doesn't know "build", we get back
+        # {"error":"unknown type: build"}. Surface it as a soft skip
+        # rather than a hard build_failed; otherwise every PR on
+        # an un-upgraded DevPod looks like a build regression.
+        if (
+            isinstance(build_resp.get("error"), str)
+            and "unknown type" in str(build_resp.get("error")).lower()
+        ):
+            print(
+                "[sandbox] MCP server too old for 'build' type — skipping",
+                file=sys.stderr,
+            )
+            build_attempted = False
+        else:
+            build_success = bool(
+                build_resp.get("success") is True
+                or build_resp.get("exit_code") == 0
+            )
+            build_output = (build_resp.get("stdout", "") or "") + (
+                ("\n" + build_resp.get("stderr", ""))
+                if build_resp.get("stderr")
+                else ""
+            )
+            if build_resp.get("error"):
+                build_output += f"\n[sandbox] mcp error: {build_resp['error']}"
+
+    # --- Step E: start app + detect/expose port -------------------------
+    # We start the app whenever clone+install succeeded AND build (if
+    # attempted) succeeded. A failing build is conclusive evidence
+    # that the app won't boot meaningfully, so skipping the start
+    # avoids the user seeing a green "App running" next to a red
+    # "Build failed".
     app_started = False
-    if clone_success and tests_failed == 0 and tests_passed > 0:
+    app_port: int | None = None
+    app_url: str | None = None
+    if clone_success and install_success and (
+        not build_attempted or build_success
+    ):
         start_resp = _post_execute(
             tunnel_url,
             {
                 "type": "start_app",
                 "repo": repo,
-                "command": _start_app_command(pr_number, APP_PORT),
-                "cwd": os.path.expanduser(f"~/pr-test-{pr_number}"),
+                "command": _start_app_command(pr_number),
+                "cwd": cwd,
             },
         )
         app_started = bool(start_resp.get("started"))
 
-    # --- Step E: expose the port ----------------------------------------
-    app_url: str | None = None
-    if app_started:
-        expose_resp = _post_execute(
-            tunnel_url,
-            {
-                "type": "expose_port",
-                "repo": repo,
-                "port": APP_PORT,
-            },
-        )
-        if isinstance(expose_resp.get("url"), str):
-            app_url = expose_resp["url"]
+        if app_started:
+            # Probe the candidate ports. The MCP server's start_app
+            # already gave the app a 3s head start; this loop adds
+            # up to APP_BIND_TIMEOUT_SEC more before declaring the
+            # app un-reachable.
+            probe = _post_execute(
+                tunnel_url,
+                {
+                    "type": "run_command",
+                    "repo": repo,
+                    "command": _port_detect_command(),
+                },
+            )
+            probe_stdout = (probe.get("stdout", "") or "").strip()
+            if probe.get("exit_code") == 0 and probe_stdout:
+                # Last non-empty line is the port — guard against
+                # any preamble curl/sleep noise on stdout.
+                last = next(
+                    (
+                        ln.strip()
+                        for ln in reversed(probe_stdout.splitlines())
+                        if ln.strip()
+                    ),
+                    "",
+                )
+                try:
+                    app_port = int(last)
+                except ValueError:
+                    app_port = None
+
+            if app_port:
+                expose_resp = _post_execute(
+                    tunnel_url,
+                    {
+                        "type": "expose_port",
+                        "repo": repo,
+                        "port": app_port,
+                    },
+                )
+                if isinstance(expose_resp.get("url"), str):
+                    app_url = expose_resp["url"]
 
     # --- Final aggregation ----------------------------------------------
-    if not clone_success:
-        overall = "error"
-    elif _looks_like_no_tests(test_output, ""):
-        overall = "no_tests"
-    elif tests_failed > 0:
-        overall = "fail"
-    elif tests_passed > 0:
-        overall = "pass"
-    else:
-        # No counts, no canonical "no tests" string — treat as no_tests
-        # rather than fail so the dashboard doesn't yellow-flag silent
-        # runs. The truncated test_output below preserves whatever
-        # the runner did say.
-        overall = "no_tests"
-
+    verdict = _compute_verdict(
+        clone_success=clone_success,
+        install_success=install_success,
+        tests_passed=tests_passed,
+        tests_failed=tests_failed,
+        no_tests=no_tests,
+        build_attempted=build_attempted,
+        build_success=build_success,
+        app_started=app_started,
+        app_url=app_url,
+    )
+    overall_db = _verdict_to_db_overall(verdict)
     duration_ms = int((time.time() - started_at) * 1000)
 
-    summary = {
+    summary: dict[str, Any] = {
+        "verdict": verdict,
+        "overall": overall_db,
         "tests_passed": tests_passed,
         "tests_failed": tests_failed,
+        "no_tests": no_tests,
         "test_output": _truncate(test_output),
+        "build_attempted": build_attempted,
+        "build_success": build_success,
+        "build_output": _truncate(build_output),
+        "app_started": app_started,
+        "app_port": app_port,
         "app_url": app_url,
         "clone_success": clone_success,
         "install_success": install_success,
-        "overall": overall,
+        "install_output": _truncate(install_output),
         "duration_ms": duration_ms,
+        "workspace_id": workspace_id,
     }
 
     # --- Persist to Supabase --------------------------------------------
+    # Note: build_attempted / build_success / verdict are NOT columns
+    # on pr_sandbox_results (migration 015 predates the rich verdict
+    # set). We fold the build status header into test_output so the
+    # information survives in the row even though the column for it
+    # doesn't exist yet — keeps the dashboard backfill story simple.
+    test_output_for_db = test_output
+    if build_attempted:
+        test_output_for_db = (
+            f"[build: {'pass' if build_success else 'FAIL'}]\n"
+            f"{(build_output[:2000] + chr(10) + '---' + chr(10)) if build_output else ''}"
+            f"{test_output}"
+        )
     _upsert_result(
         {
             "repo": repo,
@@ -496,22 +984,38 @@ def run() -> dict[str, Any]:
             "session_id": session_id,
             "tests_passed": tests_passed,
             "tests_failed": tests_failed,
-            "test_output": summary["test_output"],
+            "test_output": _truncate(test_output_for_db),
             "app_url": app_url,
             "app_started": app_started,
             "clone_success": clone_success,
             "install_success": install_success,
-            "overall": overall,
+            "overall": overall_db,
             "duration_ms": duration_ms,
         }
     )
 
+    # --- Always post the GitHub comment ---------------------------------
+    # Per RULES: "Always post the GitHub comment even if some steps
+    # fail". Wrapped in its own try so a GitHub API outage doesn't
+    # eat the summary line below.
+    try:
+        _post_pr_comment(repo, pr_number, _format_pr_comment(summary))
+    except Exception as e:
+        print(
+            f"[sandbox] PR comment unexpectedly raised: "
+            f"{type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+
     print(
         f"[sandbox] PR {repo}#{pr_number} — tests: {tests_passed} passed, "
-        f"{tests_failed} failed"
+        f"{tests_failed} failed; build: "
+        f"{'attempted' if build_attempted else 'skipped'}"
+        f"{'/passed' if build_attempted and build_success else ''}"
+        f"{'/failed' if build_attempted and not build_success else ''}"
     )
     print(f"[sandbox] App URL: {app_url or 'App not started'}")
-    print(f"[sandbox] Overall: {overall} ({duration_ms}ms)")
+    print(f"[sandbox] Verdict: {verdict} ({duration_ms}ms)")
 
     return summary
 

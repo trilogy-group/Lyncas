@@ -347,7 +347,7 @@ def _build_text(logs, all_reviews, all_errors, closed_prs, today) -> str:
         lines += ["", "=" * 60, "ERRORS", "=" * 60, ""]
         for e in all_errors:
             lines.append(f"- {e.get('pr', e.get('repo', '?'))}: {e['error']}")
-    lines += ["", "--", "Sent by night-pr-reviewer running in GitHub Actions."]
+    lines += ["", "--", "Sent by Lyncas running in GitHub Actions."]
     return "\n".join(lines)
 
 
@@ -357,7 +357,7 @@ def _render_header(today: str, n_reviews: int, n_closed: int) -> str:
     return f"""
 <tr><td style="padding:28px 24px 8px 24px;">
   <div style="font-family:{FONT_SANS};font-size:22px;font-weight:600;color:{COLOR_TEXT};letter-spacing:-0.01em;">
-    Night PR Reviewer
+    Lyncas
   </div>
   <div style="font-family:{FONT_SERIF};font-style:italic;font-size:14px;color:{COLOR_MUTED};margin-top:4px;">
     {_e(sub)} · <span style="font-family:{FONT_MONO};font-style:normal;">{_e(today)}</span>
@@ -646,7 +646,7 @@ def _render_footer(today: str) -> str:
     return f"""
 <tr><td style="padding:28px 24px 32px 24px;text-align:center;">
   <div style="font-family:{FONT_SERIF};font-style:italic;font-size:12px;color:{COLOR_MUTED};line-height:1.6;">
-    Sent by night-pr-reviewer · running autonomously in GitHub Actions
+    Sent by Lyncas · running autonomously in GitHub Actions
     <br><span style="font-family:{FONT_MONO};font-style:normal;">{_e(today)}</span>
   </div>
 </td></tr>
@@ -703,7 +703,7 @@ def _render_html(logs, all_reviews, all_errors, closed_prs, today) -> str:
 <html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width">
-<title>Night PR Reviewer Digest</title>
+<title>Lyncas Digest</title>
 <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 </head>
 <body style="margin:0;padding:0;background:{COLOR_BG};color:{COLOR_TEXT};">
@@ -730,18 +730,18 @@ def _build_subject(all_reviews: list[dict], all_errors: list[dict], closed_prs: 
     n_bugs = sum(r.get("bug_count", 0) for r in all_reviews)
 
     if not all_reviews and not all_errors:
-        return "🌙 Night PR Reviewer — all quiet"
+        return "🌙 Lyncas — all quiet"
 
     if n_closed:
-        return f"🚫 Night PR Reviewer — {_pluralize(n_closed, 'auto-closed', 'auto-closed')} · {n_reviews} reviewed"
+        return f"🚫 Lyncas — {_pluralize(n_closed, 'auto-closed', 'auto-closed')} · {n_reviews} reviewed"
 
     if n_errors:
-        return f"⚠️ Night PR Reviewer — {n_reviews} reviewed · {_pluralize(n_errors, 'error')}"
+        return f"⚠️ Lyncas — {n_reviews} reviewed · {_pluralize(n_errors, 'error')}"
 
     if n_bugs:
-        return f"🌙 Night PR Reviewer — {_pluralize(n_reviews, 'PR')} reviewed · {_pluralize(n_bugs, 'issue')} to look at"
+        return f"🌙 Lyncas — {_pluralize(n_reviews, 'PR')} reviewed · {_pluralize(n_bugs, 'issue')} to look at"
 
-    return f"🌙 Night PR Reviewer — {_pluralize(n_reviews, 'PR')} reviewed, all clean"
+    return f"🌙 Lyncas — {_pluralize(n_reviews, 'PR')} reviewed, all clean"
 
 
 def build_digest(reviews: list[dict]) -> tuple[str, str, str]:

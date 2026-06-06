@@ -101,7 +101,7 @@ export async function GET(request: NextRequest) {
         Accept: "application/vnd.github+json",
         ...(token ? { Authorization: `token ${token}` } : {}),
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "night-pr-reviewer-tree",
+        "User-Agent": "lyncas-tree",
       },
       cache: "no-store",
     });

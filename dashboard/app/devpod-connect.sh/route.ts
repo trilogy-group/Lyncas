@@ -18,11 +18,11 @@ export const runtime = "nodejs";
 
 const SCRIPT = `#!/bin/bash
 set -e
-echo "🔌 Night PR Reviewer — DevPod Connect v1"
+echo "🔌 Lyncas — DevPod Connect v1"
 echo ""
 
 INSTALL_DIR="$HOME/.night-pr-reviewer"
-DASHBOARD_URL="https://night-pr-reviewer-v2-saas.vercel.app"
+DASHBOARD_URL="https://lyncas.vercel.app"
 
 for tool in curl python3; do
   if ! command -v $tool &>/dev/null; then
@@ -82,7 +82,7 @@ done
 
 if [ -z "$TOKEN" ]; then
   echo "Usage: devpod-connect --token YOUR_TOKEN"
-  echo "Get token: https://night-pr-reviewer-v2-saas.vercel.app/dashboard/settings"
+  echo "Get token: https://lyncas.vercel.app/dashboard/settings"
   exit 1
 fi
 
@@ -92,7 +92,7 @@ fi
 umask 077
 printf "%s" "$TOKEN" > "$INSTALL_DIR/.token"
 
-echo "🚀 Starting Night PR Reviewer MCP server..."
+echo "🚀 Starting Lyncas MCP server..."
 python3 "$INSTALL_DIR/mcp_server.py" --token "$TOKEN" --port "$PORT"
 SCRIPT
 
@@ -104,7 +104,7 @@ chmod +x "$INSTALL_DIR/devpod-connect"
 # from their DevPod terminal without leaving the shell.
 cat > "$INSTALL_DIR/npr" << 'NPR_SCRIPT'
 #!/usr/bin/env python3
-"""npr — natural-language CLI for Night PR Reviewer.
+"""npr — natural-language CLI for Lyncas.
 
 Reads a question from argv (or stdin if none), detects the current
 repo from 'git remote get-url origin', and streams Claude's answer
@@ -112,7 +112,7 @@ back to the terminal. Auth is the same DEVPOD_CONNECT_TOKEN that
 devpod-connect persists at ~/.night-pr-reviewer/.token.
 
 Conversation history is persisted server-side via the
-/api/npr/history endpoint, keyed by (github_username, repo). Two
+/api/lyncas/history endpoint, keyed by (github_username, repo). Two
 flags govern it:
   --no-history   skip the GET-before-chat and POST-after-chat round
                  trips (one-shot mode, no persistence either way)
@@ -137,12 +137,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-DASHBOARD_URL = "https://night-pr-reviewer-v2-saas.vercel.app"
+DASHBOARD_URL = "https://lyncas.vercel.app"
 TOKEN_PATH = os.path.expanduser("~/.night-pr-reviewer/.token")
 NEWLINE = chr(10)
 FRAME_SEP = NEWLINE + NEWLINE
 
-# Match the server-side trim in /api/npr/history. We send at most
+# Match the server-side trim in /api/lyncas/history. We send at most
 # this many entries up so the chat route doesn't blow context, and
 # we save at most this many back so the next round trip stays
 # bounded too.
@@ -193,14 +193,14 @@ def username_from_token(token):
 
 
 def _history_url(username, repo, secret=None):
-    """Build the /api/npr/history URL with the username + repo
+    """Build the /api/lyncas/history URL with the username + repo
     query parameters. secret is only appended when DELETE-ing
     (the npr-history route reads it from the query string for
     DELETE and from the body for POST)."""
     q = {"username": username, "repo": repo}
     if secret is not None:
         q["secret"] = secret
-    return DASHBOARD_URL + "/api/npr/history?" + urllib.parse.urlencode(q)
+    return DASHBOARD_URL + "/api/lyncas/history?" + urllib.parse.urlencode(q)
 
 
 def load_history(username, repo):
@@ -238,7 +238,7 @@ def load_history(username, repo):
 
 
 def save_history(username, repo, token, messages):
-    """POST the updated history back to /api/npr/history. Best-effort
+    """POST the updated history back to /api/lyncas/history. Best-effort
     — a failed save is logged to stderr but never crashes the CLI,
     so the user's primary response (already streamed to stdout) is
     not visibly affected by a Supabase outage."""

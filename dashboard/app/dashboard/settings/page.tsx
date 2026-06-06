@@ -146,7 +146,7 @@ export default function DashboardSettingsPage() {
       <SectionHeading
         eyebrow="Settings"
         title="Account & notifications"
-        subtitle="Manage where Night PR Reviewer sends your daily digest."
+        subtitle="Manage where Lyncas sends your daily digest."
       />
 
       <Card className="p-6 space-y-6">

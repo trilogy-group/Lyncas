@@ -29,7 +29,7 @@ export const runtime = "nodejs";
 // (f"...{x}...") is fine because we use single curly braces, but
 // JS-style ${...} would otherwise be evaluated by Next.
 const SCRIPT = `#!/usr/bin/env python3
-"""Night PR Reviewer — DevPod MCP Server
+"""Lyncas — DevPod MCP Server
 Runs inside the developer's DevPod. Exposes tools Openclaw can call.
 """
 import argparse, json, os, subprocess, sys, threading, time
@@ -37,7 +37,7 @@ import urllib.request, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-DASHBOARD_URL = "https://night-pr-reviewer-v2-saas.vercel.app"
+DASHBOARD_URL = "https://lyncas.vercel.app"
 
 def get_tunnel_url(port):
     import re, shutil
@@ -118,7 +118,7 @@ class MCPHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._json(200, {"status": "ok", "service": "night-pr-reviewer-mcp"})
+            self._json(200, {"status": "ok", "service": "lyncas-mcp"})
         else:
             self._json(404, {"error": "not found"})
 

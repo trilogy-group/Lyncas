@@ -66,12 +66,12 @@ async function sendOTPEmail(
     await transport.sendMail({
       from: user,
       to,
-      subject: "Verify your Night PR Reviewer digest email",
+      subject: "Verify your Lyncas digest email",
       text: `Your verification code is: ${otp}\n\nIt expires in 10 minutes. If you didn't request this, ignore the email.`,
       html: `\
 <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:480px;margin:0 auto;padding:24px;">
   <h1 style="font-size:18px;font-weight:600;margin:0 0 12px 0;">Verify your digest email</h1>
-  <p style="margin:0 0 16px 0;color:#57534e;">Use this code in the Night PR Reviewer dashboard to confirm <strong>${to}</strong>:</p>
+  <p style="margin:0 0 16px 0;color:#57534e;">Use this code in the Lyncas dashboard to confirm <strong>${to}</strong>:</p>
   <div style="font-family:'JetBrains Mono','SF Mono',Menlo,monospace;font-size:28px;font-weight:600;letter-spacing:0.25em;padding:16px 20px;background:#fafaf9;border:1px solid #e7e5e4;border-radius:8px;text-align:center;">${otp}</div>
   <p style="margin:16px 0 0 0;color:#a8a29e;font-size:12px;">Expires in 10 minutes. Didn't request this? Safely ignore the email.</p>
 </div>`,

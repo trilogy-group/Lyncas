@@ -1,6 +1,6 @@
 # dashboard
 
-Next.js (App Router) dashboard for the `night-pr-reviewer` agent. Reads
+Next.js (App Router) dashboard for the `lyncas` agent. Reads
 review/run/digest rows from the same Supabase project that the agent writes
 to, renders an overview page with stat cards + filterable/sortable reviews
 table + two charts, plus per-PR detail, run history, and a read-only

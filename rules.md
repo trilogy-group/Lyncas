@@ -1,4 +1,4 @@
-# Night PR Reviewer — Custom Rules for HackHelix-LLMHallucination
+# Lyncas — Custom Rules for HackHelix-LLMHallucination
 
 ## Auto-close rules
 - Auto-close any PR that adds hardcoded API keys, tokens, or passwords, regardless of severity score

@@ -1,6 +1,6 @@
 # night-pr-webhook.service
 #
-# systemd unit file for the Night PR Reviewer webhook handler. Drop it
+# systemd unit file for the Lyncas webhook handler. Drop it
 # into the appropriate systemd directory, reload, enable, start. The
 # unit can run either as a system service (recommended for EC2 because
 # it survives logout) or as a per-user service (no sudo needed).
@@ -40,7 +40,7 @@
 # firewall.
 
 [Unit]
-Description=Night PR Reviewer webhook handler (EC2)
+Description=Lyncas webhook handler (EC2)
 Documentation=https://github.com/trilogy-group/Night-PR-Reviewer-v2
 After=network-online.target
 Wants=network-online.target

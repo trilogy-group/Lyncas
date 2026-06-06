@@ -1,6 +1,6 @@
 // dashboard/lib/github-app.ts
 //
-// Server-only helpers for talking to GitHub as the Night PR Reviewer
+// Server-only helpers for talking to GitHub as the Lyncas
 // GitHub App. Two flavors of credential live in this module:
 //
 //   1. App JWT — short-lived (10 min) RS256 token signed with the App's

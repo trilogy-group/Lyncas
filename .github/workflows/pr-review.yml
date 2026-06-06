@@ -1,4 +1,4 @@
-name: night-pr-reviewer
+name: lyncas
 
 on:
   schedule:

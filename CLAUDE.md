@@ -9,7 +9,7 @@ in that order.
 
 ## Project summary
 
-Night PR Reviewer is an autonomous GitHub PR-reviewing agent. A
+Lyncas is an autonomous GitHub PR-reviewing agent. A
 push or PR event triggers a Vercel webhook, which dispatches a
 GitHub Actions workflow, which runs a Python agent. The agent
 executes a LangGraph multi-node pipeline (repo-context → reviewer
@@ -339,7 +339,7 @@ limit 5;
 
 **Workflow trigger** (manual, in the GitHub Actions tab):
 
-- Run `night-pr-reviewer` via workflow_dispatch on `main`.
+- Run `lyncas` via workflow_dispatch on `main`.
 - Tail logs. Look for `[startup] Using model: claude-opus-4-5`
   followed by `[fingerprint:...]` and `[graph:...]` lines.
 - A new row should appear in `runs` with `finished_at` set.

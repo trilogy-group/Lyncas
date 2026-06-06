@@ -35,7 +35,7 @@ Regular Gmail passwords don't work over SMTP. You need an app password.
 
 - Enable 2FA on your Google account if you haven't
 - Go to [Google account → Security → App passwords](https://myaccount.google.com/apppasswords)
-- Create one named "night-pr-reviewer"
+- Create one named "lyncas"
 - Copy the 16-character password
 
 ### 5. Add secrets to the agent repo
@@ -53,7 +53,7 @@ In the agent repo on GitHub: Settings → Secrets and variables → Actions → 
 
 ### 6. Test it manually
 
-Go to the Actions tab → night-pr-reviewer → Run workflow. This triggers the scan immediately *and* sends a digest at the end (because of `workflow_dispatch` in the condition). Use this for your video demo.
+Go to the Actions tab → lyncas → Run workflow. This triggers the scan immediately *and* sends a digest at the end (because of `workflow_dispatch` in the condition). Use this for your video demo.
 
 ## Database setup
 

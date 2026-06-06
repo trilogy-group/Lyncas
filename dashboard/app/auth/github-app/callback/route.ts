@@ -10,7 +10,7 @@ import { upsertInstallation } from "@/lib/queries";
 import { getUser } from "@/lib/supabase/server";
 
 // /auth/github-app/callback — landing page after a user installs (or
-// re-configures) the Night PR Reviewer GitHub App.
+// re-configures) the Lyncas GitHub App.
 //
 // GitHub redirects here with these query params after install:
 //   ?installation_id=<int>&setup_action=install

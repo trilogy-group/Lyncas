@@ -85,7 +85,7 @@ export default async function DashboardReportsPage() {
             {watched.length === 0 && (
               <p className="text-xs text-muted">
                 You haven&apos;t connected any repositories yet. Install
-                the Night PR Reviewer GitHub App on the repo you want
+                the Lyncas GitHub App on the repo you want
                 analyzed — every new PR there will produce a report here.
               </p>
             )}
@@ -93,7 +93,7 @@ export default async function DashboardReportsPage() {
           {installUrl && watched.length === 0 && (
             <div className="flex justify-center">
               <ExternalLinkButton href={installUrl} variant="primary">
-                Install Night PR Reviewer →
+                Install Lyncas →
               </ExternalLinkButton>
             </div>
           )}

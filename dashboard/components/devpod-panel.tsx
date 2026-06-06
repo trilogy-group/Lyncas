@@ -389,7 +389,7 @@ function OfflineBody({
   tokenError: string | null;
 }) {
   const installCmd =
-    "curl -fsSL https://night-pr-reviewer-v2-saas.vercel.app/devpod-connect.sh | bash";
+    "curl -fsSL https://lyncas.vercel.app/devpod-connect.sh | bash";
   const connectCmd = token
     ? `devpod-connect --token ${token}`
     : "devpod-connect --token <fetching…>";

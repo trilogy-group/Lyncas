@@ -1,4 +1,4 @@
-# ARCHITECTURE.md — Night PR Reviewer
+# ARCHITECTURE.md — Lyncas
 
 Technical reference for the v2 system as currently shipped. Companion docs:
 [PROJECT_PLAN.md](PROJECT_PLAN.md) (v3 roadmap, tradeoffs, technical debt),

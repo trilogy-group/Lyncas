@@ -22,7 +22,7 @@ const plexMono = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Night PR Reviewer",
+  title: "Lyncas",
   description:
     "Autonomous code review for your GitHub repositories — powered by Claude Opus.",
 };

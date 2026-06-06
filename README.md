@@ -1,10 +1,10 @@
-# Night PR Reviewer
+# Lyncas
 
 > An autonomous AI agent that reviews every pull request on your GitHub repositories,
 > posts a structured review in seconds, and escalates the obvious-bad ones for you.
 > Open source. Multi-tenant. Powered by Claude Opus.
 
-[Live demo](https://night-pr-reviewer-v2.vercel.app) ·
+[Live demo](https://lyncas.vercel.app) ·
 [Dashboard docs](dashboard/README.md) ·
 [Agent docs](agent/README.md) ·
 [Architecture](ARCHITECTURE.md) ·
@@ -35,12 +35,12 @@ The cost is measurable: median review latency, missed regressions, weekend
 oncall. The fix that ships today is "we need to hire more senior
 engineers," which is neither fast nor scalable.
 
-## What Night PR Reviewer does
+## What Lyncas does
 
-Night PR Reviewer sits between GitHub and your team. The moment a PR opens or
+Lyncas sits between GitHub and your team. The moment a PR opens or
 gets new commits, the agent:
 
-1. **Pulls the diff** with a per-repo install of the Night PR Reviewer GitHub
+1. **Pulls the diff** with a per-repo install of the Lyncas GitHub
    App (no shared PATs, no shared secrets).
 2. **Runs a multi-node LangGraph pipeline** (`repo-context → reviewer →
    critic → optional arbiter → final`) on **Claude Opus 4.5**, with your
@@ -84,11 +84,11 @@ poll, prompt-tuner, benchmark harness) headlessly; the underlying rows are
 just not exposed in the UI yet.
 
 The whole thing is open-source. You can self-host it, fork it, or run the
-demo at [`night-pr-reviewer-v2.vercel.app`](https://night-pr-reviewer-v2.vercel.app).
+demo at [`lyncas.vercel.app`](https://lyncas.vercel.app).
 
 ## How it's different
 
-| | Night PR Reviewer | GitHub Copilot Reviews | A bare LLM call in CI |
+| | Lyncas | GitHub Copilot Reviews | A bare LLM call in CI |
 |---|---|---|---|
 | Reads your style guide | ✅ per-repo upload | ❌ | needs glue |
 | Reasons about repo history | ✅ weekly fingerprint cached | partial | ❌ |
@@ -177,7 +177,7 @@ You have three paths:
 
 ### 1. Try the live demo
 
-Open [night-pr-reviewer-v2.vercel.app](https://night-pr-reviewer-v2.vercel.app).
+Open [lyncas.vercel.app](https://lyncas.vercel.app).
 
 - `/landing` is the marketing page.
 - `/login` → sign in with GitHub or via email magic-link.

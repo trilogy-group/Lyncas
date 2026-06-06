@@ -1,4 +1,4 @@
-# PROJECT_PLAN.md — Night PR Reviewer
+# PROJECT_PLAN.md — Lyncas
 
 Forward-looking plan for the autonomous PR-review agent. Companion docs:
 [ARCHITECTURE.md](ARCHITECTURE.md) (how the system is wired today),
@@ -8,7 +8,7 @@ Forward-looking plan for the autonomous PR-review agent. Companion docs:
 
 ## What this project is
 
-Night PR Reviewer is an autonomous agent that wakes up on every push or PR
+Lyncas is an autonomous agent that wakes up on every push or PR
 event in a watched GitHub repo, runs the diff through a four-node LangGraph
 (repo-context → reviewer → critic → arbiter/final), posts a structured
 review comment, optionally auto-closes obvious bad PRs behind a three-gate

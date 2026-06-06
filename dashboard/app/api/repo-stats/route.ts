@@ -42,7 +42,7 @@ async function gh<T>(path: string, token: string | null): Promise<{
         Accept: "application/vnd.github+json",
         ...(token ? { Authorization: `token ${token}` } : {}),
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "night-pr-reviewer-stats",
+        "User-Agent": "lyncas-stats",
       },
       cache: "no-store",
     });

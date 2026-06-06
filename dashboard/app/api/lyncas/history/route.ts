@@ -2,7 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { normalizeGithubUsername, verifyConnectToken } from "@/lib/devpod";
 
-// /api/npr/history
+// /api/lyncas/history
 //
 // Conversation history for the `npr` CLI, keyed by
 // (github_username, repo). The CLI calls this twice per
@@ -27,9 +27,9 @@ import { normalizeGithubUsername, verifyConnectToken } from "@/lib/devpod";
 // for every user; leaking a user's own history to themselves over
 // an unauth'd GET is not a meaningful regression.
 //
-// RLS: migration 017 leaves npr_conversations with a permissive
-// "anon all" policy because the route is the actual security
-// boundary. See dashboard/lib/devpod.ts for the rationale.
+// RLS: migration 019 renamed npr_conversations -> lyncas_conversations
+// and keeps the permissive "anon all" policy because the route is the
+// actual security boundary. See dashboard/lib/devpod.ts for the rationale.
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -103,7 +103,7 @@ export async function GET(req: NextRequest) {
 
   const supabase = await createSupabaseServerClient();
   const { data, error } = await supabase
-    .from("npr_conversations")
+    .from("lyncas_conversations")
     .select("messages")
     .eq("github_username", parsed.username)
     .eq("repo", parsed.repo)
@@ -114,7 +114,7 @@ export async function GET(req: NextRequest) {
     // an empty history. The CLI is expected to "continue without
     // history" on a degenerate response, so we keep the contract
     // simple — 200 + { messages: [] }.
-    console.warn(`[npr/history] GET failed: ${error.message}`);
+    console.warn(`[lyncas/history] GET failed: ${error.message}`);
     return NextResponse.json({ messages: [] });
   }
 
@@ -157,7 +157,7 @@ export async function POST(req: NextRequest) {
   // Touch updated_at explicitly on every upsert. The column default
   // (now()) only fires on INSERT, not UPDATE; without this the row's
   // updated_at would freeze at the first conversation timestamp.
-  const { error } = await supabase.from("npr_conversations").upsert(
+  const { error } = await supabase.from("lyncas_conversations").upsert(
     {
       github_username: parsed.username,
       repo: parsed.repo,
@@ -167,7 +167,7 @@ export async function POST(req: NextRequest) {
     { onConflict: "github_username,repo" },
   );
   if (error) {
-    console.warn(`[npr/history] upsert failed: ${error.message}`);
+    console.warn(`[lyncas/history] upsert failed: ${error.message}`);
     return NextResponse.json(
       { error: "persist failed", detail: error.message },
       { status: 500 },
@@ -199,13 +199,13 @@ export async function DELETE(req: NextRequest) {
 
   const supabase = await createSupabaseServerClient();
   const { error } = await supabase
-    .from("npr_conversations")
+    .from("lyncas_conversations")
     .delete()
     .eq("github_username", parsed.username)
     .eq("repo", parsed.repo);
 
   if (error) {
-    console.warn(`[npr/history] DELETE failed: ${error.message}`);
+    console.warn(`[lyncas/history] DELETE failed: ${error.message}`);
     return NextResponse.json(
       { error: "delete failed", detail: error.message },
       { status: 500 },

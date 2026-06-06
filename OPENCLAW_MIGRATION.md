@@ -1,6 +1,6 @@
 # OpenClaw Migration
 
-_Started 2026-05-15. Goal: move Night PR Reviewer's scheduling (and eventually its webhook) off GitHub Actions onto OpenClaw cron, run by Re-L on Harsh's machine._
+_Started 2026-05-15. Goal: move Lyncas's scheduling (and eventually its webhook) off GitHub Actions onto OpenClaw cron, run by Re-L on Harsh's machine._
 
 ## Three-step plan (short form)
 

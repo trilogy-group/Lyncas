@@ -1,5 +1,5 @@
 {
-  "name": "night-pr-reviewer",
+  "name": "lyncas",
 
   // Python 3.11 matches the version pinned in
   // .github/workflows/pr-review.yml so local + CI behave identically.

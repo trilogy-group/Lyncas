@@ -42,7 +42,7 @@ export default async function DashboardReposPage() {
           subtitle={
             <>
               <span className="text-white font-medium">{watched.length}</span>{" "}
-              watched · managed via the Night PR Reviewer GitHub App.
+              watched · managed via the Lyncas GitHub App.
             </>
           }
         />
@@ -62,7 +62,7 @@ export default async function DashboardReposPage() {
           {installUrl && (
             <div className="flex justify-center">
               <ExternalLinkButton href={installUrl} variant="primary">
-                Install Night PR Reviewer →
+                Install Lyncas →
               </ExternalLinkButton>
             </div>
           )}

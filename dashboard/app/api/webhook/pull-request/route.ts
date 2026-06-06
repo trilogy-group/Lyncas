@@ -103,7 +103,7 @@ async function dispatchWorkflow(meta: {
       Authorization: `token ${token}`,
       Accept: "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "night-pr-reviewer-dispatcher",
+      "User-Agent": "lyncas-dispatcher",
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ ref, inputs: {} }),

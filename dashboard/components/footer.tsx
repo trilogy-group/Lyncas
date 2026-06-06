@@ -96,7 +96,7 @@ export function Footer() {
           ))}
         </div>
         <div className="mt-12 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-6 text-[11px] font-mono uppercase tracking-[0.14em] text-muted">
-          <span>© Night PR Reviewer · Built on Claude Opus</span>
+          <span>© Lyncas · Built on Claude Opus</span>
           <span>v3 · feat/saas-multi-tenant</span>
         </div>
       </div>

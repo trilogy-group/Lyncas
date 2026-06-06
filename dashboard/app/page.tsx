@@ -7,7 +7,7 @@ import { getUser } from "@/lib/supabase/server";
 // Logged-out → /landing            (public marketing page)
 //
 // The v1 demo overview lived here pre-SaaS. On main that still renders,
-// so the live demo at night-pr-reviewer-v2.vercel.app keeps working
+// so the live demo at lyncas.vercel.app keeps working
 // unchanged. On this branch the same content lives at /dashboard/overview
 // behind the auth gate; the public demo routes (/repos, /runs, /benchmark,
 // /settings, /learning, /pr/[id]) remain accessible without auth so the

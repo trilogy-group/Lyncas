@@ -64,7 +64,7 @@ const TRUNC = {
 
 function systemPromptChat(repo: string): string {
   return `\
-You are a GitHub repository assistant for Night PR Reviewer.
+You are a GitHub repository assistant for Lyncas.
 You help developers understand their repositories, review pull requests, and manage their codebase.
 Current repository: ${repo}
 You have access to real GitHub data fetched before this conversation.
@@ -192,7 +192,7 @@ async function ghJSON<T = unknown>(
         Accept: "application/vnd.github+json",
         ...(pat ? { Authorization: `token ${pat}` } : {}),
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "night-pr-reviewer-chat",
+        "User-Agent": "lyncas-chat",
       },
       cache: "no-store",
     });
@@ -771,7 +771,7 @@ async function executeAction(
     Accept: "application/vnd.github+json",
     Authorization: `token ${token}`,
     "X-GitHub-Api-Version": "2022-11-28",
-    "User-Agent": "night-pr-reviewer-chat",
+    "User-Agent": "lyncas-chat",
   } as const;
 
   try {

@@ -18,7 +18,7 @@ import { TerminalWindow } from "@/components/ui/terminal-window";
 // white-on-black, default = transparent w/ white border).
 
 export const metadata = {
-  title: "Night PR Reviewer — AI code review that works while you sleep",
+  title: "Lyncas — AI code review that works while you sleep",
   description:
     "Autonomous PR reviews delivered to GitHub in seconds. Self-learning, per-repo rules, free to start.",
 };
@@ -188,7 +188,7 @@ export default function LandingPage() {
 
           <div className="mt-12 text-center space-y-4">
             <h3 className="text-base font-semibold">
-              Read about how teams ship Night PR Reviewer
+              Read about how teams ship Lyncas
             </h3>
             <div className="flex flex-wrap items-center justify-center gap-3">
               <LinkButton href="/login" size="md" variant="primary">

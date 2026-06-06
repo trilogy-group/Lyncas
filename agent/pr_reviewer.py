@@ -1,5 +1,5 @@
 """
-Night PR Reviewer — autonomous agent that reviews open PRs on configured repos
+Lyncas — autonomous agent that reviews open PRs on configured repos
 using Claude, posts the review as a PR comment, and logs work for a daily digest.
 
 Runs hourly via GitHub Actions. Idempotent — won't re-review the same PR.
@@ -1315,7 +1315,7 @@ def format_close_comment(review: dict, review_url: str | None = None) -> str:
 
     lines = [
         CLOSE_MARKER,
-        "## 🚫 PR auto-closed by night-pr-reviewer",
+        "## 🚫 PR auto-closed by Lyncas",
         "",
         f"This PR was automatically closed because all three gates were met:",
         f"- Verdict: `request_changes`",
@@ -1372,7 +1372,7 @@ def format_review_comment(review: dict) -> str:
 
     lines: list[str] = [
         REVIEW_MARKER,
-        "## 🌙 Night PR Reviewer",
+        "## 🌙 Lyncas",
         "",
         f"**Verdict:** {verdict_emoji} {verdict_label}  ",
         f"**Severity:** {severity_score}/10 · **Confidence:** {confidence}",

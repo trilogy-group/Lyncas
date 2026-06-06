@@ -24,7 +24,7 @@ the idempotency marker — invisible HTML comment.
 
 ```markdown
 <!-- night-pr-reviewer:v1 -->
-## 🌙 Night PR Reviewer
+## 🌙 Lyncas
 
 **Verdict:** ✅ APPROVE
 **Severity:** 4/10 · **Confidence:** high
@@ -131,7 +131,7 @@ Format from `format_close_comment(review)`:
 
 ```markdown
 <!-- night-pr-reviewer:closed:v1 -->
-## 🚫 PR auto-closed by night-pr-reviewer
+## 🚫 PR auto-closed by Lyncas
 
 This PR was automatically closed because all three gates were met:
 - Verdict: `request_changes`
@@ -177,17 +177,17 @@ clients that strip HTML.
 
 | Condition | Subject |
 |---|---|
-| `not all_reviews and not all_errors` | `🌙 Night PR Reviewer — all quiet` |
-| `n_closed > 0` | `🚫 Night PR Reviewer — N auto-closed · M reviewed` |
-| `n_errors > 0` | `⚠️ Night PR Reviewer — M reviewed · N errors` |
-| `n_bugs > 0` | `🌙 Night PR Reviewer — M PRs reviewed · N issues to look at` |
-| else | `🌙 Night PR Reviewer — M PRs reviewed, all clean` |
+| `not all_reviews and not all_errors` | `🌙 Lyncas — all quiet` |
+| `n_closed > 0` | `🚫 Lyncas — N auto-closed · M reviewed` |
+| `n_errors > 0` | `⚠️ Lyncas — M reviewed · N errors` |
+| `n_bugs > 0` | `🌙 Lyncas — M PRs reviewed · N issues to look at` |
+| else | `🌙 Lyncas — M PRs reviewed, all clean` |
 
 Pluralization is via `_pluralize(n, "singular", "plural?")`.
 
 ### HTML structure (top to bottom)
 
-1. **Header** — `Night PR Reviewer` brand + `your overnight code-review
+1. **Header** — `Lyncas` brand + `your overnight code-review
    digest · YYYY-MM-DD` in italicized serif. `_render_header`.
 2. **Summary panel** — 4 stat tiles: Reviews / Auto-closed / Bugs
    flagged / Total cost. `_render_summary_panel`. Costs aggregate
@@ -202,7 +202,7 @@ Pluralization is via `_pluralize(n, "singular", "plural?")`.
 5. **All reviews section** — header + one card per review.
    `_render_reviews_section`.
 6. **Errors section** (only if any) — list. `_render_errors_section`.
-7. **Footer** — italicized "Sent by night-pr-reviewer · running
+7. **Footer** — italicized "Sent by Lyncas · running
    autonomously in GitHub Actions". `_render_footer`.
 
 If both `all_reviews` and `all_errors` are empty, render

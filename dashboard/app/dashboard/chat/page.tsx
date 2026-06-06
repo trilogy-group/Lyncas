@@ -21,7 +21,7 @@ import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 //
 // Columns:
 //   ┌─ 220px left ─┬─ flex chat ─────────────────────┬─ 280px right ─┐
-//   │ repo picker  │ briefing + messages + composer  │ Repository    │
+//   │ repo picker  │ messages + composer             │ Repository    │
 //   │ (dropdown)   │                                 │ Research      │
 //   │ quick acts   │                                 │               │
 //   └──────────────┴─────────────────────────────────┴───────────────┘
@@ -64,30 +64,6 @@ interface ChatMessage {
 
 interface WatchedRepoLite {
   repo: string;
-}
-
-// Per-repo briefing cache. When `generatedAt` is within
-// BRIEFING_TTL_MS we render `content` directly without making an API
-// call. The dismissed flag is sticky across tab switches because the
-// whole entry is persisted into sessionStorage.
-interface BriefingCacheEntry {
-  content: string;
-  generatedAt: number;
-  loading: boolean;
-  error: string | null;
-  dismissed: boolean;
-}
-
-// Adapter type the BriefingCard component reads from. Kept as a
-// distinct shape from BriefingCacheEntry so the cache store can
-// evolve (e.g. add per-repo last-error timestamps) without leaking
-// into the render layer.
-interface BriefingState {
-  repo: string;
-  content: string;
-  loading: boolean;
-  error: string | null;
-  dismissed: boolean;
 }
 
 // Per-repo research cache. Same TTL pattern — an in-flight refresh
@@ -171,15 +147,26 @@ const STORAGE_KEY = "lyncas-chat-state";
 // Bump when the persisted shape changes incompatibly. Stale blobs from
 // older versions are dropped on read.
 const STORAGE_VERSION = 1;
-const BRIEFING_TTL_MS = 60 * 60 * 1000; // 60 min per spec
 const RESEARCH_TTL_MS = 30 * 60 * 1000; // 30 min per spec
 
 // Quick actions — three rows, three columns. The third row is the
 // "actions" row; "Run tests" is shown ONLY when DevPod is connected.
 // Each entry's `prompt` is what we send to /api/chat verbatim — keep
 // them concrete so the model has a clear instruction.
+type QuickActionIcon =
+  | "prs"
+  | "review"
+  | "merge"
+  | "health"
+  | "branches"
+  | "contributors"
+  | "tests"
+  | "report"
+  | "bugs";
+
 type QuickAction = {
   label: string;
+  icon: QuickActionIcon;
   prompt: string;
   // When true, the button is hidden unless DevPod is live for the
   // current user. Used by "Run tests" — meaningless without a
@@ -195,34 +182,40 @@ const QUICK_ACTION_ROWS: ReadonlyArray<ReadonlyArray<QuickAction>> = [
   // Row 1 — PR actions
   [
     {
-      label: "📋 Open PRs",
+      label: "Open PRs",
+      icon: "prs",
       prompt:
         "List all open pull requests with their status, author, and age",
     },
     {
-      label: "🔍 Review latest PR",
+      label: "Review latest PR",
+      icon: "review",
       prompt:
         "Review the most recently opened PR. Give verdict, severity, and top 3 issues",
     },
     {
-      label: "🔀 Recent merges",
+      label: "Recent merges",
+      icon: "merge",
       prompt: "Show the last 5 merged PRs with what changed",
     },
   ],
   // Row 2 — Code intelligence
   [
     {
-      label: "📊 Repo health",
+      label: "Repo health",
+      icon: "health",
       prompt:
         "Give me a repo health summary: open PRs, recent activity, top contributors, and any concerns",
     },
     {
-      label: "🌿 Branches",
+      label: "Branches",
+      icon: "branches",
       prompt:
         "List all branches, their age, and which ones are stale (no commits in 14+ days)",
     },
     {
-      label: "👥 Contributors",
+      label: "Contributors",
+      icon: "contributors",
       prompt:
         "Who are the top contributors this month and what have they been working on",
     },
@@ -230,18 +223,21 @@ const QUICK_ACTION_ROWS: ReadonlyArray<ReadonlyArray<QuickAction>> = [
   // Row 3 — Actions
   [
     {
-      label: "🧪 Run tests",
+      label: "Run tests",
+      icon: "tests",
       prompt:
         "Run the sandbox tests on the most recent open PR and tell me whether it's safe to merge",
       requiresDevpod: true,
     },
     {
-      label: "📄 Generate report",
+      label: "Generate report",
+      icon: "report",
       prompt: "",
       action: "report",
     },
     {
-      label: "🔎 Find bugs",
+      label: "Find bugs",
+      icon: "bugs",
       prompt:
         "Review the diff of all open PRs and list the top 5 most critical bugs found across all of them",
     },
@@ -282,6 +278,7 @@ function renderMarkdown(raw: string): string {
     return `<pre class="code-block"><code>${body.replace(/^\n/, "")}</code></pre>`;
   });
   s = s.replace(/`([^`\n]+)`/g, '<code class="inline-code">$1</code>');
+  s = s.replace(/\*\*\*([^*\n]+)\*\*\*/g, "<strong><em>$1</em></strong>");
   s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
   s = s.replace(/(^|\s)\*([^*\n]+)\*/g, "$1<em>$2</em>");
 
@@ -342,22 +339,26 @@ function renderMarkdown(raw: string): string {
       continue;
     }
 
-    const h1 = /^\s*#\s+(.+)$/.exec(line);
-    const h3 = /^\s*###\s+(.+)$/.exec(line);
-    const h2 = /^\s*##\s+(.+)$/.exec(line);
-    if (h1) {
+    // ----- horizontal rule -----
+    // A line of 3+ repeated -, * or _ (and nothing else) is a thematic
+    // break. LLMs emit these constantly as section separators; without
+    // this rule they render as a literal "---".
+    if (/^\s*([-*_])\1{2,}\s*$/.test(line)) {
       closeLists();
-      out.push(`<h1 class="md-h1">${h1[1]}</h1>`);
+      out.push('<hr class="md-hr"/>');
       continue;
     }
-    if (h3) {
+
+    // ----- ATX headings (# … ######) -----
+    // Generalised so ####/#####/###### no longer fall through and
+    // render as literal hashes. Levels >3 collapse onto a compact h4
+    // style. A trailing run of #'s (atx-closed headings) is trimmed.
+    const heading = /^\s*(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line);
+    if (heading) {
       closeLists();
-      out.push(`<h3 class="md-h3">${h3[1]}</h3>`);
-      continue;
-    }
-    if (h2) {
-      closeLists();
-      out.push(`<h2 class="md-h2">${h2[1]}</h2>`);
+      const level = Math.min(heading[1].length, 4);
+      const tag = level <= 3 ? `h${level}` : "h4";
+      out.push(`<${tag} class="md-h${level}">${heading[2]}</${tag}>`);
       continue;
     }
 
@@ -430,7 +431,7 @@ function renderMarkdown(raw: string): string {
   // every list AND spurious <br>s inside the list, which together
   // looked like "an empty line after every bullet".
   const BLOCK_PREFIX_RE =
-    /^\s*<(ul|ol|table|pre|h1|h2|h3|blockquote|div)\b/i;
+    /^\s*<(ul|ol|table|pre|h1|h2|h3|h4|hr|blockquote|div)\b/i;
   return out
     .join("\n")
     .split(/\n{2,}/)
@@ -585,10 +586,10 @@ function ChatPageInner() {
 
   // --- Persistence-backed state ----------------------------------------
   //
-  // These four are read once on mount from sessionStorage and then
+  // These are read once on mount from sessionStorage and then
   // mirrored back on every change. The blob is key=STORAGE_KEY,
-  // shape={selectedRepo, messagesByRepo, briefingsByRepo,
-  // researchByRepo}. See PersistedState below.
+  // shape={selectedRepo, messagesByRepo, researchByRepo}. See
+  // PersistedState below.
   //
   // We pre-read the initializer eagerly inside the useState callback
   // so the first paint already shows the restored repo + messages
@@ -598,9 +599,6 @@ function ChatPageInner() {
   const [selectedRepo, setSelectedRepo] = useState<string>("");
   const [messagesByRepo, setMessagesByRepo] = useState<
     Record<string, ChatMessage[]>
-  >({});
-  const [briefingsByRepo, setBriefingsByRepo] = useState<
-    Record<string, BriefingCacheEntry>
   >({});
   const [researchByRepo, setResearchByRepo] = useState<
     Record<string, ResearchCacheEntry>
@@ -619,33 +617,19 @@ function ChatPageInner() {
     {},
   );
 
-  // Derived per-repo views — these replace the old `messages`,
-  // `briefing`, `research` flat-state. Empty/null defaults so the
-  // existing renderers don't have to special-case "no entry yet".
+  // Derived per-repo views — these replace the old `messages` /
+  // `research` flat-state. Empty/null defaults so the existing
+  // renderers don't have to special-case "no entry yet".
   const messages = useMemo<ChatMessage[]>(
     () => messagesByRepo[selectedRepo] ?? [],
     [messagesByRepo, selectedRepo],
   );
-  const briefingEntry = briefingsByRepo[selectedRepo] ?? null;
   const researchEntry = researchByRepo[selectedRepo] ?? null;
 
-  // Adapt the cache shape back to the legacy "BriefingState" /
-  // "ResearchState" the existing render code reads from. We wrap
-  // rather than refactor every consumer because the consumer JSX is
-  // long and stable; only the store shape changed.
-  const briefing: BriefingState | null = useMemo(
-    () =>
-      briefingEntry
-        ? {
-            repo: selectedRepo,
-            content: briefingEntry.content,
-            loading: briefingEntry.loading,
-            error: briefingEntry.error,
-            dismissed: briefingEntry.dismissed,
-          }
-        : null,
-    [briefingEntry, selectedRepo],
-  );
+  // Adapt the cache shape back to the legacy "ResearchState" the
+  // existing render code reads from. We wrap rather than refactor every
+  // consumer because the consumer JSX is long and stable; only the
+  // store shape changed.
   const research: ResearchState | null = useMemo(
     () =>
       researchEntry
@@ -725,12 +709,11 @@ function ChatPageInner() {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const statsAbortRef = useRef<AbortController | null>(null);
-  // Per-repo briefing/research aborts — when the user switches repos
-  // we want to keep the in-flight briefing for the OLD repo running
-  // (so when they switch back, the cache is already populated). The
-  // bootstrap-cleanup path doesn't try to walk these maps; they get
+  // Per-repo research aborts — when the user switches repos we want to
+  // keep the in-flight research fetch for the OLD repo running (so when
+  // they switch back, the cache is already populated). The
+  // bootstrap-cleanup path doesn't try to walk this map; it gets
   // GC'd with the page.
-  const briefingAbortByRepoRef = useRef<Record<string, AbortController>>({});
   const researchAbortByRepoRef = useRef<Record<string, AbortController>>({});
 
   // ----- Mount-time hydrate from sessionStorage -----
@@ -741,7 +724,6 @@ function ChatPageInner() {
     type Persisted = {
       selectedRepo?: string;
       messagesByRepo?: Record<string, ChatMessage[]>;
-      briefingsByRepo?: Record<string, BriefingCacheEntry>;
       researchByRepo?: Record<string, ResearchCacheEntry>;
     };
     const restored = safeReadStorage<Persisted>();
@@ -751,16 +733,6 @@ function ChatPageInner() {
       }
       if (restored.messagesByRepo && typeof restored.messagesByRepo === "object") {
         setMessagesByRepo(restored.messagesByRepo);
-      }
-      if (restored.briefingsByRepo && typeof restored.briefingsByRepo === "object") {
-        // Coerce any stale `loading: true` flags off — a tab refresh
-        // mid-stream would otherwise leave the briefing card stuck
-        // in a skeleton state forever.
-        const sane: Record<string, BriefingCacheEntry> = {};
-        for (const [k, v] of Object.entries(restored.briefingsByRepo)) {
-          sane[k] = { ...v, loading: false };
-        }
-        setBriefingsByRepo(sane);
       }
       if (restored.researchByRepo && typeof restored.researchByRepo === "object") {
         const sane: Record<string, ResearchCacheEntry> = {};
@@ -781,14 +753,12 @@ function ChatPageInner() {
     safeWriteStorage({
       selectedRepo,
       messagesByRepo,
-      briefingsByRepo,
       researchByRepo,
     });
   }, [
     hydrated,
     selectedRepo,
     messagesByRepo,
-    briefingsByRepo,
     researchByRepo,
   ]);
 
@@ -803,21 +773,6 @@ function ChatPageInner() {
         ...prev,
         [repo]: updater(prev[repo] ?? []),
       }));
-    },
-    [],
-  );
-  const updateBriefingForRepo = useCallback(
-    (repo: string, patch: Partial<BriefingCacheEntry>): void => {
-      setBriefingsByRepo((prev) => {
-        const cur = prev[repo] ?? {
-          content: "",
-          generatedAt: 0,
-          loading: false,
-          error: null,
-          dismissed: false,
-        };
-        return { ...prev, [repo]: { ...cur, ...patch } };
-      });
     },
     [],
   );
@@ -1038,7 +993,7 @@ function ChatPageInner() {
     const el = scrollRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [messages, briefing]);
+  }, [messages]);
 
   // ----- DevPod liveness polling -----
   // Used by:
@@ -1129,94 +1084,6 @@ function ChatPageInner() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
-
-  // --- briefing -----------------------------------------------------------
-  // Streams a fresh briefing for `repo` and writes the result into
-  // briefingsByRepo[repo]. Per-repo abort controllers — switching
-  // repos doesn't kill an in-flight briefing, so by the time the
-  // user switches back the cache is already populated. The TTL check
-  // is the caller's responsibility (see selectedRepo effect below).
-  const fetchBriefing = useCallback(
-    async (repo: string) => {
-      briefingAbortByRepoRef.current[repo]?.abort();
-      const ac = new AbortController();
-      briefingAbortByRepoRef.current[repo] = ac;
-
-      updateBriefingForRepo(repo, {
-        content: "",
-        loading: true,
-        error: null,
-        dismissed: false,
-        generatedAt: 0,
-      });
-      setGlobalError(null);
-      try {
-        const res = await fetch("/api/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            message: "Generate a research briefing for this repository.",
-            repo,
-            history: [],
-            isResearchBriefing: true,
-          }),
-          signal: ac.signal,
-        });
-        if (!res.ok || !res.body) {
-          let detail = `HTTP ${res.status}`;
-          try {
-            const j = (await res.json()) as { error?: string };
-            if (j.error) detail = j.error;
-          } catch {
-            // non-json
-          }
-          updateBriefingForRepo(repo, { loading: false, error: detail });
-          setGlobalError(
-            "Some repository data unavailable — answers may be limited",
-          );
-          return;
-        }
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buf = "";
-        let content = "";
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buf += decoder.decode(value, { stream: true });
-          const frames = buf.split("\n\n");
-          buf = frames.pop() ?? "";
-          for (const frame of frames) {
-            const line = frame.startsWith("data: ") ? frame.slice(6) : frame;
-            if (!line) continue;
-            if (line === "[DONE]") {
-              reader.cancel();
-              updateBriefingForRepo(repo, {
-                content,
-                loading: false,
-                generatedAt: Date.now(),
-              });
-              return;
-            }
-            content += line;
-            updateBriefingForRepo(repo, { content });
-          }
-        }
-        updateBriefingForRepo(repo, {
-          content,
-          loading: false,
-          generatedAt: Date.now(),
-        });
-      } catch (e) {
-        if ((e as Error).name === "AbortError") return;
-        updateBriefingForRepo(repo, {
-          loading: false,
-          error: (e as Error).message,
-        });
-      }
-    },
-    [updateBriefingForRepo],
-  );
 
   // --- stats --------------------------------------------------------------
   const fetchStats = useCallback(async (repo: string) => {
@@ -1324,11 +1191,8 @@ function ChatPageInner() {
   //
   // When switching repos:
   //   * Stats are not persisted, so always refetch (cheap, no TTL).
-  //   * Briefings are cached for BRIEFING_TTL_MS — only fetch on
-  //     cache miss / staleness. Critical: the legacy effect ran
-  //     fetchBriefing on every selectedRepo change which is what
-  //     made tab switches re-burn Anthropic tokens.
-  //   * Research is cached for RESEARCH_TTL_MS — same rule.
+  //   * Research is cached for RESEARCH_TTL_MS — only fetch on
+  //     cache miss / staleness.
   //   * Messages are NEVER cleared on switch — the per-repo map
   //     preserves them. Only an explicit "Clear chat" wipes them.
   //
@@ -1354,17 +1218,6 @@ function ChatPageInner() {
       // Stats: always.
       void fetchStats(selectedRepo);
 
-      // Briefing: cache check.
-      const b = briefingsByRepo[selectedRepo];
-      const briefingFresh =
-        b &&
-        !b.error &&
-        b.content &&
-        Date.now() - b.generatedAt < BRIEFING_TTL_MS;
-      if (!briefingFresh && !(b && b.loading)) {
-        void fetchBriefing(selectedRepo);
-      }
-
       // Research: cache check.
       const r = researchByRepo[selectedRepo];
       const researchFresh =
@@ -1377,11 +1230,11 @@ function ChatPageInner() {
       }
     }, 400);
     return () => clearTimeout(t);
-    // briefingsByRepo / researchByRepo intentionally NOT in deps:
-    // we only want the cache check on explicit selectedRepo change,
-    // not on every cache write (which would fire infinitely).
+    // researchByRepo intentionally NOT in deps: we only want the cache
+    // check on explicit selectedRepo change, not on every cache write
+    // (which would fire infinitely).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedRepo, fetchBriefing, fetchStats, fetchResearch]);
+  }, [selectedRepo, fetchStats, fetchResearch]);
 
   // --- send / report ------------------------------------------------------
 
@@ -1677,6 +1530,7 @@ function ChatPageInner() {
 
           <ProjectStructureCard
             tree={tree}
+            repo={selectedRepo}
             hasRepo={hasRepo}
             open={treePanelOpen}
             onToggle={() => setTreePanelOpen((v) => !v)}
@@ -1834,20 +1688,6 @@ function ChatPageInner() {
 
               {hasRepo &&
                 !roomTransition &&
-                briefing &&
-                !briefing.dismissed &&
-                briefing.repo === selectedRepo && (
-                  <BriefingCard
-                    briefing={briefing}
-                    onDismiss={() =>
-                      updateBriefingForRepo(selectedRepo, { dismissed: true })
-                    }
-                    onRefresh={() => void fetchBriefing(selectedRepo)}
-                  />
-                )}
-
-              {hasRepo &&
-                !roomTransition &&
                 activePrNumber !== null && (
                   <SandboxTestCard
                     repo={selectedRepo}
@@ -1857,16 +1697,8 @@ function ChatPageInner() {
 
               {hasRepo &&
                 !roomTransition &&
-                messages.length === 0 &&
-                briefing?.dismissed && (
-                  <EmptyRoomQuickStart
-                    repo={selectedRepo}
-                    devpodLive={devpodLive}
-                    onAction={(a) => {
-                      if (a.action === "report") void generateReport();
-                      else void send(a.prompt);
-                    }}
-                  />
+                messages.length === 0 && (
+                  <EmptyRoomQuickStart repo={selectedRepo} />
                 )}
 
               {messages.map((m, idx) => {
@@ -2004,7 +1836,7 @@ function ChatPageInner() {
         /* and the legacy 1.5 line-height + 0.35rem paragraph margins    */
         /* opened up too much vertical space between bullets and prose.  */
         .md-content {
-          line-height: 1.45;
+          line-height: 1.55;
         }
         .md-content p {
           margin: 0 0 0.25rem 0;
@@ -2027,9 +1859,40 @@ function ChatPageInner() {
         }
         .md-content .md-h1,
         .md-content .md-h2,
+        .md-content .md-h3,
+        .md-content .md-h4 {
+          margin-top: 0.7rem;
+          margin-bottom: 0.3rem;
+          font-weight: 700;
+          line-height: 1.3;
+        }
+        .md-content .md-h1:first-child,
+        .md-content .md-h2:first-child,
+        .md-content .md-h3:first-child,
+        .md-content .md-h4:first-child {
+          margin-top: 0;
+        }
+        /* Keep headings only marginally larger than body text — a chat
+           bubble shouldn't shout a 2em <h1>. */
+        .md-content .md-h1 {
+          font-size: 1.14em;
+        }
+        .md-content .md-h2 {
+          font-size: 1.02em;
+        }
         .md-content .md-h3 {
-          margin-top: 0.6rem;
-          margin-bottom: 0.25rem;
+          font-size: 0.95em;
+        }
+        .md-content .md-h4 {
+          font-size: 0.85em;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+          opacity: 0.8;
+        }
+        .md-content .md-hr {
+          border: 0;
+          border-top: 1px solid var(--color-border);
+          margin: 0.7rem 0;
         }
         .md-content .md-table {
           width: 100%;
@@ -2381,20 +2244,114 @@ function RepoDropdown({
 // Reads repo_rules.repo_directory_tree (anon-select per migration 009).
 // =========================================================================
 
+// Color-coded accents for the project-structure tree. Buckets are
+// deliberately coarse so the panel reads as a calm, scannable index
+// rather than a confetti of one-off colors.
+const TREE_FOLDER_COLOR = "#e3b341";
+
+function fileAccent(name: string): string {
+  const ext = name.includes(".") ? name.split(".").pop()!.toLowerCase() : "";
+  if (
+    [
+      "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "rs", "rb",
+      "java", "kt", "php", "c", "cc", "cpp", "h", "hpp", "cs", "swift",
+      "scala", "sh", "bash", "zsh", "lua", "dart",
+    ].includes(ext)
+  )
+    return "#60a5fa"; // code → blue
+  if (
+    ["json", "yaml", "yml", "toml", "ini", "env", "lock", "xml", "cfg", "conf"].includes(ext)
+  )
+    return "#f59e0b"; // config / data → amber-orange
+  if (["css", "scss", "sass", "less", "styl"].includes(ext)) return "#ec4899"; // styles → pink
+  if (["md", "mdx", "txt", "rst", "pdf", "adoc", "license"].includes(ext))
+    return "#9ca3af"; // docs → gray
+  if (
+    ["png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "mp4", "mov", "avif"].includes(ext)
+  )
+    return "#a78bfa"; // media → purple
+  return "#6b7280"; // default → muted
+}
+
+function TreeFolderIcon({ color }: { color: string }) {
+  return (
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden>
+      <path
+        d="M1.5 3.75A1.25 1.25 0 0 1 2.75 2.5h2.69c.33 0 .65.13.88.37l.94.94H13.25A1.25 1.25 0 0 1 14.5 5.06v6.19A1.25 1.25 0 0 1 13.25 12.5H2.75A1.25 1.25 0 0 1 1.5 11.25V3.75Z"
+        fill={color}
+        fillOpacity="0.22"
+        stroke={color}
+        strokeWidth="1.1"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function TreeFileIcon({ color }: { color: string }) {
+  return (
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden>
+      <path
+        d="M4 1.75A.75.75 0 0 1 4.75 1H9l3.25 3.25v10A.75.75 0 0 1 11.5 15H4.75a.75.75 0 0 1-.75-.75V1.75Z"
+        fill={color}
+        fillOpacity="0.14"
+        stroke={color}
+        strokeWidth="1.1"
+        strokeLinejoin="round"
+      />
+      <path d="M8.75 1.25v3.25H12" stroke={color} strokeWidth="1.1" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function ArrowOutIcon() {
+  return (
+    <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor" aria-hidden>
+      <path d="M9 2h5v5h-1V3.7L7.7 9 7 8.3 12.3 3H9V2z" />
+      <path d="M3 4h4v1H4v7h7V9h1v4H3V4z" />
+    </svg>
+  );
+}
+
+interface TreeEntry {
+  name: string;
+  isDir: boolean;
+}
+
 function ProjectStructureCard({
   tree,
+  repo,
   hasRepo,
   open,
   onToggle,
 }: {
   tree: DirectoryTreeState | null;
+  repo: string;
   hasRepo: boolean;
   open: boolean;
   onToggle: () => void;
 }) {
   const empty = !hasRepo;
   const ready = !!(tree && !tree.loading && tree.text && tree.text.trim());
-  const lineCount = ready ? (tree!.text as string).split("\n").length : 0;
+
+  const entries: TreeEntry[] = useMemo(() => {
+    if (!ready) return [];
+    return (tree!.text as string)
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .map((line) => {
+        const isDir = line.endsWith("/");
+        return { name: isDir ? line.slice(0, -1) : line, isDir };
+      });
+  }, [ready, tree]);
+
+  const folderCount = entries.filter((e) => e.isDir).length;
+  const fileCount = entries.length - folderCount;
+
+  const ghUrl = (e: TreeEntry) =>
+    `https://github.com/${repo}/${e.isDir ? "tree" : "blob"}/HEAD/${e.name}`;
+
   return (
     <Card flush>
       <button
@@ -2419,13 +2376,27 @@ function ProjectStructureCard({
           Project structure
         </span>
         {ready && (
-          <span className="font-mono text-[9px] text-muted">
-            {lineCount} line{lineCount === 1 ? "" : "s"}
+          <span className="flex items-center gap-1.5 font-mono text-[9px] text-muted">
+            <span className="inline-flex items-center gap-1">
+              <span
+                className="inline-block h-1.5 w-1.5 rounded-[1px]"
+                style={{ backgroundColor: TREE_FOLDER_COLOR }}
+                aria-hidden
+              />
+              {folderCount}
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span
+                className="inline-block h-1.5 w-1.5 rounded-[1px] bg-muted"
+                aria-hidden
+              />
+              {fileCount}
+            </span>
           </span>
         )}
       </button>
       {open && (
-        <div className="p-2 text-[11px]">
+        <div className="p-2">
           {empty ? (
             <p className="px-1 py-2 text-[11px] text-muted">
               Select a repository to see its tree.
@@ -2438,9 +2409,80 @@ function ProjectStructureCard({
               <div className="h-2 w-1/2 rounded bg-border/50" />
             </div>
           ) : ready ? (
-            <pre className="max-h-72 overflow-auto whitespace-pre rounded-sm bg-bg-elev px-2 py-2 font-mono text-[10.5px] leading-relaxed text-text">
-              {tree!.text}
-            </pre>
+            <div className="max-h-80 overflow-auto pr-0.5">
+              <div className="relative pl-2.5">
+                {/* vertical guide rail */}
+                <span
+                  className="pointer-events-none absolute left-1 top-1 bottom-1 w-px bg-border/70"
+                  aria-hidden
+                />
+                {entries.map((e, i) => {
+                  const accent = e.isDir
+                    ? TREE_FOLDER_COLOR
+                    : fileAccent(e.name);
+                  const ext =
+                    !e.isDir && e.name.includes(".")
+                      ? e.name.split(".").pop()!.toLowerCase()
+                      : "";
+                  const showDivider =
+                    i === folderCount && folderCount > 0 && fileCount > 0;
+                  return (
+                    <div key={`${e.name}-${i}`}>
+                      {showDivider && (
+                        <div className="my-1 ml-1.5 border-t border-dashed border-border/60" />
+                      )}
+                      <a
+                        href={ghUrl(e)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="group/row relative flex items-center gap-2 rounded-sm py-[3px] pl-2 pr-1.5 transition-colors hover:bg-bg-elev"
+                        title={`Open ${e.name} on GitHub`}
+                      >
+                        {/* connector tick into the guide rail */}
+                        <span
+                          className="pointer-events-none absolute -left-[5px] top-1/2 h-px w-[7px] -translate-y-1/2 bg-border/70"
+                          aria-hidden
+                        />
+                        <span className="shrink-0">
+                          {e.isDir ? (
+                            <TreeFolderIcon color={accent} />
+                          ) : (
+                            <TreeFileIcon color={accent} />
+                          )}
+                        </span>
+                        <span
+                          className={
+                            "min-w-0 flex-1 truncate font-mono text-[11.5px] " +
+                            (e.isDir
+                              ? "font-medium text-text"
+                              : "text-text/90")
+                          }
+                        >
+                          {e.name}
+                          {e.isDir && (
+                            <span className="text-muted">/</span>
+                          )}
+                        </span>
+                        {ext && (
+                          <span
+                            className="shrink-0 rounded-[3px] px-1 py-px font-mono text-[8.5px] uppercase tracking-[0.08em]"
+                            style={{
+                              color: accent,
+                              backgroundColor: accent + "1f",
+                            }}
+                          >
+                            {ext}
+                          </span>
+                        )}
+                        <span className="shrink-0 text-muted opacity-0 transition-opacity group-hover/row:opacity-100">
+                          <ArrowOutIcon />
+                        </span>
+                      </a>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
           ) : (
             <p className="px-1 py-2 text-[11px] text-muted">
               No tree yet — the agent will populate this when it runs
@@ -2474,7 +2516,9 @@ function NoRoomState({
   return (
     <div className="flex flex-col items-center justify-center gap-8 py-12 text-center sm:py-16">
       <div className="space-y-3">
-        <div className="text-3xl">🌙</div>
+        <div className="flex justify-center text-text">
+          <LyncasGlyph size={34} />
+        </div>
         <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">
           Lyncas
         </h1>
@@ -2527,17 +2571,28 @@ function NoRoomState({
           select a repo) is right above. */}
       <div className="grid w-full max-w-2xl grid-cols-1 gap-3 px-2 sm:grid-cols-3 sm:px-0">
         <FeatureCard
-          icon="⚡"
+          icon={
+            <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" strokeLinecap="round" aria-hidden>
+              <path d="M9 1.5L3.5 9H7.5l-1 5.5L12.5 7H8.5z" />
+            </svg>
+          }
           title="Instant reviews"
           body="Reviews land in ~30 seconds of opening a pull request."
         />
         <FeatureCard
-          icon="🧠"
+          icon={
+            <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" strokeLinecap="round" aria-hidden>
+              <circle cx="4" cy="4" r="1.6" />
+              <circle cx="12" cy="4" r="1.6" />
+              <circle cx="8" cy="12" r="1.6" />
+              <path d="M5.4 4.6L7 10.6M10.6 4.6L9 10.6M5.5 4h5" />
+            </svg>
+          }
           title="AI-powered"
           body="A 4-node LangGraph pipeline cross-checks every verdict."
         />
         <FeatureCard
-          icon="🧪"
+          icon={<ActionIcon name="tests" />}
           title="Sandbox testing"
           body="Live preview URLs and real test runs from your DevPod."
         />
@@ -2546,18 +2601,45 @@ function NoRoomState({
   );
 }
 
+// Brand starburst glyph (mirrors components/ui/brand.tsx) — used in
+// place of the old moon emoji for the agent avatar and empty-state hero.
+function LyncasGlyph({ size = 20 }: { size?: number }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} aria-hidden>
+      <g
+        fill="currentColor"
+        stroke="currentColor"
+        strokeWidth={0.5}
+        strokeLinejoin="round"
+      >
+        <polygon points="12,1 13.3,9 12,12 10.7,9" />
+        <polygon points="12,23 13.3,15 12,12 10.7,15" />
+        <polygon points="1,12 9,10.7 12,12 9,13.3" />
+        <polygon points="23,12 15,10.7 12,12 15,13.3" />
+        <polygon points="4.2,4.2 10,9.2 12,12 9.2,10" />
+        <polygon points="19.8,19.8 14,14.8 12,12 14.8,14" />
+        <polygon points="4.2,19.8 9.2,14 12,12 10,14.8" />
+        <polygon points="19.8,4.2 14.8,9.2 12,12 14,10" />
+      </g>
+    </svg>
+  );
+}
+
 function FeatureCard({
   icon,
   title,
   body,
 }: {
-  icon: string;
+  icon: React.ReactNode;
   title: string;
   body: string;
 }) {
   return (
-    <div className="flex flex-col items-start gap-1 rounded-sm border border-border bg-bg-elev p-3 text-left">
-      <div className="text-xl" aria-hidden>
+    <div className="flex flex-col items-start gap-1.5 rounded-md border border-border bg-bg-elev p-3 text-left">
+      <div
+        className="flex h-8 w-8 items-center justify-center rounded-[6px] border border-border bg-bg text-text"
+        aria-hidden
+      >
         {icon}
       </div>
       <div className="text-sm font-semibold">{title}</div>
@@ -3015,105 +3097,6 @@ function ResearchSkeleton() {
 }
 
 // =========================================================================
-// Briefing card
-// =========================================================================
-
-function BriefingCard({
-  briefing,
-  onDismiss,
-  onRefresh,
-}: {
-  briefing: BriefingState;
-  onDismiss: () => void;
-  onRefresh: () => void;
-}) {
-  const [copied, setCopied] = useState(false);
-  async function copy() {
-    try {
-      await navigator.clipboard.writeText(briefing.content);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // ignore
-    }
-  }
-  return (
-    <div className="overflow-hidden rounded-sm border border-border bg-bg-elev border-l-2 border-l-[#60a5fa]">
-      <div className="flex items-center justify-between border-b border-border bg-bg px-4 py-2">
-        <div className="flex items-center gap-2">
-          <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-[#60a5fa]">
-            Research briefing
-          </span>
-          <span className="text-[10px] font-mono text-muted">
-            auto-generated on room enter
-          </span>
-        </div>
-        <div className="flex items-center gap-1">
-          <button
-            type="button"
-            onClick={copy}
-            disabled={briefing.loading || !briefing.content}
-            className="rounded-sm border border-border px-2 py-0.5 text-[10px] font-mono uppercase tracking-[0.14em] text-muted hover:text-text disabled:opacity-40"
-          >
-            {copied ? "Copied" : "Copy"}
-          </button>
-          <button
-            type="button"
-            onClick={onRefresh}
-            disabled={briefing.loading}
-            className="rounded-sm border border-border px-2 py-0.5 text-[11px] text-muted hover:text-text disabled:opacity-40"
-            title="Regenerate briefing"
-          >
-            ↻
-          </button>
-          <button
-            type="button"
-            onClick={onDismiss}
-            className="rounded-sm border border-border px-2 py-0.5 text-[11px] text-muted hover:text-text"
-            title="Dismiss"
-          >
-            ✕
-          </button>
-        </div>
-      </div>
-      <div className="p-4 text-sm">
-        {briefing.loading && !briefing.content ? (
-          <BriefingSkeleton />
-        ) : briefing.error ? (
-          <div className="text-xs text-[#ff9d4d]">
-            Could not generate briefing: {briefing.error}
-          </div>
-        ) : (
-          <div
-            className="md-content"
-            dangerouslySetInnerHTML={{
-              __html: renderMarkdown(briefing.content),
-            }}
-          />
-        )}
-      </div>
-    </div>
-  );
-}
-
-function BriefingSkeleton() {
-  return (
-    <div className="animate-pulse space-y-3">
-      <div className="h-3 w-24 rounded bg-border" />
-      <div className="space-y-1.5">
-        <div className="h-2 w-full rounded bg-border/70" />
-        <div className="h-2 w-5/6 rounded bg-border/70" />
-      </div>
-      <div className="mt-3 h-3 w-32 rounded bg-border" />
-      <div className="space-y-1.5">
-        <div className="h-2 w-4/6 rounded bg-border/70" />
-        <div className="h-2 w-3/6 rounded bg-border/70" />
-      </div>
-    </div>
-  );
-}
-
-// =========================================================================
 // Report card (full-width, print-friendly, white background)
 // =========================================================================
 
@@ -3261,7 +3244,7 @@ function ReportCard({
 
 // Renders a single chat turn. The render contract:
 //   * User turns are right-aligned, white bubble, "You" label.
-//   * Assistant turns are left-aligned, dark bubble, 🌙 + "Agent" label.
+//   * Assistant turns are left-aligned, dark bubble, brand glyph + "Agent" label.
 //   * `isStreaming` only applies to the LAST message — the parent
 //     gates this so older messages don't flash a cursor.
 //   * `streamError` (set by the parent on stream failure) renders an
@@ -3336,10 +3319,10 @@ function MessageBubble({
       ) : (
         <span
           aria-hidden
-          className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-border bg-bg-elev text-sm"
+          className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-border bg-bg-elev text-text"
           title="Lyncas"
         >
-          🌙
+          <LyncasGlyph size={13} />
         </span>
       )}
 
@@ -3362,7 +3345,7 @@ function MessageBubble({
 
         <div
           className={
-            "relative max-w-[85%] rounded-md px-3.5 py-2.5 font-mono text-[13px] leading-snug sm:max-w-[80%] " +
+            "relative max-w-[85%] rounded-md px-3.5 py-2.5 font-mono text-[12px] leading-relaxed sm:max-w-[80%] " +
             (isUser
               ? "bg-white text-black"
               : "border border-border bg-bg-elev text-white") +
@@ -3460,6 +3443,105 @@ function TypingDots() {
 // action is filtered out unless DevPod is connected.
 // =========================================================================
 
+// Monochrome 16×16 line icons for the quick actions. Stroke-based so
+// they inherit `currentColor` and stay crisp at small sizes — no
+// emoji, no color noise.
+function ActionIcon({ name }: { name: QuickActionIcon }) {
+  const common = {
+    width: 15,
+    height: 15,
+    viewBox: "0 0 16 16",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.3,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+    "aria-hidden": true,
+  };
+  switch (name) {
+    case "prs":
+      return (
+        <svg {...common}>
+          <circle cx="4" cy="4" r="1.6" />
+          <circle cx="4" cy="12" r="1.6" />
+          <path d="M4 5.6v4.8" />
+          <path d="M11.5 4h-3l1.2-1.2M8.5 4l1.2 1.2" />
+          <circle cx="12" cy="6" r="1.6" />
+          <path d="M12 7.6c0 2-1 2.8-3 3.2" />
+        </svg>
+      );
+    case "review":
+      return (
+        <svg {...common}>
+          <circle cx="7" cy="7" r="4" />
+          <path d="M10 10l3 3" />
+          <path d="M5.5 7l1.2 1.2L9 5.8" />
+        </svg>
+      );
+    case "merge":
+      return (
+        <svg {...common}>
+          <circle cx="4" cy="4" r="1.6" />
+          <circle cx="4" cy="12" r="1.6" />
+          <circle cx="12" cy="9" r="1.6" />
+          <path d="M4 5.6v4.8" />
+          <path d="M4 8c0-2.4 3.5-1.4 6.4-1.4" />
+        </svg>
+      );
+    case "health":
+      return (
+        <svg {...common}>
+          <path d="M1.5 8h3l1.5-4 2.5 8 1.5-4h4.5" />
+        </svg>
+      );
+    case "branches":
+      return (
+        <svg {...common}>
+          <circle cx="4" cy="3.5" r="1.6" />
+          <circle cx="4" cy="12.5" r="1.6" />
+          <circle cx="12" cy="3.5" r="1.6" />
+          <path d="M4 5.1v5.8" />
+          <path d="M12 5.1c0 3.4-3 3.6-6 4.2" />
+        </svg>
+      );
+    case "contributors":
+      return (
+        <svg {...common}>
+          <circle cx="6" cy="6" r="2.2" />
+          <path d="M2.5 13c.5-2.2 2-3.2 3.5-3.2s3 1 3.5 3.2" />
+          <path d="M11 4.2a2 2 0 0 1 0 3.8" />
+          <path d="M11.5 9.8c1.3.3 2.2 1.3 2.6 3" />
+        </svg>
+      );
+    case "tests":
+      return (
+        <svg {...common}>
+          <path d="M6.5 2v4L3.5 12a1.3 1.3 0 0 0 1.2 2h6.6a1.3 1.3 0 0 0 1.2-2L9.5 6V2" />
+          <path d="M5.5 2h5" />
+          <path d="M5.8 9.5h4.4" />
+        </svg>
+      );
+    case "report":
+      return (
+        <svg {...common}>
+          <path d="M4 1.8h5L12 4.8v9.4H4z" />
+          <path d="M8.6 1.8v3.2H12" />
+          <path d="M6 8.5h4M6 11h2.5" />
+        </svg>
+      );
+    case "bugs":
+      return (
+        <svg {...common}>
+          <rect x="5" y="6" width="6" height="6.5" rx="3" />
+          <path d="M6 4.5l1 1.5M10 4.5L9 6" />
+          <path d="M2.5 8H5M11 8h2.5M2.8 11H5M11 11h2.2M3.2 5.5L5 6.7M11 6.7l1.8-1.2" />
+        </svg>
+      );
+    default:
+      return null;
+  }
+}
+
 function QuickActionGrid({
   hasRepo,
   isStreaming,
@@ -3481,17 +3563,25 @@ function QuickActionGrid({
   );
   if (compact) {
     return (
-      <div className="flex flex-col gap-1 p-1">
+      <div className="flex flex-col gap-0.5 p-1">
         {visible.map((a) => (
           <button
             key={a.label}
             type="button"
             onClick={() => onAction(a)}
             disabled={!hasRepo || isStreaming}
-            className="rounded-sm border border-transparent px-2 py-1.5 text-left text-xs font-mono text-muted transition-colors hover:bg-bg-elev hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-muted"
+            className="group/qa flex items-center gap-2.5 rounded-sm border border-transparent px-2 py-1.5 text-left text-xs font-mono text-muted transition-colors hover:border-border hover:bg-bg-elev hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-transparent disabled:hover:bg-transparent disabled:hover:text-muted"
             title={a.action === "report" ? "Generate health report" : a.prompt}
           >
-            {a.label}
+            <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-[4px] border border-border bg-bg text-muted transition-colors group-hover/qa:border-border-strong group-hover/qa:text-text">
+              <ActionIcon name={a.icon} />
+            </span>
+            <span className="min-w-0 flex-1 truncate">{a.label}</span>
+            <span className="shrink-0 text-muted opacity-0 transition-opacity group-hover/qa:opacity-100">
+              <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden>
+                <path d="M6 4l4 4-4 4" />
+              </svg>
+            </span>
           </button>
         ))}
       </div>
@@ -3505,10 +3595,22 @@ function QuickActionGrid({
           type="button"
           onClick={() => onAction(a)}
           disabled={!hasRepo || isStreaming}
-          className="flex h-full flex-col items-start gap-1 rounded-sm border border-border bg-bg-elev px-3 py-2.5 text-left text-xs font-mono text-text transition-colors hover:border-border-strong hover:bg-card disabled:cursor-not-allowed disabled:opacity-40"
+          className="group/qa flex h-full flex-col gap-2 rounded-md border border-border bg-bg-elev px-3 py-3 text-left text-xs font-mono text-text transition-all hover:-translate-y-px hover:border-border-strong hover:bg-card disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:translate-y-0"
           title={a.action === "report" ? "Generate health report" : a.prompt}
         >
-          <span className="text-sm font-semibold">{a.label}</span>
+          <span className="flex items-center justify-between">
+            <span className="flex h-7 w-7 items-center justify-center rounded-[5px] border border-border bg-bg text-text transition-colors group-hover/qa:border-border-strong">
+              <ActionIcon name={a.icon} />
+            </span>
+            <span className="text-muted opacity-0 transition-opacity group-hover/qa:opacity-100">
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden>
+                <path d="M6 4l4 4-4 4" />
+              </svg>
+            </span>
+          </span>
+          <span className="text-[13px] font-semibold leading-tight">
+            {a.label}
+          </span>
           {a.action !== "report" && (
             <span className="line-clamp-2 text-[10px] font-normal leading-snug text-muted">
               {a.prompt}
@@ -3521,43 +3623,31 @@ function QuickActionGrid({
 }
 
 // =========================================================================
-// Empty-room quick start — shown when a repo IS selected but the
-// briefing has been dismissed and no messages exist yet. Mirrors the
-// empty-state spec ("Ask me anything about {repo}").
+// Empty-room state — shown when a repo IS selected but has no messages
+// yet. Quick actions intentionally live ONLY in the left sidebar, so
+// this is a calm prompt to start typing rather than a duplicate grid.
 // =========================================================================
 
-function EmptyRoomQuickStart({
-  repo,
-  devpodLive,
-  onAction,
-}: {
-  repo: string;
-  devpodLive: boolean;
-  onAction: (a: QuickAction) => void;
-}) {
+function EmptyRoomQuickStart({ repo }: { repo: string }) {
   return (
-    <div className="space-y-5 py-8">
-      <div className="flex flex-col items-center gap-2 text-center">
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src={repoAvatarUrl(repo)}
-          alt=""
-          className="h-12 w-12 rounded-full border border-border bg-card"
-        />
-        <div className="text-sm font-semibold">
-          Ask me anything about{" "}
-          <span className="font-mono">{repo}</span>
-        </div>
-        <div className="text-[11px] text-muted">
-          Pick a quick action below or type your own question.
-        </div>
-      </div>
-      <QuickActionGrid
-        hasRepo={true}
-        isStreaming={false}
-        devpodLive={devpodLive}
-        onAction={onAction}
+    <div className="flex flex-col items-center gap-3 py-16 text-center">
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={repoAvatarUrl(repo)}
+        alt=""
+        className="h-12 w-12 rounded-full border border-border bg-card"
       />
+      <div className="space-y-1">
+        <div className="text-[13px] font-semibold">
+          Ask me anything about{" "}
+          <span className="font-mono">{repo.split("/")[1] ?? repo}</span>
+        </div>
+        <p className="text-[11px] leading-relaxed text-muted">
+          Type a question below, or use a{" "}
+          <span className="text-text">Quick action</span> from the
+          sidebar.
+        </p>
+      </div>
     </div>
   );
 }
@@ -3625,7 +3715,7 @@ function ChatComposer({
           placeholder={placeholder}
           rows={1}
           disabled={isStreaming || !hasRepo}
-          className="resize-none rounded-sm border border-border bg-card px-3 py-2 font-mono text-[13px] leading-snug focus:border-white focus:outline-none disabled:opacity-60"
+          className="resize-none rounded-sm border border-border bg-card px-3 py-2 font-mono text-[12px] leading-relaxed focus:border-white focus:outline-none disabled:opacity-60"
           style={{ minHeight: 38, maxHeight: 120 }}
         />
         {showCharCount && (

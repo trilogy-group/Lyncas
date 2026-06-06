@@ -205,38 +205,25 @@ export function DevPodPanel({ githubUsername }: Props) {
     }
   }
 
-  const dot =
-    conn.state === "live"
-      ? "bg-[#4ade80]"
-      : conn.state === "loading"
-        ? "bg-border"
-        : "bg-[#9ca3af]";
-  const label =
-    conn.state === "live"
-      ? "DevPod: live ✓"
-      : conn.state === "loading"
-        ? "DevPod: …"
-        : "DevPod: offline";
-
   return (
     <Card flush>
-      <div className="border-b border-border px-3 py-2 flex items-center justify-between gap-2">
+      <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
         <span className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
-          <span
-            className={`inline-block h-2 w-2 rounded-full ${dot}`}
-            aria-hidden
-          />
-          {label}
+          <DevPodGlyph />
+          DevPod
         </span>
-        {conn.state === "offline" && (
-          <button
-            type="button"
-            onClick={toggleOpen}
-            className="rounded-sm border border-border px-2 py-0.5 text-[10px] font-mono uppercase tracking-[0.14em] text-muted hover:text-text"
-          >
-            {open ? "Hide" : "Connect"}
-          </button>
-        )}
+        <div className="flex items-center gap-1.5">
+          <StatusPill state={conn.state} />
+          {conn.state === "offline" && (
+            <button
+              type="button"
+              onClick={toggleOpen}
+              className="rounded-sm border border-border px-2 py-0.5 text-[10px] font-mono uppercase tracking-[0.14em] text-muted transition-colors hover:border-border-strong hover:text-text"
+            >
+              {open ? "Hide" : "Connect"}
+            </button>
+          )}
+        </div>
       </div>
 
       {conn.state === "live" && (
@@ -262,6 +249,58 @@ export function DevPodPanel({ githubUsername }: Props) {
   );
 }
 
+// ---- header chrome -----------------------------------------------------
+
+function DevPodGlyph() {
+  return (
+    <svg
+      width="11"
+      height="11"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.3"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M8 1.5l5.5 3v7L8 14.5 2.5 11.5v-7L8 1.5Z" />
+      <path d="M2.7 4.6L8 7.5l5.3-2.9M8 7.5v6.8" />
+    </svg>
+  );
+}
+
+function StatusPill({ state }: { state: ConnectionState["state"] }) {
+  const map = {
+    live: {
+      dot: "bg-[#4ade80]",
+      cls: "border-[#4ade80]/30 bg-[#4ade80]/10 text-[#4ade80]",
+      label: "Live",
+    },
+    loading: {
+      dot: "bg-border animate-pulse",
+      cls: "border-border bg-bg-elev text-muted",
+      label: "Connecting",
+    },
+    offline: {
+      dot: "bg-[#9ca3af]",
+      cls: "border-border bg-bg-elev text-muted",
+      label: "Offline",
+    },
+  } as const;
+  const s = map[state];
+  return (
+    <span
+      className={
+        "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[9px] font-mono uppercase tracking-[0.14em] " +
+        s.cls
+      }
+    >
+      <span className={"inline-block h-1.5 w-1.5 rounded-full " + s.dot} aria-hidden />
+      {s.label}
+    </span>
+  );
+}
+
 // ---- live body ---------------------------------------------------------
 
 function LiveBody({
@@ -281,40 +320,51 @@ function LiveBody({
   onDisconnect: () => void;
   disconnecting: boolean;
 }) {
-  const wsLabel = (data.workspace_id ?? "—").slice(0, 20);
+  const wsLabel = (data.workspace_id ?? "—").slice(0, 24);
   return (
-    <div className="space-y-3 px-3 py-3 text-[11px]">
-      <div className="space-y-1">
-        <div className="flex items-center justify-between gap-2">
-          <span className="text-muted">Workspace</span>
-          <span className="font-mono truncate" title={data.workspace_id ?? ""}>
+    <div className="space-y-3 px-3 py-3">
+      <dl className="divide-y divide-border/60 rounded-sm border border-border bg-bg/40 text-[11px]">
+        <div className="flex items-center justify-between gap-2 px-2.5 py-1.5">
+          <dt className="text-muted">Workspace</dt>
+          <dd
+            className="max-w-[58%] truncate font-mono text-text"
+            title={data.workspace_id ?? ""}
+          >
             {wsLabel}
-          </span>
+          </dd>
         </div>
-        <div className="flex items-center justify-between gap-2">
-          <span className="text-muted">Last ping</span>
-          <span className="font-mono">{relativeTime(data.last_ping)}</span>
+        <div className="flex items-center justify-between gap-2 px-2.5 py-1.5">
+          <dt className="text-muted">Last ping</dt>
+          <dd className="font-mono text-text">{relativeTime(data.last_ping)}</dd>
         </div>
+      </dl>
+
+      <div className="space-y-1.5">
+        <div className="text-[9px] font-mono uppercase tracking-[0.16em] text-muted">
+          Capabilities
+        </div>
+        <CapabilityBadges caps={data.capabilities} />
       </div>
 
-      <CapabilityBadges caps={data.capabilities} />
-
-      <div className="flex flex-col gap-1.5">
+      <div className="grid grid-cols-2 gap-1.5">
         <button
           type="button"
           onClick={onRunTests}
           disabled={!data.capabilities.run_tests || exec?.pending}
-          className="rounded-sm border border-border bg-bg px-2 py-1.5 text-[11px] font-mono uppercase tracking-[0.14em] text-text hover:bg-bg-elev disabled:cursor-not-allowed disabled:opacity-40"
+          className="flex items-center justify-center gap-1.5 rounded-sm border border-border bg-bg px-2 py-1.5 text-[10px] font-mono uppercase tracking-[0.12em] text-text transition-colors hover:border-border-strong hover:bg-bg-elev disabled:cursor-not-allowed disabled:opacity-40"
         >
+          <svg width="9" height="9" viewBox="0 0 16 16" fill="currentColor" aria-hidden>
+            <path d="M4 2.5v11l9-5.5z" />
+          </svg>
           {exec?.pending ? "Running…" : "Run tests"}
         </button>
         <button
           type="button"
           onClick={onDisconnect}
           disabled={disconnecting}
-          className="rounded-sm border border-[#ff5252]/40 bg-transparent px-2 py-1.5 text-[11px] font-mono uppercase tracking-[0.14em] text-[#ff5252] hover:bg-[#ff5252]/10 disabled:opacity-40"
+          className="rounded-sm border border-[#ff5252]/40 bg-transparent px-2 py-1.5 text-[10px] font-mono uppercase tracking-[0.12em] text-[#ff5252] transition-colors hover:bg-[#ff5252]/10 disabled:opacity-40"
         >
-          {disconnecting ? "Disconnecting…" : "Disconnect"}
+          {disconnecting ? "…" : "Disconnect"}
         </button>
       </div>
 
@@ -325,7 +375,7 @@ function LiveBody({
             onClick={onToggleOutput}
             className="mb-1 text-[10px] font-mono uppercase tracking-[0.14em] text-muted hover:text-text"
           >
-            {showOutput ? "Hide output ▼" : "Show output ▶"}
+            {showOutput ? "Hide output ▾" : "Show output ▸"}
           </button>
           {showOutput && (
             <div className="space-y-1.5">
@@ -335,7 +385,7 @@ function LiveBody({
                 </div>
               )}
               {exec?.output && (
-                <pre className="max-h-60 overflow-auto rounded-sm border border-border bg-bg-elev p-2 text-[10.5px] leading-relaxed whitespace-pre-wrap">
+                <pre className="max-h-60 overflow-auto whitespace-pre-wrap rounded-sm border border-border bg-bg-elev p-2 text-[10.5px] leading-relaxed">
                   {exec.output}
                 </pre>
               )}
@@ -362,13 +412,20 @@ function CapabilityBadges({ caps }: { caps: DevpodCapabilities }) {
           <span
             key={key}
             className={
-              "inline-flex items-center rounded-sm border px-1.5 py-0.5 text-[9px] font-mono uppercase tracking-[0.14em] " +
+              "inline-flex items-center gap-1 rounded-sm border px-1.5 py-0.5 text-[9px] font-mono uppercase tracking-[0.12em] " +
               (on
                 ? "border-border bg-bg-elev text-muted"
-                : "border-border/50 bg-transparent text-muted/40 line-through")
+                : "border-border/40 text-muted/40")
             }
-            title={key}
+            title={on ? `${key}: available` : `${key}: unavailable`}
           >
+            <span
+              className={
+                "inline-block h-1 w-1 rounded-full " +
+                (on ? "bg-[#4ade80]" : "bg-border")
+              }
+              aria-hidden
+            />
             {label}
           </span>
         );
@@ -395,17 +452,17 @@ function OfflineBody({
     : "devpod-connect --token <fetching…>";
 
   return (
-    <div className="space-y-3 px-3 py-3 text-[11px]">
-      <div className="space-y-1">
-        <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
-          Step 1 — install (run once in DevPod terminal)
-        </div>
+    <div className="space-y-3 px-3 py-3">
+      <p className="text-[10.5px] leading-relaxed text-muted">
+        Connect a DevPod to run tests and live previews straight from
+        chat. Paste these into your DevPod terminal:
+      </p>
+      <div className="space-y-1.5">
+        <StepLabel n={1} text="Install — run once" />
         <CopyBox text={installCmd} />
       </div>
-      <div className="space-y-1">
-        <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
-          Step 2 — connect (run each session)
-        </div>
+      <div className="space-y-1.5">
+        <StepLabel n={2} text="Connect — each session" />
         {tokenError ? (
           <div className="rounded-sm border border-[#ff5252]/40 bg-[#ff5252]/10 px-2 py-1 text-[10.5px] text-[#ff5252]">
             {tokenError}
@@ -414,9 +471,19 @@ function OfflineBody({
           <CopyBox text={connectCmd} disabled={!token || tokenLoading} />
         )}
       </div>
-      <p className="text-[10.5px] text-muted">
-        Run both commands inside your DevPod terminal.
-      </p>
+    </div>
+  );
+}
+
+function StepLabel({ n, text }: { n: number; text: string }) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="flex h-4 w-4 items-center justify-center rounded-full border border-border bg-bg-elev text-[9px] font-mono text-muted">
+        {n}
+      </span>
+      <span className="text-[10px] font-mono uppercase tracking-[0.16em] text-muted">
+        {text}
+      </span>
     </div>
   );
 }
@@ -440,17 +507,23 @@ function CopyBox({
     }
   }
   return (
-    <div className="flex items-stretch gap-1 rounded-sm border border-border bg-bg-elev p-1.5">
-      <code className="flex-1 truncate font-mono text-[10.5px] text-text" title={text}>
+    <div className="group flex items-stretch gap-1.5 rounded-sm border border-border bg-bg p-2 transition-colors hover:border-border-strong">
+      <span className="select-none font-mono text-[10.5px] leading-relaxed text-muted/70" aria-hidden>
+        $
+      </span>
+      <code
+        className="flex-1 truncate font-mono text-[10.5px] leading-relaxed text-text"
+        title={text}
+      >
         {text}
       </code>
       <button
         type="button"
         onClick={copy}
         disabled={disabled}
-        className="rounded-sm border border-border px-2 py-0.5 text-[9px] font-mono uppercase tracking-[0.14em] text-muted hover:text-text disabled:opacity-40"
+        className="shrink-0 rounded-sm border border-border px-2 py-0.5 text-[9px] font-mono uppercase tracking-[0.14em] text-muted transition-colors hover:border-border-strong hover:text-text disabled:opacity-40"
       >
-        {copied ? "✓" : "Copy"}
+        {copied ? "Copied" : "Copy"}
       </button>
     </div>
   );

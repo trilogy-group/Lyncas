@@ -167,7 +167,7 @@ const CHAR_COUNT_VISIBLE_THRESHOLD = 500;
 // the right contract for a chat workspace. localStorage would survive
 // browser restart and confuse users who expect "I closed the tab, the
 // agent forgot what we were talking about".
-const STORAGE_KEY = "night-pr-chat-state";
+const STORAGE_KEY = "lyncas-chat-state";
 // Bump when the persisted shape changes incompatibly. Stale blobs from
 // older versions are dropped on read.
 const STORAGE_VERSION = 1;
@@ -1984,7 +1984,7 @@ function ChatPageInner() {
               this commit and live here so we don't churn the global
               stylesheet for a single page's surface). */}
       <style jsx global>{`
-        @keyframes night-pr-caret-blink {
+        @keyframes lyncas-caret-blink {
           50% {
             opacity: 0;
           }
@@ -1994,7 +1994,7 @@ function ChatPageInner() {
           margin-left: 2px;
           color: currentColor;
           opacity: 0.7;
-          animation: night-pr-caret-blink 1s steps(2, end) infinite;
+          animation: lyncas-caret-blink 1s steps(2, end) infinite;
           vertical-align: baseline;
         }
         /* ----- Chat bubble markdown overrides ------------------------ */

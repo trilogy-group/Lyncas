@@ -95,7 +95,7 @@ export default function LandingPage() {
             </TerminalWindow>
 
             <TerminalWindow
-              title="Night-PR Sandbox"
+              title="Lyncas Sandbox"
               hint="RUNNING REVIEW…"
               className="animate-fade-up-3"
               bodyClassName="min-h-[160px] flex items-center justify-center"
@@ -272,7 +272,7 @@ export default function LandingPage() {
           <h2 className="mt-6 font-mono font-bold uppercase tracking-tight text-[36px] sm:text-[60px] leading-[0.95]">
             Build secure AI agents
             <br />
-            at scale with Night PR
+            at scale with Lyncas
           </h2>
           <p className="mt-6 text-base text-muted-strong max-w-2xl mx-auto leading-relaxed">
             Open-source autonomous reviewer purpose-built for shipping teams.

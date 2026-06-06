@@ -26,7 +26,7 @@ export function BrandMark({
       <BrandGlyph />
       {withName && (
         <span className="font-mono text-sm font-bold tracking-[0.04em] text-white">
-          NIGHT/PR
+          LYNCAS
         </span>
       )}
     </span>

@@ -389,11 +389,13 @@ export async function upsertRepoResearch(
   repo: string,
   articles: RepoResearchArticle[],
   fingerprintHash: string | null,
+  summary: string | null = null,
 ): Promise<void> {
   const supabase = await createSupabaseServerClient();
   const { error } = await supabase.from("repo_research").upsert(
     {
       repo,
+      summary,
       articles,
       fingerprint_hash: fingerprintHash,
       updated_at: new Date().toISOString(),

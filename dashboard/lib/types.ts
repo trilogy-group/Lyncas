@@ -238,6 +238,10 @@ export interface RepoResearchArticle {
 export interface RepoResearch {
   id: string;
   repo: string;
+  // Plain-English "what this application is" blurb shown above the
+  // suggested-research list. May be absent on rows generated before
+  // migration 020.
+  summary?: string | null;
   articles: RepoResearchArticle[];
   fingerprint_hash: string | null;
   updated_at: string;

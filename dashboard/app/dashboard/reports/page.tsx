@@ -6,6 +6,7 @@ import { SectionHeading } from "@/components/ui/section-heading";
 import { ReportCard } from "@/components/report-card";
 import { getPrReports, getWatchedRepos } from "@/lib/queries";
 import { getUser } from "@/lib/supabase/server";
+import type { PrReport } from "@/lib/types";
 
 // /dashboard/reports
 //
@@ -31,6 +32,15 @@ function appInstallUrl(): string | null {
   return `https://github.com/apps/${slug}/installations/new`;
 }
 
+// Recommendation buckets, in the order they should appear on the page.
+// Mirrors the verdict accent set used on the report cards / design brief.
+const REC_ORDER = [
+  { key: "merge", label: "Merge", color: "#58e684" },
+  { key: "request_changes", label: "Request changes", color: "#f6c25b" },
+  { key: "reject", label: "Reject", color: "#ff5a5a" },
+  { key: "needs_review", label: "Needs review", color: "#5bd3ff" },
+] as const;
+
 export default async function DashboardReportsPage() {
   const user = await getUser().catch(() => null);
   if (!user) redirect("/login");
@@ -40,29 +50,21 @@ export default async function DashboardReportsPage() {
   const reports = await getPrReports(repoList);
   const installUrl = appInstallUrl();
 
-  // Group by status counts for the eyebrow line. Useful at a glance
-  // and avoids the user having to scroll to see how many requests-
-  // for-change there are.
-  const counts = reports.reduce(
-    (acc, r) => {
-      const k = r.merge_recommendation ?? "needs_review";
-      acc[k] = (acc[k] ?? 0) + 1;
-      return acc;
-    },
-    {} as Record<string, number>,
-  );
-  const subtitleParts: string[] = [];
-  if (counts.merge) subtitleParts.push(`${counts.merge} merge`);
-  if (counts.request_changes)
-    subtitleParts.push(`${counts.request_changes} request changes`);
-  if (counts.reject) subtitleParts.push(`${counts.reject} reject`);
-  if (counts.needs_review)
-    subtitleParts.push(`${counts.needs_review} needs review`);
+  // Bucket reports by merge recommendation so the page reads as
+  // "decisions grouped by outcome" rather than one long undifferentiated
+  // feed. Within a bucket, the query's order (newest first) is kept.
+  const grouped = new Map<string, PrReport[]>();
+  for (const r of reports) {
+    const k = r.merge_recommendation ?? "needs_review";
+    const arr = grouped.get(k) ?? [];
+    arr.push(r);
+    grouped.set(k, arr);
+  }
 
   return (
     <Container className="py-10 space-y-8">
       <SectionHeading
-        eyebrow="📊 PR Reports"
+        eyebrow="Reports"
         title="Per-PR analysis at a glance"
         subtitle={
           reports.length === 0
@@ -71,7 +73,7 @@ export default async function DashboardReportsPage() {
                 reports.length === 1 ? "report" : "reports"
               } across ${watched.length} ${
                 watched.length === 1 ? "repo" : "repos"
-              }${subtitleParts.length > 0 ? ` · ${subtitleParts.join(" · ")}` : ""}`
+              }, grouped by merge recommendation.`
         }
       />
 
@@ -99,11 +101,61 @@ export default async function DashboardReportsPage() {
           )}
         </Card>
       ) : (
-        <div className="space-y-4">
-          {reports.map((r) => (
-            <ReportCard key={r.id} report={r} />
-          ))}
-        </div>
+        <>
+          {/* Summary chips — one per non-empty bucket, accent-coded. */}
+          <div className="flex flex-wrap gap-2">
+            {REC_ORDER.map(({ key, label, color }) => {
+              const n = grouped.get(key)?.length ?? 0;
+              if (n === 0) return null;
+              return (
+                <span
+                  key={key}
+                  className="inline-flex items-center gap-2 rounded-sm border px-2.5 py-1 font-mono text-[11px]"
+                  style={{ borderColor: `${color}55`, background: `${color}14` }}
+                >
+                  <span
+                    className="inline-block h-2 w-2 rounded-full"
+                    style={{ backgroundColor: color }}
+                    aria-hidden
+                  />
+                  <span style={{ color }}>{label}</span>
+                  <span className="text-muted-strong tabular-nums">{n}</span>
+                </span>
+              );
+            })}
+          </div>
+
+          {/* Grouped sections. */}
+          <div className="space-y-10">
+            {REC_ORDER.map(({ key, label, color }) => {
+              const bucket = grouped.get(key);
+              if (!bucket || bucket.length === 0) return null;
+              return (
+                <section key={key} className="space-y-4">
+                  <div className="flex items-center gap-3">
+                    <span
+                      className="inline-block h-2.5 w-2.5 rounded-full"
+                      style={{ backgroundColor: color }}
+                      aria-hidden
+                    />
+                    <h2 className="font-mono text-[12px] font-semibold uppercase tracking-[0.18em] text-white">
+                      {label}
+                    </h2>
+                    <span className="font-mono text-[11px] text-muted tabular-nums">
+                      {bucket.length}
+                    </span>
+                    <span className="h-px flex-1 bg-border" aria-hidden />
+                  </div>
+                  <div className="space-y-4">
+                    {bucket.map((r) => (
+                      <ReportCard key={r.id} report={r} />
+                    ))}
+                  </div>
+                </section>
+              );
+            })}
+          </div>
+        </>
       )}
     </Container>
   );

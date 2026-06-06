@@ -34,25 +34,34 @@ export const runtime = "nodejs";
 
 const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const RESEARCH_MODEL = "claude-haiku-4-5";
-const MAX_TOKENS = 1024;
+const MAX_TOKENS = 1400;
 const ARTICLE_COUNT = 5;
 
 const RESEARCH_SYSTEM_PROMPT = `\
-You suggest external reading material for a software developer joining a repository.
+You are a product-minded engineer briefing a developer on the SPECIFIC application in a repository — not its generic tech stack.
 
-You are given a compact REPOSITORY SUMMARY. Reply with ONLY a JSON array (no prose, no markdown fences) of exactly ${ARTICLE_COUNT} entries. Each entry is an object with these keys:
+You are given a compact REPOSITORY SUMMARY (purpose, stack, directories). First work out what this product actually IS and what it is FOR (its domain, its users, the problem it solves). Then suggest research that would help someone improve or extend THIS product.
 
-  { "title": string, "url": string, "source": string, "description": string }
+Reply with ONLY a JSON object (no prose, no markdown fences) of this exact shape:
 
-Rules:
-  * url MUST be a real URL you are confident exists (MDN, official docs, well-known blog posts, GitHub READMEs, RFCs, CVEs). Do NOT invent URLs. If you cannot recall a specific URL, point at the documentation root (e.g. "https://nextjs.org/docs") rather than fabricate a deep link.
-  * source is a short readable name like "MDN", "dev.to", "Anthropic Docs", "GitHub", "Stack Overflow". Not a domain.
-  * description is ONE sentence (max ~120 chars) explaining why it's relevant to THIS repository.
+  {
+    "summary": string,
+    "articles": [ { "title": string, "url": string, "source": string, "description": string }, ... ]
+  }
+
+"summary":
+  * 2-3 sentences, plain English, describing what this application is, who it's for, and the kind of problem it solves. Be concrete and specific to THIS repo (e.g. "An AI résumé builder that turns a user's work history into tailored, ATS-friendly résumés"), never generic ("a web application built with Next.js").
+  * If the repo's purpose is genuinely unclear from the summary, say what it most likely is in one sentence and note the uncertainty.
+
+"articles": exactly ${ARTICLE_COUNT} entries. Each is research aimed at the product's DOMAIN and FEATURES, not its boilerplate:
+  * Prioritise: domain concepts, techniques/algorithms relevant to the product, specialised libraries/APIs/models for its problem space, UX patterns for its feature set, and concrete feature ideas with prior art. (For an AI résumé builder: ATS parsing, résumé scoring, prompt patterns for tailoring text, PDF generation, relevant datasets — NOT "the Next.js docs".)
+  * AVOID generic framework/language documentation (Next.js, React, MDN, Python docs, "intro to TypeScript") UNLESS a feature genuinely hinges on a non-obvious capability of that tool. Assume the developer already knows their stack.
+  * url MUST be a real URL you are confident exists (official docs of a specialised tool, well-known engineering blog posts, papers/arXiv, GitHub repos, RFCs). Do NOT invent URLs. If unsure of a deep link, point at a stable root rather than fabricate one.
+  * source is a short readable name like "arXiv", "Stripe Docs", "GitHub", "Smashing Magazine", "Anthropic". Not a domain.
+  * description is ONE sentence (max ~140 chars) explaining how it helps build or improve a feature of THIS product.
   * title is concise (max ~80 chars).
-  * Prefer canonical / foundational resources over trendy think-pieces. Bias toward official docs for the repo's stack.
-  * If the summary doesn't strongly imply a topic, pick general resources for the dominant language / framework rather than guessing.
 
-Return only the JSON array, starting with [ and ending with ].`;
+Return only the JSON object, starting with { and ending with }.`;
 
 function hashFingerprint(text: string | null): string | null {
   if (!text) return null;
@@ -91,17 +100,29 @@ interface AnthropicResponse {
   error?: { message?: string };
 }
 
-async function generateArticles(
+interface ResearchResult {
+  summary: string;
+  articles: RepoResearchArticle[];
+}
+
+function sanitizeSummary(raw: unknown): string {
+  if (typeof raw !== "string") return "";
+  // Collapse whitespace and cap length so a runaway generation can't
+  // bloat the cached row or the sidebar.
+  return raw.replace(/\s+/g, " ").trim().slice(0, 600);
+}
+
+async function generateResearch(
   fingerprintText: string | null,
   repo: string,
   apiKey: string,
-): Promise<RepoResearchArticle[]> {
+): Promise<ResearchResult> {
   // Prefer the real fingerprint summary; if we don't have one yet,
   // ship the bare repo slug so Claude can at least pattern-match the
   // owner/name. Both produce useful (if generic) suggestions.
   const summary =
     (fingerprintText && fingerprintText.trim()) ||
-    `Repository slug: ${repo}. No detailed fingerprint available yet — suggest material for whatever stack the repo name implies, or general software-engineering reading if unclear.`;
+    `Repository slug: ${repo}. No detailed fingerprint available yet — infer what the product most likely is from the owner/name and suggest domain/feature research for that, noting the uncertainty.`;
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -147,9 +168,22 @@ async function generateArticles(
     cleaned = cleaned.trim();
   }
   try {
-    return sanitizeArticles(JSON.parse(cleaned));
+    const parsed = JSON.parse(cleaned) as unknown;
+    // New shape: { summary, articles }. Tolerate a bare array (old
+    // shape / model regression) by treating it as articles-only.
+    if (Array.isArray(parsed)) {
+      return { summary: "", articles: sanitizeArticles(parsed) };
+    }
+    if (parsed && typeof parsed === "object") {
+      const obj = parsed as Record<string, unknown>;
+      return {
+        summary: sanitizeSummary(obj.summary),
+        articles: sanitizeArticles(obj.articles),
+      };
+    }
+    return { summary: "", articles: [] };
   } catch {
-    return [];
+    return { summary: "", articles: [] };
   }
 }
 
@@ -202,6 +236,7 @@ export async function GET(request: NextRequest) {
     ) {
       return NextResponse.json({
         repo,
+        summary: cached.summary ?? "",
         articles: cached.articles,
         updated_at: cached.updated_at,
         cache: "hit",
@@ -209,9 +244,9 @@ export async function GET(request: NextRequest) {
     }
   }
 
-  let articles: RepoResearchArticle[] = [];
+  let result: ResearchResult = { summary: "", articles: [] };
   try {
-    articles = await generateArticles(fingerprint, repo, apiKey);
+    result = await generateResearch(fingerprint, repo, apiKey);
   } catch (e) {
     // Hard failure on Claude side — surface a 502 so the UI can show
     // the "could not generate" state, but don't persist garbage.
@@ -226,7 +261,7 @@ export async function GET(request: NextRequest) {
   // page view for a repo whose fingerprint genuinely produces nothing
   // good. A future fingerprint change will invalidate naturally.
   try {
-    await upsertRepoResearch(repo, articles, currentHash);
+    await upsertRepoResearch(repo, result.articles, currentHash, result.summary);
   } catch {
     // Cache write failed — return the live result anyway so the UI
     // isn't blocked.
@@ -234,7 +269,8 @@ export async function GET(request: NextRequest) {
 
   return NextResponse.json({
     repo,
-    articles,
+    summary: result.summary,
+    articles: result.articles,
     updated_at: new Date().toISOString(),
     cache: force ? "forced" : "miss",
   });

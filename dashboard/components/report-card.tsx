@@ -109,7 +109,11 @@ export function ReportCard({ report }: ReportCardProps) {
       : "no sandbox";
 
   return (
-    <Card className="space-y-3 p-5" tone="default">
+    <Card
+      className="space-y-3 border-l-2 p-5"
+      tone="default"
+      style={{ borderLeftColor: recColor }}
+    >
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2 font-mono text-[11px] uppercase tracking-[0.14em] text-muted">
@@ -174,7 +178,7 @@ export function ReportCard({ report }: ReportCardProps) {
             rel="noopener noreferrer"
             className="inline-flex items-center gap-1.5 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-200 transition hover:bg-emerald-500/20"
           >
-            🔗 Live Preview
+            Live preview
             <span className="text-[10px] opacity-70">↗</span>
           </a>
         )}
@@ -184,7 +188,7 @@ export function ReportCard({ report }: ReportCardProps) {
           disabled={downloading}
           className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs font-medium text-white transition hover:border-border-strong disabled:cursor-wait disabled:opacity-60"
         >
-          {downloading ? "📄 Building .docx…" : "📥 Download .docx"}
+          {downloading ? "Building .docx…" : "Download .docx"}
         </button>
         {hasMarkdown && (
           <button
@@ -193,9 +197,19 @@ export function ReportCard({ report }: ReportCardProps) {
             className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs font-medium text-muted-strong transition hover:border-border-strong hover:text-white"
           >
             {expanded ? "Hide full report" : "View full report"}
-            <span className="text-[10px] opacity-70">
-              {expanded ? "▲" : "▼"}
-            </span>
+            <svg
+              width="9"
+              height="9"
+              viewBox="0 0 16 16"
+              fill="currentColor"
+              aria-hidden
+              className={
+                "opacity-70 transition-transform " +
+                (expanded ? "-rotate-90" : "rotate-90")
+              }
+            >
+              <path d="M5 3l6 5-6 5V3z" />
+            </svg>
           </button>
         )}
       </div>

@@ -1,3 +1,4 @@
+import { cache } from "react";
 import { cookies } from "next/headers";
 import { createServerClient, type CookieMethodsServer } from "@supabase/ssr";
 
@@ -60,10 +61,15 @@ export async function getSession() {
 // `getUser()` (which round-trips to the Supabase Auth server to check
 // the JWT) — use this when downstream code is going to use auth.uid()
 // in RLS rather than trusting cookie-side state.
-export async function getUser() {
+//
+// Wrapped in React `cache()` so the auth round-trip is deduped within a
+// single server render: the /dashboard layout and the page underneath it
+// both call getUser(), and without this they'd each hit Supabase Auth,
+// adding a needless round-trip to every full page load.
+export const getUser = cache(async () => {
   const supabase = await createSupabaseServerClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();
   return user;
-}
+});

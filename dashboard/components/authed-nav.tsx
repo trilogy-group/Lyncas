@@ -28,6 +28,9 @@ const LINKS: NavLinkSpec[] = [
   // Settings because it's a daily-driver surface, not a setup one.
   { href: "/dashboard/reports", label: "Reports" },
   { href: "/dashboard/settings", label: "Settings" },
+  // Docs — in-app reference for the whole product. Lives last in the
+  // nav because it's a "when you need it" surface, not a daily driver.
+  { href: "/dashboard/docs", label: "Docs" },
 ];
 
 export function AuthedNav({ email, displayName, avatarUrl }: AuthedNavProps) {

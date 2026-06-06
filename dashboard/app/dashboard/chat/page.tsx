@@ -70,6 +70,7 @@ interface WatchedRepoLite {
 // flips `refreshing: true` while keeping the prior `articles` visible
 // so the user doesn't see a flicker on the ↻ click.
 interface ResearchCacheEntry {
+  summary: string | null;
   articles: ResearchArticle[];
   fetchedAt: number;
   updatedAt: string | null;
@@ -106,6 +107,7 @@ interface ResearchArticle {
 
 interface ResearchState {
   repo: string;
+  summary: string | null;
   articles: ResearchArticle[];
   updatedAt: string | null;
   loading: boolean;
@@ -127,9 +129,16 @@ interface InstallStatusState {
   loaded: boolean;
 }
 
+interface TreeApiEntry {
+  path: string;
+  dir: boolean;
+}
+
 interface DirectoryTreeState {
   repo: string;
-  text: string | null;
+  entries: TreeApiEntry[] | null;
+  defaultBranch: string;
+  truncated: boolean;
   loading: boolean;
 }
 
@@ -635,6 +644,7 @@ function ChatPageInner() {
       researchEntry
         ? {
             repo: selectedRepo,
+            summary: researchEntry.summary ?? null,
             articles: researchEntry.articles,
             updatedAt: researchEntry.updatedAt,
             loading: researchEntry.loading,
@@ -780,6 +790,7 @@ function ChatPageInner() {
     (repo: string, patch: Partial<ResearchCacheEntry>): void => {
       setResearchByRepo((prev) => {
         const cur = prev[repo] ?? {
+          summary: null,
           articles: [],
           fetchedAt: 0,
           updatedAt: null,
@@ -941,34 +952,59 @@ function ChatPageInner() {
   }, [searchParams, refreshRepos]);
 
   // --- fetch directory tree when selected repo changes -------------------
-  // Hit /api/repo-tree which calls GitHub's /contents endpoint server-
-  // side. This replaces the old behaviour that pulled
-  // repo_rules.repo_directory_tree (a per-PR snapshot that frequently
-  // contained nothing more than "./" when the most recent reviewed PR
-  // touched only root files).
+  // Hit /api/repo-tree which calls GitHub's recursive git-trees endpoint
+  // server-side and returns the FULL repo structure as a flat
+  // { path, dir } list. The Project structure panel builds an expandable
+  // explorer from it (folders expand in place rather than linking out).
   useEffect(() => {
     if (!selectedRepo) {
       setTree(null);
       return;
     }
     const ac = new AbortController();
-    setTree({ repo: selectedRepo, text: null, loading: true });
+    setTree({
+      repo: selectedRepo,
+      entries: null,
+      defaultBranch: "HEAD",
+      truncated: false,
+      loading: true,
+    });
     void (async () => {
       try {
         const res = await fetch(
           `/api/repo-tree?repo=${encodeURIComponent(selectedRepo)}`,
           { signal: ac.signal },
         );
-        let text: string | null = null;
+        let entries: TreeApiEntry[] | null = null;
+        let defaultBranch = "HEAD";
+        let truncated = false;
         if (res.ok) {
-          const body = (await res.json()) as { tree?: string | null };
-          text = body.tree ?? null;
+          const body = (await res.json()) as {
+            entries?: TreeApiEntry[] | null;
+            defaultBranch?: string;
+            truncated?: boolean;
+          };
+          entries = Array.isArray(body.entries) ? body.entries : null;
+          defaultBranch = body.defaultBranch ?? "HEAD";
+          truncated = !!body.truncated;
         }
         if (ac.signal.aborted) return;
-        setTree({ repo: selectedRepo, text, loading: false });
+        setTree({
+          repo: selectedRepo,
+          entries,
+          defaultBranch,
+          truncated,
+          loading: false,
+        });
       } catch (err) {
         if ((err as Error)?.name === "AbortError") return;
-        setTree({ repo: selectedRepo, text: null, loading: false });
+        setTree({
+          repo: selectedRepo,
+          entries: null,
+          defaultBranch: "HEAD",
+          truncated: false,
+          loading: false,
+        });
       }
     })();
     return () => {
@@ -1139,6 +1175,7 @@ function ChatPageInner() {
         return {
           ...prev,
           [repo]: {
+            summary: cur?.summary ?? null,
             articles: cur?.articles ?? [],
             updatedAt: cur?.updatedAt ?? null,
             fetchedAt: cur?.fetchedAt ?? 0,
@@ -1164,10 +1201,12 @@ function ChatPageInner() {
           return;
         }
         const data = (await res.json()) as {
+          summary?: string | null;
           articles: ResearchArticle[];
           updated_at: string;
         };
         updateResearchForRepo(repo, {
+          summary: data.summary ?? null,
           articles: data.articles ?? [],
           updatedAt: data.updated_at ?? null,
           fetchedAt: Date.now(),
@@ -1526,6 +1565,26 @@ function ChatPageInner() {
               devpodLive={devpodLive}
               lastReviewByRepo={lastReviewByRepo}
             />
+            {hasRepo && (
+              <div className="mt-2 flex items-center gap-2 rounded-sm border border-border bg-bg-elev px-2 py-1.5">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={repoAvatarUrl(selectedRepo)}
+                  alt=""
+                  className="h-5 w-5 shrink-0 rounded-full border border-border bg-card"
+                />
+                <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-text">
+                  {selectedRepo}
+                </span>
+                <span className="flex shrink-0 items-center gap-1 font-mono text-[8.5px] uppercase tracking-[0.14em] text-muted">
+                  <span
+                    className="inline-block h-1.5 w-1.5 rounded-full bg-[#4ade80]"
+                    aria-hidden
+                  />
+                  Watching
+                </span>
+              </div>
+            )}
           </Card>
 
           <ProjectStructureCard
@@ -2313,9 +2372,188 @@ function ArrowOutIcon() {
   );
 }
 
-interface TreeEntry {
+interface TreeNode {
   name: string;
+  path: string;
   isDir: boolean;
+  children: TreeNode[];
+}
+
+// Build a nested tree from the flat { path, dir } list the API returns.
+// Intermediate directories are created on demand so the structure is
+// correct even if GitHub omits a parent entry.
+function buildTree(entries: TreeApiEntry[]): TreeNode[] {
+  const root: TreeNode = { name: "", path: "", isDir: true, children: [] };
+  const dirMap = new Map<string, TreeNode>([["", root]]);
+
+  const ensureDir = (path: string): TreeNode => {
+    const existing = dirMap.get(path);
+    if (existing) return existing;
+    const slash = path.lastIndexOf("/");
+    const parentPath = slash === -1 ? "" : path.slice(0, slash);
+    const name = slash === -1 ? path : path.slice(slash + 1);
+    const parent = ensureDir(parentPath);
+    const node: TreeNode = { name, path, isDir: true, children: [] };
+    parent.children.push(node);
+    dirMap.set(path, node);
+    return node;
+  };
+
+  for (const e of entries) {
+    if (e.dir) {
+      ensureDir(e.path);
+      continue;
+    }
+    const slash = e.path.lastIndexOf("/");
+    const parentPath = slash === -1 ? "" : e.path.slice(0, slash);
+    const name = slash === -1 ? e.path : e.path.slice(slash + 1);
+    ensureDir(parentPath).children.push({
+      name,
+      path: e.path,
+      isDir: false,
+      children: [],
+    });
+  }
+
+  const sortRec = (node: TreeNode) => {
+    node.children.sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    node.children.forEach(sortRec);
+  };
+  sortRec(root);
+  return root.children;
+}
+
+// One row in the explorer. Folders toggle their children in place;
+// files (and an on-hover icon on folders) link out to GitHub.
+function TreeNodeRow({
+  node,
+  depth,
+  expanded,
+  onToggleDir,
+  repo,
+  branch,
+}: {
+  node: TreeNode;
+  depth: number;
+  expanded: Set<string>;
+  onToggleDir: (path: string) => void;
+  repo: string;
+  branch: string;
+}) {
+  const isOpen = node.isDir && expanded.has(node.path);
+  const accent = node.isDir ? TREE_FOLDER_COLOR : fileAccent(node.name);
+  const ext =
+    !node.isDir && node.name.includes(".")
+      ? node.name.split(".").pop()!.toLowerCase()
+      : "";
+  const ghUrl = `https://github.com/${repo}/${
+    node.isDir ? "tree" : "blob"
+  }/${branch}/${node.path}`;
+  // 8px base + 13px per level keeps deep nesting legible without running
+  // the labels off the right edge of a 220px rail.
+  const padLeft = 8 + depth * 13;
+
+  if (!node.isDir) {
+    return (
+      <a
+        href={ghUrl}
+        target="_blank"
+        rel="noopener noreferrer"
+        style={{ paddingLeft: padLeft }}
+        className="group/row flex items-center gap-2 rounded-sm py-[3px] pr-1.5 transition-colors hover:bg-bg-elev"
+        title={`Open ${node.path} on GitHub`}
+      >
+        <span className="w-3 shrink-0" aria-hidden />
+        <span className="shrink-0">
+          <TreeFileIcon color={accent} />
+        </span>
+        <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-text/90">
+          {node.name}
+        </span>
+        {ext && (
+          <span
+            className="shrink-0 rounded-[3px] px-1 py-px font-mono text-[8.5px] uppercase tracking-[0.08em]"
+            style={{ color: accent, backgroundColor: accent + "1f" }}
+          >
+            {ext}
+          </span>
+        )}
+        <span className="shrink-0 text-muted opacity-0 transition-opacity group-hover/row:opacity-100">
+          <ArrowOutIcon />
+        </span>
+      </a>
+    );
+  }
+
+  return (
+    <>
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={() => onToggleDir(node.path)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onToggleDir(node.path);
+          }
+        }}
+        style={{ paddingLeft: padLeft }}
+        className="group/row flex cursor-pointer items-center gap-2 rounded-sm py-[3px] pr-1.5 transition-colors hover:bg-bg-elev"
+        title={isOpen ? `Collapse ${node.name}` : `Expand ${node.name}`}
+      >
+        <svg
+          width="9"
+          height="9"
+          viewBox="0 0 16 16"
+          fill="currentColor"
+          aria-hidden
+          className={
+            "shrink-0 text-muted transition-transform " +
+            (isOpen ? "rotate-90" : "rotate-0")
+          }
+        >
+          <path d="M5 3l6 5-6 5V3z" />
+        </svg>
+        <span className="shrink-0">
+          <TreeFolderIcon color={accent} />
+        </span>
+        <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] font-medium text-text">
+          {node.name}
+          <span className="text-muted">/</span>
+        </span>
+        {!isOpen && node.children.length > 0 && (
+          <span className="shrink-0 font-mono text-[9px] text-muted">
+            {node.children.length}
+          </span>
+        )}
+        <a
+          href={ghUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={(e) => e.stopPropagation()}
+          title={`Open ${node.path} on GitHub`}
+          className="shrink-0 text-muted opacity-0 transition-opacity hover:text-text group-hover/row:opacity-100"
+        >
+          <ArrowOutIcon />
+        </a>
+      </div>
+      {isOpen &&
+        node.children.map((child) => (
+          <TreeNodeRow
+            key={child.path}
+            node={child}
+            depth={depth + 1}
+            expanded={expanded}
+            onToggleDir={onToggleDir}
+            repo={repo}
+            branch={branch}
+          />
+        ))}
+    </>
+  );
 }
 
 function ProjectStructureCard({
@@ -2332,25 +2570,51 @@ function ProjectStructureCard({
   onToggle: () => void;
 }) {
   const empty = !hasRepo;
-  const ready = !!(tree && !tree.loading && tree.text && tree.text.trim());
+  const ready = !!(
+    tree &&
+    !tree.loading &&
+    tree.entries &&
+    tree.entries.length > 0
+  );
 
-  const entries: TreeEntry[] = useMemo(() => {
-    if (!ready) return [];
-    return (tree!.text as string)
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean)
-      .map((line) => {
-        const isDir = line.endsWith("/");
-        return { name: isDir ? line.slice(0, -1) : line, isDir };
-      });
-  }, [ready, tree]);
+  const apiEntries = tree?.entries ?? null;
+  const nodes = useMemo(
+    () => (ready && apiEntries ? buildTree(apiEntries) : []),
+    [ready, apiEntries],
+  );
+  const folderCount = useMemo(
+    () => (apiEntries ?? []).filter((e) => e.dir).length,
+    [apiEntries],
+  );
+  const fileCount = (apiEntries?.length ?? 0) - folderCount;
+  const branch = tree?.defaultBranch ?? "HEAD";
 
-  const folderCount = entries.filter((e) => e.isDir).length;
-  const fileCount = entries.length - folderCount;
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
-  const ghUrl = (e: TreeEntry) =>
-    `https://github.com/${repo}/${e.isDir ? "tree" : "blob"}/HEAD/${e.name}`;
+  // Reset expansion whenever we switch repos so we never carry one
+  // repo's open folders into another's tree.
+  useEffect(() => {
+    setExpanded(new Set());
+  }, [repo]);
+
+  const toggleDir = useCallback((path: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }, []);
+
+  const expandAll = useCallback(() => {
+    const all = new Set<string>();
+    (apiEntries ?? []).forEach((e) => {
+      if (e.dir) all.add(e.path);
+    });
+    setExpanded(all);
+  }, [apiEntries]);
+
+  const collapseAll = useCallback(() => setExpanded(new Set()), []);
 
   return (
     <Card flush>
@@ -2409,84 +2673,52 @@ function ProjectStructureCard({
               <div className="h-2 w-1/2 rounded bg-border/50" />
             </div>
           ) : ready ? (
-            <div className="max-h-80 overflow-auto pr-0.5">
-              <div className="relative pl-2.5">
-                {/* vertical guide rail */}
-                <span
-                  className="pointer-events-none absolute left-1 top-1 bottom-1 w-px bg-border/70"
-                  aria-hidden
-                />
-                {entries.map((e, i) => {
-                  const accent = e.isDir
-                    ? TREE_FOLDER_COLOR
-                    : fileAccent(e.name);
-                  const ext =
-                    !e.isDir && e.name.includes(".")
-                      ? e.name.split(".").pop()!.toLowerCase()
-                      : "";
-                  const showDivider =
-                    i === folderCount && folderCount > 0 && fileCount > 0;
-                  return (
-                    <div key={`${e.name}-${i}`}>
-                      {showDivider && (
-                        <div className="my-1 ml-1.5 border-t border-dashed border-border/60" />
-                      )}
-                      <a
-                        href={ghUrl(e)}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="group/row relative flex items-center gap-2 rounded-sm py-[3px] pl-2 pr-1.5 transition-colors hover:bg-bg-elev"
-                        title={`Open ${e.name} on GitHub`}
-                      >
-                        {/* connector tick into the guide rail */}
-                        <span
-                          className="pointer-events-none absolute -left-[5px] top-1/2 h-px w-[7px] -translate-y-1/2 bg-border/70"
-                          aria-hidden
-                        />
-                        <span className="shrink-0">
-                          {e.isDir ? (
-                            <TreeFolderIcon color={accent} />
-                          ) : (
-                            <TreeFileIcon color={accent} />
-                          )}
-                        </span>
-                        <span
-                          className={
-                            "min-w-0 flex-1 truncate font-mono text-[11.5px] " +
-                            (e.isDir
-                              ? "font-medium text-text"
-                              : "text-text/90")
-                          }
-                        >
-                          {e.name}
-                          {e.isDir && (
-                            <span className="text-muted">/</span>
-                          )}
-                        </span>
-                        {ext && (
-                          <span
-                            className="shrink-0 rounded-[3px] px-1 py-px font-mono text-[8.5px] uppercase tracking-[0.08em]"
-                            style={{
-                              color: accent,
-                              backgroundColor: accent + "1f",
-                            }}
-                          >
-                            {ext}
-                          </span>
-                        )}
-                        <span className="shrink-0 text-muted opacity-0 transition-opacity group-hover/row:opacity-100">
-                          <ArrowOutIcon />
-                        </span>
-                      </a>
-                    </div>
-                  );
-                })}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between gap-2 px-1">
+                <span className="font-mono text-[9px] uppercase tracking-[0.14em] text-muted">
+                  {repo.split("/")[1] ?? repo}
+                </span>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={expandAll}
+                    className="rounded-sm border border-border px-1.5 py-0.5 font-mono text-[8.5px] uppercase tracking-[0.12em] text-muted transition-colors hover:border-border-strong hover:text-text"
+                  >
+                    Expand
+                  </button>
+                  <button
+                    type="button"
+                    onClick={collapseAll}
+                    className="rounded-sm border border-border px-1.5 py-0.5 font-mono text-[8.5px] uppercase tracking-[0.12em] text-muted transition-colors hover:border-border-strong hover:text-text"
+                  >
+                    Collapse
+                  </button>
+                </div>
               </div>
+              <div className="max-h-[420px] overflow-auto pr-0.5">
+                {nodes.map((node) => (
+                  <TreeNodeRow
+                    key={node.path}
+                    node={node}
+                    depth={0}
+                    expanded={expanded}
+                    onToggleDir={toggleDir}
+                    repo={repo}
+                    branch={branch}
+                  />
+                ))}
+              </div>
+              {tree?.truncated && (
+                <p className="px-1 pt-1 text-[9.5px] leading-relaxed text-muted">
+                  Large repo — showing a partial tree. Open on GitHub for
+                  the full structure.
+                </p>
+              )}
             </div>
           ) : (
             <p className="px-1 py-2 text-[11px] text-muted">
-              No tree yet — the agent will populate this when it runs
-              its next review.
+              Couldn&apos;t load the tree for this repo. It may be empty or
+              access may be restricted.
             </p>
           )}
         </div>
@@ -3020,7 +3252,9 @@ function ResearchPanel({ research }: { research: ResearchState | null }) {
       </div>
     );
   }
-  if (research.articles.length === 0) {
+  const summary = research.summary?.trim() ?? "";
+  const hasArticles = research.articles.length > 0;
+  if (!summary && !hasArticles) {
     return (
       <div className="text-[11px] text-muted">
         No suggestions yet. Try the refresh button above.
@@ -3029,6 +3263,19 @@ function ResearchPanel({ research }: { research: ResearchState | null }) {
   }
   return (
     <div className="space-y-3">
+      {summary && (
+        <div className="space-y-1.5 rounded-sm border border-border bg-bg-elev p-2.5">
+          <div className="text-[9px] font-mono uppercase tracking-[0.16em] text-muted">
+            About this project
+          </div>
+          <p className="text-[11.5px] leading-relaxed text-text">{summary}</p>
+        </div>
+      )}
+      {hasArticles && (
+        <div className="text-[9px] font-mono uppercase tracking-[0.16em] text-muted">
+          Suggested research
+        </div>
+      )}
       <ul className="space-y-2.5">
         {research.articles.map((a, idx) => {
           const favicon = faviconUrl(a.url);

@@ -208,22 +208,11 @@ export function DevPodPanel({ githubUsername }: Props) {
   return (
     <Card flush>
       <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
-        <span className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
+        <span className="flex min-w-0 items-center gap-2 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
           <DevPodGlyph />
-          DevPod
+          <span className="truncate">DevPod</span>
         </span>
-        <div className="flex items-center gap-1.5">
-          <StatusPill state={conn.state} />
-          {conn.state === "offline" && (
-            <button
-              type="button"
-              onClick={toggleOpen}
-              className="rounded-sm border border-border px-2 py-0.5 text-[10px] font-mono uppercase tracking-[0.14em] text-muted transition-colors hover:border-border-strong hover:text-text"
-            >
-              {open ? "Hide" : "Connect"}
-            </button>
-          )}
-        </div>
+        <StatusPill state={conn.state} />
       </div>
 
       {conn.state === "live" && (
@@ -238,12 +227,25 @@ export function DevPodPanel({ githubUsername }: Props) {
         />
       )}
 
-      {conn.state !== "live" && open && (
-        <OfflineBody
-          token={token}
-          tokenLoading={tokenLoading}
-          tokenError={tokenError}
-        />
+      {conn.state !== "live" && (
+        <div className="px-3 py-3">
+          <button
+            type="button"
+            onClick={toggleOpen}
+            className="flex w-full items-center justify-center gap-1.5 rounded-sm border border-border bg-bg px-2 py-1.5 text-[10px] font-mono uppercase tracking-[0.14em] text-text transition-colors hover:border-border-strong hover:bg-bg-elev"
+          >
+            {open ? "Hide setup" : "Connect a DevPod"}
+          </button>
+          {open && (
+            <div className="pt-1">
+              <OfflineBody
+                token={token}
+                tokenLoading={tokenLoading}
+                tokenError={tokenError}
+              />
+            </div>
+          )}
+        </div>
       )}
     </Card>
   );
@@ -452,7 +454,7 @@ function OfflineBody({
     : "devpod-connect --token <fetching…>";
 
   return (
-    <div className="space-y-3 px-3 py-3">
+    <div className="space-y-3 pt-3">
       <p className="text-[10.5px] leading-relaxed text-muted">
         Connect a DevPod to run tests and live previews straight from
         chat. Paste these into your DevPod terminal:

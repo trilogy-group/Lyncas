@@ -320,9 +320,18 @@ def stream_chat(message, repo, token, history):
                         if body.startswith("{"):
                             try:
                                 evt = json.loads(body)
-                                if isinstance(evt, dict) and "error" in evt:
-                                    sys.stderr.write(NEWLINE + "[lyncas] error: " + str(evt["error"]) + NEWLINE)
-                                    return 2, "".join(captured)
+                                if isinstance(evt, dict):
+                                    if "error" in evt:
+                                        sys.stderr.write(NEWLINE + "[lyncas] error: " + str(evt["error"]) + NEWLINE)
+                                        return 2, "".join(captured)
+                                    # Text frames are JSON-encoded so newlines
+                                    # survive the SSE transport. Write the
+                                    # decoded text, not the raw JSON.
+                                    if isinstance(evt.get("t"), str):
+                                        sys.stdout.write(evt["t"])
+                                        sys.stdout.flush()
+                                        captured.append(evt["t"])
+                                        continue
                             except Exception:
                                 pass
                         sys.stdout.write(body)

@@ -523,6 +523,43 @@ export function buildReportDocument(report: PrReport): Document {
   });
 }
 
+// --- Generic markdown -> docx (used by the chat health report) ----------
+
+// Build a Word document from a raw markdown string with no PrReport
+// header card. The chat "Generate report" flow produces freeform
+// markdown (not a structured PrReport), so it uses this path to get a
+// real .docx rather than a renamed .md.
+export function buildMarkdownDocument(
+  markdown: string,
+  title: string,
+): Document {
+  const blocks = parseBlocks(markdown ?? "");
+  const bodyChildren = blocks.flatMap(blockToDocx);
+  return new Document({
+    creator: "Lyncas",
+    title,
+    description: title,
+    sections: [{ properties: {}, children: bodyChildren }],
+  });
+}
+
+export async function downloadMarkdownDocx(
+  markdown: string,
+  filename: string,
+  title: string,
+): Promise<void> {
+  const doc = buildMarkdownDocument(markdown, title);
+  const blob = await Packer.toBlob(doc);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
 // --- Browser download entry point ---------------------------------------
 
 // Filename uses the same flatten-the-slash convention as the .md

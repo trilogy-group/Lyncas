@@ -16,6 +16,7 @@ import { Container } from "@/components/ui/container";
 import { DevPodPanel } from "@/components/devpod-panel";
 import { SandboxTestCard } from "@/components/sandbox-test-card";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
+import { downloadMarkdownDocx } from "@/lib/docx-report";
 
 // /dashboard/chat — three-column repo chat workspace.
 //
@@ -1374,24 +1375,37 @@ function ChatPageInner() {
           const frames = buf.split("\n\n");
           buf = frames.pop() ?? "";
           for (const frame of frames) {
-            const line = frame.startsWith("data: ") ? frame.slice(6) : frame;
-            if (!line) continue;
-            if (line === "[DONE]") {
+            const payload = frame.startsWith("data: ")
+              ? frame.slice(6)
+              : frame;
+            if (!payload) continue;
+            if (payload === "[DONE]") {
               reader.cancel();
               return;
             }
-            if (line.startsWith("{")) {
+            // Text frames are JSON-encoded ({ "t": "..." }) so embedded
+            // newlines survive the SSE transport intact. Errors arrive
+            // as { "error": "..." }. Anything else is treated as legacy
+            // plain text for backward compatibility.
+            if (payload.startsWith("{")) {
               try {
-                const parsed = JSON.parse(line) as { error?: string };
+                const parsed = JSON.parse(payload) as {
+                  t?: string;
+                  error?: string;
+                };
                 if (parsed.error) {
                   flagInterrupted(parsed.error);
+                  continue;
+                }
+                if (typeof parsed.t === "string") {
+                  appendToAssistantInRepo(repo, asstId, parsed.t);
                   continue;
                 }
               } catch {
                 // fall through and treat as plain text
               }
             }
-            appendToAssistantInRepo(repo, asstId, line);
+            appendToAssistantInRepo(repo, asstId, payload);
           }
         }
       } catch (e) {
@@ -1431,17 +1445,14 @@ function ChatPageInner() {
     function flagReportError(detail: string) {
       setMessagesForRepo(repo, (prev) =>
         prev.map((m) =>
-          m.id === reportId
-            ? {
-                ...m,
-                content: m.content + `\n\n**Report failed.** ${detail}`,
-                streamError: detail,
-              }
-            : m,
+          m.id === reportId ? { ...m, streamError: detail } : m,
         ),
       );
     }
     try {
+      // Reports are a single non-streaming JSON call now: the full
+      // markdown comes back intact (no SSE newline corruption) and we
+      // render a compact download card rather than a live preview.
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1451,36 +1462,22 @@ function ChatPageInner() {
         }),
         signal: ac.signal,
       });
-      if (!res.ok || !res.body) {
-        let detail = `HTTP ${res.status}`;
-        try {
-          const j = (await res.json()) as { error?: string };
-          if (j.error) detail = j.error;
-        } catch {
-          // non-json
-        }
-        flagReportError(detail);
+      const j = (await res.json().catch(() => ({}))) as {
+        markdown?: string;
+        error?: string;
+      };
+      if (!res.ok) {
+        flagReportError(j.error ?? `HTTP ${res.status}`);
         return;
       }
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        const frames = buf.split("\n\n");
-        buf = frames.pop() ?? "";
-        for (const frame of frames) {
-          const line = frame.startsWith("data: ") ? frame.slice(6) : frame;
-          if (!line) continue;
-          if (line === "[DONE]") {
-            reader.cancel();
-            return;
-          }
-          appendToAssistantInRepo(repo, reportId, line);
-        }
+      const markdown = (j.markdown ?? "").trim();
+      if (!markdown) {
+        flagReportError("The model returned an empty report.");
+        return;
       }
+      setMessagesForRepo(repo, (prev) =>
+        prev.map((m) => (m.id === reportId ? { ...m, content: markdown } : m)),
+      );
     } catch (e) {
       if ((e as Error).name === "AbortError") return;
       flagReportError((e as Error).message || "Network error.");
@@ -1488,7 +1485,7 @@ function ChatPageInner() {
       setIsStreaming(false);
       abortRef.current = null;
     }
-  }, [appendToAssistantInRepo, isStreaming, selectedRepo, setMessagesForRepo]);
+  }, [isStreaming, selectedRepo, setMessagesForRepo]);
 
   // Replays an interrupted stream by deleting the failed assistant
   // message and re-issuing send() with the same prompt.
@@ -3344,8 +3341,30 @@ function ResearchSkeleton() {
 }
 
 // =========================================================================
-// Report card (full-width, print-friendly, white background)
+// Report card — download-first. The report is NOT rendered inline as a
+// big preview; it's offered as a downloadable document (.docx / .md)
+// with an optional collapsible preview for those who want a quick look.
 // =========================================================================
+
+function DocGlyph() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+      <path d="M14 3v5h5" />
+      <path d="M9 13h6M9 17h6" />
+    </svg>
+  );
+}
 
 function ReportCard({
   message,
@@ -3357,7 +3376,14 @@ function ReportCard({
   isStreaming: boolean;
 }) {
   const [copied, setCopied] = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
+  const [docxBusy, setDocxBusy] = useState(false);
+  const [docxError, setDocxError] = useState<string | null>(null);
   const pending = isStreaming && !message.content;
+  const ready = !pending && !!message.content && !message.streamError;
+
+  const today = new Date().toISOString().slice(0, 10);
+  const safeRepo = repo.replace(/[^A-Za-z0-9._-]+/g, "-");
 
   async function copy() {
     try {
@@ -3369,75 +3395,135 @@ function ReportCard({
     }
   }
 
-  function download() {
-    const today = new Date().toISOString().slice(0, 10);
-    const safeRepo = repo.replace(/[^A-Za-z0-9._-]+/g, "-");
-    const filename = `${safeRepo}-health-report-${today}.md`;
+  function downloadMd() {
     const blob = new Blob([message.content], {
       type: "text/markdown;charset=utf-8",
     });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = filename;
+    a.download = `${safeRepo}-health-report-${today}.md`;
     document.body.appendChild(a);
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 0);
   }
 
+  async function downloadDocx() {
+    if (docxBusy) return;
+    setDocxBusy(true);
+    setDocxError(null);
+    try {
+      await downloadMarkdownDocx(
+        message.content,
+        `${safeRepo}-health-report-${today}.docx`,
+        `Repository Health Report — ${repo}`,
+      );
+    } catch (e) {
+      setDocxError((e as Error).message || "Could not build .docx");
+    } finally {
+      setDocxBusy(false);
+    }
+  }
+
+  if (message.streamError && !message.content) {
+    return (
+      <article className="rounded-md border border-red-500/30 bg-red-500/5 px-4 py-3">
+        <p className="text-[12px] font-mono text-red-300">
+          Report failed. {message.streamError}
+        </p>
+      </article>
+    );
+  }
+
   return (
-    <article className="overflow-hidden rounded-sm border border-border bg-white text-black shadow-sm">
-      <header className="flex items-center justify-between gap-2 border-b border-black/10 bg-black/[0.02] px-4 py-2">
-        <div className="flex items-center gap-2">
-          <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-black/60">
-            Report
-          </span>
-          <span className="text-[10px] font-mono text-black/40">
-            {repo} · {formatTime(message.ts)}
-          </span>
-        </div>
-        <div className="flex items-center gap-1">
-          <button
-            type="button"
-            onClick={copy}
-            disabled={pending || !message.content}
-            className="rounded-sm border border-black/15 bg-white px-2 py-0.5 text-[10px] font-mono uppercase tracking-[0.14em] text-black/60 hover:text-black disabled:opacity-40"
-          >
-            {copied ? "Copied" : "Copy"}
-          </button>
-          <button
-            type="button"
-            onClick={download}
-            disabled={pending || !message.content}
-            className="rounded-sm border border-black/15 bg-white px-2 py-0.5 text-[10px] font-mono uppercase tracking-[0.14em] text-black/60 hover:text-black disabled:opacity-40"
-          >
-            Download .md
-          </button>
-        </div>
-      </header>
-      <div className="report-content px-6 py-5 text-sm leading-relaxed">
-        {pending ? (
-          <div className="space-y-3 py-4">
-            <div className="h-4 w-1/2 rounded bg-black/10" />
-            <div className="space-y-1.5">
-              <div className="h-2 w-full rounded bg-black/5" />
-              <div className="h-2 w-11/12 rounded bg-black/5" />
-              <div className="h-2 w-9/12 rounded bg-black/5" />
-            </div>
-            <div className="text-[11px] font-mono uppercase tracking-[0.18em] text-black/40">
-              Generating report…
-            </div>
+    <article className="overflow-hidden rounded-md border border-border bg-card">
+      <div className="flex items-start gap-3 px-4 py-3.5">
+        <span
+          className={`mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-md border ${
+            ready
+              ? "border-accent/30 bg-accent/10 text-accent"
+              : "border-border bg-bg text-muted"
+          }`}
+        >
+          <DocGlyph />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
+              Report
+            </span>
+            <span className="truncate text-[10px] font-mono text-muted/70">
+              {repo} · {formatTime(message.ts)}
+            </span>
           </div>
-        ) : (
+          <p className="mt-0.5 text-[13px] font-medium text-text">
+            {pending
+              ? "Generating repository health report…"
+              : "Repository health report is ready."}
+          </p>
+          {pending ? (
+            <div className="mt-2 flex items-center gap-2 text-[11px] font-mono text-muted">
+              <span className="h-3 w-3 animate-spin rounded-full border-2 border-muted/30 border-t-accent" />
+              Crunching PRs, commits & review history…
+            </div>
+          ) : (
+            <>
+              <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={downloadDocx}
+                  disabled={!ready || docxBusy}
+                  className="inline-flex items-center gap-1.5 rounded-md bg-accent px-3 py-1.5 text-[11px] font-medium text-black transition hover:opacity-90 disabled:opacity-40"
+                >
+                  {docxBusy ? "Building .docx…" : "Download .docx"}
+                </button>
+                <button
+                  type="button"
+                  onClick={downloadMd}
+                  disabled={!ready}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-border bg-bg px-3 py-1.5 text-[11px] font-medium text-text transition hover:border-accent/40 disabled:opacity-40"
+                >
+                  Download .md
+                </button>
+                <button
+                  type="button"
+                  onClick={copy}
+                  disabled={!ready}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-border bg-bg px-3 py-1.5 text-[11px] font-medium text-muted transition hover:text-text disabled:opacity-40"
+                >
+                  {copied ? "Copied" : "Copy markdown"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowPreview((v) => !v)}
+                  disabled={!ready}
+                  className="inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-[11px] font-medium text-muted transition hover:text-text disabled:opacity-40"
+                >
+                  {showPreview ? "Hide preview" : "Show preview"}
+                </button>
+              </div>
+              {docxError && (
+                <p className="mt-2 text-[11px] font-mono text-red-300">
+                  {docxError}
+                </p>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+
+      {ready && showPreview && (
+        <div className="report-content border-t border-border bg-white px-6 py-5 text-sm leading-relaxed text-black">
           <div
             className="md-content"
             dangerouslySetInnerHTML={{
               __html: renderMarkdown(message.content),
             }}
           />
-        )}
-      </div>
+        </div>
+      )}
+
       <style jsx>{`
         :global(.report-content .md-h1) {
           font-size: 1.4rem;

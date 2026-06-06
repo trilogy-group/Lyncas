@@ -904,6 +904,18 @@ async function streamFromAnthropic(opts: {
   const decoder = new TextDecoder();
   const reader = upstream.body.getReader();
 
+  // Emit a text frame as JSON so embedded newlines / blank lines never
+  // collide with the SSE `\n\n` frame delimiter. The client decodes
+  // `{ "t": "..." }` and appends `.t` verbatim, preserving markdown
+  // paragraph breaks and headings exactly as the model wrote them.
+  function sendText(
+    c: ReadableStreamDefaultController<Uint8Array>,
+    text: string,
+  ): void {
+    if (!text) return;
+    c.enqueue(encoder.encode(`data: ${JSON.stringify({ t: text })}\n\n`));
+  }
+
   const writeToken = opts.writeToken;
   const repo = opts.repo;
   const allowActions = opts.allowActions;
@@ -947,11 +959,7 @@ async function streamFromAnthropic(opts: {
             // Strip the trailing newline directly before ACTION:
             // for a cleaner visual hand-off to the confirmation.
             const trimmed = chunk.replace(/\n+$/, "");
-            if (trimmed) {
-              controller_.enqueue(
-                encoder.encode(`data: ${trimmed}\n\n`),
-              );
-            }
+            sendText(controller_, trimmed);
             emitted = accum.length; // skip past the captured action region
           }
           return;
@@ -961,7 +969,7 @@ async function streamFromAnthropic(opts: {
         const safeEnd = Math.max(emitted, accum.length - LOOKAHEAD);
         if (safeEnd > emitted) {
           const chunk = accum.slice(emitted, safeEnd);
-          controller_.enqueue(encoder.encode(`data: ${chunk}\n\n`));
+          sendText(controller_, chunk);
           emitted = safeEnd;
         }
       }
@@ -973,18 +981,14 @@ async function streamFromAnthropic(opts: {
           if (actionStart > emitted) {
             const chunk = accum.slice(emitted, actionStart);
             const trimmed = chunk.replace(/\n+$/, "");
-            if (trimmed) {
-              controller_.enqueue(
-                encoder.encode(`data: ${trimmed}\n\n`),
-              );
-            }
+            sendText(controller_, trimmed);
             emitted = accum.length;
           }
         } else {
           // No action — emit everything that's left.
           if (emitted < accum.length) {
             const chunk = accum.slice(emitted);
-            controller_.enqueue(encoder.encode(`data: ${chunk}\n\n`));
+            sendText(controller_, chunk);
             emitted = accum.length;
           }
         }
@@ -1035,7 +1039,7 @@ async function streamFromAnthropic(opts: {
                 `_(${a.kind} #${a.number} not executed — no write token for this repo.)_`,
             )
             .join("\n");
-          controller_.enqueue(encoder.encode(`data: \n\n${lines}\n\n`));
+          sendText(controller_, `\n\n${lines}`);
           return;
         }
 
@@ -1055,9 +1059,7 @@ async function streamFromAnthropic(opts: {
         if (confirmations.length > 0) {
           // One blank line between confirmations keeps the markdown
           // renderer from collapsing them into a single paragraph.
-          controller_.enqueue(
-            encoder.encode(`data: \n\n${confirmations.join("\n\n")}\n\n`),
-          );
+          sendText(controller_, `\n\n${confirmations.join("\n\n")}`);
         }
       }
 
@@ -1126,6 +1128,55 @@ async function streamFromAnthropic(opts: {
       "X-Accel-Buffering": "no",
     },
   });
+}
+
+// --- Non-streaming report generation -------------------------------------
+// The "Generate report" flow used to stream the markdown over SSE and
+// render it live in the chat. That had two problems: (1) paragraph
+// breaks in the markdown collided with the SSE `\n\n` frame delimiter,
+// corrupting headings/newlines, and (2) it dumped a giant, half-parsed
+// preview into the chat. We now generate the whole report in one
+// non-streaming call and return it as JSON; the client renders a
+// compact "report ready — download" card instead of a live preview.
+async function generateReportMarkdown(opts: {
+  apiKey: string;
+  systemPrompt: string;
+  userMessage: string;
+  maxTokens: number;
+}): Promise<{ markdown: string } | { error: string; status: number }> {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": opts.apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: CHAT_MODEL,
+      max_tokens: opts.maxTokens,
+      system: opts.systemPrompt,
+      messages: [{ role: "user", content: opts.userMessage }],
+    }),
+  });
+  if (!res.ok) {
+    let detail = `Anthropic returned HTTP ${res.status}`;
+    try {
+      const j = (await res.json()) as { error?: { message?: string } };
+      if (j.error?.message) detail = j.error.message;
+    } catch {
+      // non-json
+    }
+    return { error: detail, status: 502 };
+  }
+  const body = (await res.json()) as {
+    content?: Array<{ type?: string; text?: string }>;
+  };
+  const markdown = (body.content ?? [])
+    .filter((c) => c.type === "text")
+    .map((c) => c.text ?? "")
+    .join("")
+    .trim();
+  return { markdown };
 }
 
 // --- Route handler -------------------------------------------------------
@@ -1302,25 +1353,34 @@ export async function POST(request: NextRequest) {
     ? `REPOSITORY DATA:\n${repoDataJSON}\n\nGenerate the report now.`
     : `REPOSITORY DATA:\n${repoDataJSON}\n\nUSER QUESTION:\n${message}`;
 
-  // 6. Stream
-  const systemPrompt = isReport
-    ? reportSystemPrompt(repo)
-    : isResearchBriefing
-      ? RESEARCH_BRIEFING_PROMPT
-      : systemPromptChat(repo);
+  // 6a. Reports — single non-streaming call, returned as JSON. No SSE,
+  // so the markdown's paragraph breaks survive intact and the client
+  // can offer a clean download instead of a live in-chat preview.
+  if (isReport) {
+    const report = await generateReportMarkdown({
+      apiKey: anthropicKey,
+      systemPrompt: reportSystemPrompt(repo),
+      userMessage: userPayload,
+      maxTokens: 4096,
+    });
+    if ("error" in report) return jsonError(report.error, report.status);
+    return NextResponse.json({ markdown: report.markdown, repo });
+  }
+
+  // 6b. Chat / briefing — streamed over SSE.
+  const systemPrompt = isResearchBriefing
+    ? RESEARCH_BRIEFING_PROMPT
+    : systemPromptChat(repo);
 
   return streamFromAnthropic({
     apiKey: anthropicKey,
     systemPrompt,
-    // Reports + briefings start a fresh context — neither benefits
-    // from prior chit-chat.
-    history: isReport || isResearchBriefing ? [] : history,
+    // Briefings start a fresh context — they don't benefit from prior
+    // chit-chat. (Reports returned earlier via the JSON path.)
+    history: isResearchBriefing ? [] : history,
     userMessage: userPayload,
     writeToken: resolved.token,
     repo,
-    // Reports are pure read-only generation — never execute ACTIONs
-    // even if Claude hallucinates one.
-    allowActions: !isResearchBriefing && !isReport,
-    maxTokens: isReport ? 4096 : undefined,
+    allowActions: !isResearchBriefing,
   });
 }

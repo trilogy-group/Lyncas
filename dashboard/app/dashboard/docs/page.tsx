@@ -1,8 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
-import { motion } from "framer-motion";
+import React, { useEffect, useState } from "react";
+import { motion, useScroll, useSpring } from "framer-motion";
 import { Badge } from "@/components/ui/badge";
 import { LinkButton } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -48,6 +48,14 @@ const SECTIONS: SectionSpec[] = [
 export default function DocsPage() {
   const [active, setActive] = useState<string>(SECTIONS[0].id);
 
+  // Thin reading-progress bar pinned to the very top, above the nav.
+  const { scrollYProgress } = useScroll();
+  const progress = useSpring(scrollYProgress, {
+    stiffness: 120,
+    damping: 30,
+    mass: 0.3,
+  });
+
   // Scroll-spy: highlight the TOC entry whose section is nearest the
   // top of the viewport. rootMargin biases the "active" line toward the
   // upper third so a section lights up as it scrolls into reading range.
@@ -68,77 +76,174 @@ export default function DocsPage() {
     return () => observer.disconnect();
   }, []);
 
+  // Opt this page into smooth anchor scrolling without changing the
+  // global stylesheet; revert on unmount so other pages keep instant
+  // jumps.
+  useEffect(() => {
+    const root = document.documentElement;
+    const prev = root.style.scrollBehavior;
+    root.style.scrollBehavior = "smooth";
+    return () => {
+      root.style.scrollBehavior = prev;
+    };
+  }, []);
+
   return (
     <div className="bg-noise">
+      {/* Reading progress -------------------------------------------- */}
+      <motion.div
+        style={{ scaleX: progress }}
+        className="fixed inset-x-0 top-0 z-50 h-[2px] origin-left bg-white"
+        aria-hidden
+      />
+
       {/* ----------------------------------------------------------- */}
       {/* Hero                                                         */}
       {/* ----------------------------------------------------------- */}
       <section className="relative overflow-hidden border-b border-border dot-grid">
         <Container size="wide" className="relative py-14 sm:py-20">
-          <motion.div
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.5, ease: EASE }}
-            className="max-w-3xl space-y-5"
-          >
-            <p className="text-[10px] font-mono uppercase tracking-[0.22em] text-muted-strong">
-              [ Documentation ]
-            </p>
-            <h1 className="font-mono font-bold tracking-tight leading-[0.98] text-[40px] sm:text-[58px]">
-              <span className="block uppercase">How to use</span>
-              <span className="mt-2 inline-block bg-white px-3 uppercase text-black">
-                Lyncas
-              </span>
-            </h1>
-            <p className="text-sm sm:text-base text-muted-strong leading-relaxed">
-              Lyncas is an autonomous GitHub PR-reviewing agent. Connect a
-              repository, open a pull request, and a Claude-Opus-powered
-              reviewer posts a structured verdict in seconds — then learns
-              from what you keep, revert, and close. This guide walks through
-              every surface of the product and how to drive it.
-            </p>
-            <div className="flex flex-wrap gap-3 pt-2">
-              <LinkButton href="/dashboard/repos" variant="primary" size="md">
-                Connect a repo
-              </LinkButton>
-              <LinkButton href="/dashboard/chat" variant="default" size="md">
-                Open the chat
-              </LinkButton>
-            </div>
-          </motion.div>
+          <div className="grid items-center gap-12 lg:grid-cols-[minmax(0,1fr)_minmax(0,440px)]">
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.5, ease: EASE }}
+              className="space-y-5"
+            >
+              <p className="text-[10px] font-mono uppercase tracking-[0.22em] text-muted-strong">
+                [ Documentation ]
+              </p>
+              <h1 className="font-mono font-bold tracking-tight leading-[0.98] text-[40px] sm:text-[58px]">
+                <span className="block uppercase">How to use</span>
+                <span className="mt-2 inline-block bg-white px-3 uppercase text-black">
+                  Lyncas
+                </span>
+              </h1>
+              <p className="max-w-2xl text-sm sm:text-base text-muted-strong leading-relaxed">
+                Lyncas is an autonomous GitHub PR-reviewing agent. Connect a
+                repository, open a pull request, and a Claude-Opus-powered
+                reviewer posts a structured verdict in seconds — then learns
+                from what you keep, revert, and close. This guide walks through
+                every surface of the product and how to drive it.
+              </p>
+              <div className="flex flex-wrap gap-3 pt-2">
+                <LinkButton href="/dashboard/repos" variant="primary" size="md">
+                  Connect a repo
+                </LinkButton>
+                <LinkButton href="/dashboard/chat" variant="default" size="md">
+                  Open the chat
+                </LinkButton>
+              </div>
+              <div className="flex flex-wrap gap-2 pt-3">
+                <HeroChip value="<30s" label="median review" />
+                <HeroChip value="3 gates" label="before auto-close" />
+                <HeroChip value="Opus 4.5" label="powered" />
+              </div>
+            </motion.div>
+
+            <motion.div
+              initial={{ opacity: 0, y: 16 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.55, delay: 0.15, ease: EASE }}
+              className="hidden lg:block"
+            >
+              <TerminalWindow title="lyncas · review" hint="POSTED ✓">
+                <pre className="whitespace-pre font-mono text-[12px] leading-relaxed">
+                  <span className="text-muted">repo    </span>
+                  <span className="text-text">acme/web</span>
+                  {"\n"}
+                  <span className="text-muted">pr      </span>
+                  <span className="text-text">#482 · refactor auth</span>
+                  {"\n\n"}
+                  <span className="text-muted">verdict   </span>
+                  <span style={{ color: verdictColors.approve }}>approve</span>
+                  {"\n"}
+                  <span className="text-muted">severity  </span>
+                  <span style={{ color: severityColors.clean }}>2 / 10</span>
+                  {"\n"}
+                  <span className="text-muted">confidence</span>
+                  <span className="text-text">  high</span>
+                  {"\n"}
+                  <span className="text-muted">bugs      </span>
+                  <span className="text-text">0 · nits 1</span>
+                  {"\n"}
+                  <span className="text-muted">─────────────────────</span>
+                  {"\n"}
+                  <span className="text-muted">auto-close</span>
+                  <span className="text-muted">  skipped (gate 3)</span>
+                </pre>
+              </TerminalWindow>
+            </motion.div>
+          </div>
         </Container>
       </section>
+
+      {/* Mobile section chips — replaces the hidden TOC on small ----- */}
+      <div className="sticky top-14 z-30 border-b border-border bg-bg/90 backdrop-blur lg:hidden">
+        <div className="flex gap-2 overflow-x-auto px-4 py-2.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          {SECTIONS.map((s, i) => (
+            <a
+              key={s.id}
+              href={`#${s.id}`}
+              className={
+                "shrink-0 whitespace-nowrap rounded-sm border px-2.5 py-1 text-[11px] font-mono uppercase tracking-[0.1em] transition-colors " +
+                (active === s.id
+                  ? "border-border-strong bg-bg-elev text-white"
+                  : "border-border text-muted hover:text-white")
+              }
+            >
+              <span className="text-muted-strong">
+                {String(i + 1).padStart(2, "0")}
+              </span>{" "}
+              {s.label}
+            </a>
+          ))}
+        </div>
+      </div>
 
       {/* ----------------------------------------------------------- */}
       {/* Body — sticky TOC + content                                  */}
       {/* ----------------------------------------------------------- */}
       <Container size="wide" className="py-12">
-        <div className="grid gap-10 lg:grid-cols-[220px_minmax(0,1fr)]">
+        <div className="grid gap-12 lg:grid-cols-[228px_minmax(0,1fr)]">
           {/* TOC ---------------------------------------------------- */}
           <aside className="hidden lg:block">
-            <nav className="sticky top-20 space-y-1">
-              <p className="px-3 pb-3 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
+            <nav className="sticky top-20 max-h-[calc(100vh-7rem)] overflow-y-auto pr-2">
+              <p className="mb-3 border-b border-border px-3 pb-3 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
                 On this page
               </p>
-              {SECTIONS.map((s) => (
-                <a
-                  key={s.id}
-                  href={`#${s.id}`}
-                  className={
-                    "block rounded-sm border-l-2 px-3 py-1.5 text-[12px] font-mono uppercase tracking-[0.1em] transition-colors " +
-                    (active === s.id
-                      ? "border-white bg-bg-elev text-white"
-                      : "border-transparent text-muted hover:text-white")
-                  }
-                >
-                  {s.label}
-                </a>
-              ))}
+              <ul className="space-y-0.5">
+                {SECTIONS.map((s, i) => {
+                  const on = active === s.id;
+                  return (
+                    <li key={s.id}>
+                      <a
+                        href={`#${s.id}`}
+                        className={
+                          "group flex items-center gap-2.5 rounded-sm border-l-2 px-3 py-1.5 text-[12px] font-mono uppercase tracking-[0.08em] transition-colors " +
+                          (on
+                            ? "border-white bg-bg-elev text-white"
+                            : "border-transparent text-muted hover:border-border-strong hover:text-white")
+                        }
+                      >
+                        <span
+                          className={
+                            "tabular-nums " +
+                            (on ? "text-muted-strong" : "text-border-strong")
+                          }
+                        >
+                          {String(i + 1).padStart(2, "0")}
+                        </span>
+                        {s.label}
+                      </a>
+                    </li>
+                  );
+                })}
+              </ul>
             </nav>
           </aside>
 
           {/* Content ------------------------------------------------ */}
-          <article className="min-w-0 max-w-3xl space-y-20">
+          <article className="min-w-0 max-w-3xl">
             <Introduction />
             <HowItWorks />
             <Quickstart />
@@ -159,6 +264,15 @@ export default function DocsPage() {
   );
 }
 
+function HeroChip({ value, label }: { value: string; label: string }) {
+  return (
+    <span className="inline-flex items-baseline gap-1.5 border border-border bg-card px-2.5 py-1.5 text-[11px] font-mono uppercase tracking-[0.1em]">
+      <span className="font-bold text-white">{value}</span>
+      <span className="text-muted">{label}</span>
+    </span>
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /* Section primitives                                                  */
 /* ------------------------------------------------------------------ */
@@ -174,16 +288,44 @@ function DocSection({
   title: string;
   children: React.ReactNode;
 }) {
+  const idx = SECTIONS.findIndex((s) => s.id === id);
+  const num = String(idx + 1).padStart(2, "0");
+  const first = idx === 0;
   return (
-    <section id={id} className="scroll-mt-24 space-y-5">
-      <header className="space-y-2">
-        <p className="text-[10px] font-mono uppercase tracking-[0.22em] text-muted">
-          &gt; {eyebrow}
-        </p>
-        <h2 className="text-2xl sm:text-[28px] font-semibold tracking-[-0.02em] text-white">
-          {title}
-        </h2>
-      </header>
+    <section
+      id={id}
+      className={
+        "scroll-mt-24 " +
+        (first ? "" : "mt-16 border-t border-border pt-16")
+      }
+    >
+      <motion.header
+        initial={{ opacity: 0, y: 8 }}
+        whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ once: true, amount: 0.6 }}
+        transition={{ duration: 0.4, ease: EASE }}
+        className="group mb-5 flex items-start gap-4"
+      >
+        <span className="select-none font-mono text-2xl font-bold leading-none tracking-tight text-border-strong sm:text-3xl">
+          {num}
+        </span>
+        <div className="space-y-1.5">
+          <p className="text-[10px] font-mono uppercase tracking-[0.22em] text-muted">
+            &gt; {eyebrow}
+          </p>
+          <h2 className="flex items-center gap-2 text-2xl sm:text-[28px] font-semibold tracking-[-0.02em] text-white">
+            <a href={`#${id}`} className="hover:underline underline-offset-[6px] decoration-white/30">
+              {title}
+            </a>
+            <span
+              className="font-mono text-base text-muted opacity-0 transition-opacity group-hover:opacity-100"
+              aria-hidden
+            >
+              #
+            </span>
+          </h2>
+        </div>
+      </motion.header>
       <div className="space-y-4 text-sm leading-relaxed text-muted-strong">
         {children}
       </div>
@@ -211,32 +353,60 @@ function FeatureCell({
   children: React.ReactNode;
 }) {
   return (
-    <div className="bg-bg p-5">
-      <h4 className="mb-1.5 text-sm font-semibold text-white">{title}</h4>
+    <div className="group relative bg-bg p-5 transition-colors hover:bg-bg-elev">
+      <span
+        className="absolute inset-x-0 top-0 h-px bg-transparent transition-colors group-hover:bg-white/50"
+        aria-hidden
+      />
+      <h4 className="mb-1.5 flex items-center gap-2 text-sm font-semibold text-white">
+        <span
+          className="h-1.5 w-1.5 shrink-0 bg-border-strong transition-colors group-hover:bg-white"
+          aria-hidden
+        />
+        {title}
+      </h4>
       <p className="text-[13px] leading-relaxed text-muted">{children}</p>
     </div>
   );
 }
 
-function Step({
-  n,
-  title,
-  children,
-}: {
+// Steps — wraps a list of <Step> into a vertical timeline. The
+// connector line is drawn by each step except the last, which we detect
+// here so callers don't have to track ordering.
+function Steps({ children }: { children: React.ReactNode }) {
+  const items = React.Children.toArray(children).filter(
+    React.isValidElement,
+  ) as React.ReactElement<StepProps>[];
+  return (
+    <ol className="space-y-0">
+      {items.map((child, i) =>
+        React.cloneElement(child, { _last: i === items.length - 1 }),
+      )}
+    </ol>
+  );
+}
+
+interface StepProps {
   n: number;
   title: string;
   children: React.ReactNode;
-}) {
+  _last?: boolean;
+}
+
+function Step({ n, title, children, _last = false }: StepProps) {
   return (
-    <div className="flex gap-4">
-      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-sm border border-border bg-card font-mono text-sm font-bold tabular-nums text-white">
-        {n}
+    <li className="flex gap-4">
+      <div className="flex flex-col items-center">
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-sm border border-border bg-card font-mono text-sm font-bold tabular-nums text-white">
+          {n}
+        </div>
+        {!_last && <div className="mt-1 w-px flex-1 bg-border" aria-hidden />}
       </div>
-      <div className="space-y-1 pt-0.5">
+      <div className={"space-y-1 pt-1 " + (_last ? "" : "pb-6")}>
         <h4 className="text-sm font-semibold text-white">{title}</h4>
         <p className="text-[13px] leading-relaxed text-muted">{children}</p>
       </div>
-    </div>
+    </li>
   );
 }
 
@@ -328,7 +498,7 @@ Structured review comment posted to the PR
         </pre>
       </TerminalWindow>
 
-      <div className="space-y-5">
+      <Steps>
         <Step n={1} title="Trigger">
           A push or pull-request event hits a lightweight webhook. It verifies
           the signature and dispatches the workflow — nothing more. The webhook
@@ -348,7 +518,7 @@ Structured review comment posted to the PR
           The verdict is posted as a structured comment on the PR, the result is
           stored, and — only if all gates pass — the PR may be auto-closed.
         </Step>
-      </div>
+      </Steps>
     </DocSection>
   );
 }
@@ -357,7 +527,7 @@ function Quickstart() {
   return (
     <DocSection id="quickstart" eyebrow="Get started" title="Quickstart">
       <Lead>Three steps from zero to your first automated review.</Lead>
-      <div className="space-y-5">
+      <Steps>
         <Step n={1} title="Connect a repository">
           Head to{" "}
           <ScreenLink href="/dashboard/repos" label="Repos" /> and install the
@@ -376,7 +546,7 @@ function Quickstart() {
           you can tune per-repo behavior, set notification preferences, and chat
           with the agent about any repo.
         </Step>
-      </div>
+      </Steps>
       <Card className="p-5">
         <p className="text-[13px] leading-relaxed text-muted">
           <span className="font-mono uppercase tracking-[0.12em] text-white">
@@ -750,7 +920,7 @@ function SelfLearningSection() {
         PR it wanted closed, or close one it approved, that disagreement is
         recorded.
       </Lead>
-      <div className="space-y-5">
+      <Steps>
         <Step n={1} title="Observe">
           A poller tracks what happened to each reviewed PR — merged, closed,
           reverted — and settles it into a labeled outcome.
@@ -768,7 +938,7 @@ function SelfLearningSection() {
           The agent never changes its own behavior unilaterally — a human
           reviews and merges the tuner&apos;s PR, exactly like any other change.
         </Step>
-      </div>
+      </Steps>
     </DocSection>
   );
 }
@@ -882,7 +1052,7 @@ function GateCell({
 
 function Faq({ q, children }: { q: string; children: React.ReactNode }) {
   return (
-    <details className="group border border-border bg-card rounded-md">
+    <details className="group rounded-md border border-border bg-card transition-colors hover:border-border-strong open:border-border-strong">
       <summary className="flex cursor-pointer list-none items-center justify-between gap-4 px-5 py-4 text-sm font-semibold text-white">
         {q}
         <span

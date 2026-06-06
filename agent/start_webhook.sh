@@ -9,13 +9,13 @@
 #   bash agent/start_webhook.sh                 # foreground, Ctrl+C to stop
 #   nohup bash agent/start_webhook.sh &         # background, logs to nohup.out
 #
-# Assumes the repo is checked out at ~/trilogy/Night-PR-Reviewer-v2
+# Assumes the repo is checked out at ~/trilogy/Lyncas
 # (matches the systemd unit's WorkingDirectory). Edit the cd path if
 # your deployment uses a different layout.
 
 set -euo pipefail
 
-cd ~/trilogy/Night-PR-Reviewer-v2
+cd ~/trilogy/Lyncas
 
 # set -a exports every variable defined by the sourced file so the
 # python process inherits them without us having to re-export each

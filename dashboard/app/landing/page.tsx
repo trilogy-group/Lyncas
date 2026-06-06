@@ -195,7 +195,7 @@ export default function LandingPage() {
                 Try it on your repo
               </LinkButton>
               <Link
-                href="https://github.com/HarshBti1805/night-pr-reviewer"
+                href="https://github.com/trilogy-group/Lyncas"
                 className="text-[11px] font-mono uppercase tracking-[0.18em] underline underline-offset-[6px] hover:text-text"
               >
                 Read the source →

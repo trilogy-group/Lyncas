@@ -8,7 +8,7 @@ Python agent that runs in GitHub Actions, reviews open PRs on configured repos, 
 2. **For each new PR:** fetches the diff, sends it to Claude with a strict review prompt, posts the structured review as a PR comment
 3. **Each morning (7am UTC):** emails a digest of everything reviewed in the last 24h
 
-The review marker (`<!-- night-pr-reviewer:v1 -->`) makes the agent idempotent — it won't re-review a PR it's already touched.
+The review marker (`<!-- lyncas:v1 -->`) makes the agent idempotent — it won't re-review a PR it's already touched.
 
 ## Setup (one-time, ~10 minutes)
 

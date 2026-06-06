@@ -12,7 +12,7 @@ import { getPrReports, getWatchedRepos } from "@/lib/queries";
 // on demand from the client.
 //
 // Auth: standard Supabase JWT (dashboard session). DevPod-token
-// auth is intentionally NOT supported here — the `npr` CLI doesn't
+// auth is intentionally NOT supported here — the `lyncas` CLI doesn't
 // need a reports endpoint (it asks Claude directly via /api/chat),
 // and supporting both auth modes here would require widening the
 // principal type that getWatchedRepos accepts. We keep this route

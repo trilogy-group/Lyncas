@@ -99,10 +99,10 @@ SANDBOX_WAIT_SEC = 180
 POLL_INTERVAL_SEC = 5
 
 # GitHub comment marker — same convention as the reviewer's
-# `<!-- night-pr-reviewer:v1 -->` and the sandbox's
-# `<!-- night-pr-reviewer:sandbox:v2 -->`. Lets the next run
+# `<!-- lyncas:v1 -->` and the sandbox's
+# `<!-- lyncas:sandbox:v2 -->`. Lets the next run
 # update-in-place instead of stacking duplicate comments.
-REPORT_COMMENT_MARKER = "<!-- night-pr-reviewer:report:v1 -->"
+REPORT_COMMENT_MARKER = "<!-- lyncas:report:v1 -->"
 
 # Maximum bugs to include in the prompt's BUGS section. The full
 # review_bugs payload still goes to Supabase; this just bounds the

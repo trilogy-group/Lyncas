@@ -33,7 +33,7 @@ Required env:
   - GITHUB_TOKEN_PAT      (PAT with repo scope on the agent repo)
   - SUPABASE_URL
   - SUPABASE_SERVICE_KEY
-  - GITHUB_REPOSITORY     (e.g. "user/night-pr-reviewer"; GitHub Actions
+  - GITHUB_REPOSITORY     (e.g. "trilogy-group/Lyncas"; GitHub Actions
                             sets this automatically; for local runs set
                             it to your fork's owner/name)
 

@@ -23,7 +23,7 @@ the idempotency marker — invisible HTML comment.
 ### Skeleton (Phase 3 layout)
 
 ```markdown
-<!-- night-pr-reviewer:v1 -->
+<!-- lyncas:v1 -->
 ## 🌙 Lyncas
 
 **Verdict:** ✅ APPROVE
@@ -130,7 +130,7 @@ posts a different comment first, then patches `state=closed`.
 Format from `format_close_comment(review)`:
 
 ```markdown
-<!-- night-pr-reviewer:closed:v1 -->
+<!-- lyncas:closed:v1 -->
 ## 🚫 PR auto-closed by Lyncas
 
 This PR was automatically closed because all three gates were met:
@@ -160,7 +160,7 @@ the dispute in the morning digest.
 every auto-close in the daily digest.*
 ```
 
-Different marker (`CLOSE_MARKER = <!-- night-pr-reviewer:closed:v1 -->`)
+Different marker (`CLOSE_MARKER = <!-- lyncas:closed:v1 -->`)
 so re-checking detects auto-close history specifically.
 
 ---

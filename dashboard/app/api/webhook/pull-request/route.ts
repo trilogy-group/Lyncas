@@ -28,7 +28,7 @@ import crypto from "node:crypto";
 //                        roles need access to different repos owned by
 //                        potentially different GitHub accounts.
 //   AGENT_REPO       — `<owner>/<repo>` of the agent repo, e.g.
-//                      "HarshBti1805/Night-PR-Reviewer". This is the
+//                      "trilogy-group/Lyncas". This is the
 //                      repo whose Actions workflow we dispatch — NOT
 //                      the repo the PR was opened against.
 //   AGENT_WORKFLOW   — (optional) workflow file name. Defaults to

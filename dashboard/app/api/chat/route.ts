@@ -1132,7 +1132,7 @@ async function streamFromAnthropic(opts: {
 
 // Authenticated principal for downstream code. We support two auth
 // modes: the standard Supabase JWT (cookie-based) AND an
-// X-DevPod-Token header that the in-DevPod `npr` CLI sends. Only the
+// X-DevPod-Token header that the in-DevPod `lyncas` CLI sends. Only the
 // `.id` field is read downstream; using a narrow shape keeps both
 // paths pluggable without leaking JWT-specific fields into the
 // DevPod path's principal.
@@ -1151,7 +1151,7 @@ interface AuthedPrincipal {
 // DEVPOD_CONNECT_SECRET in constant time, then look up the
 // matching auth.users row by raw_user_meta_data->>'user_name'
 // via the migration-016 security-definer RPC. We use the auth.users
-// path (not user_profiles) so the npr CLI works even when the
+// path (not user_profiles) so the lyncas CLI works even when the
 // profile-row upsert hasn't run yet.
 async function resolveDevpodAuth(
   request: NextRequest,
@@ -1233,14 +1233,14 @@ export async function POST(request: NextRequest) {
   //     letting the user silently query someone else's public repo
   //     using the deploy-wide PAT.
   //
-  //   * DevPod token (npr CLI) — the user is authenticated by
+  //   * DevPod token (lyncas CLI) — the user is authenticated by
   //     possession of <github_username>:<DEVPOD_CONNECT_SECRET>, and
   //     the CLI is meant to work in any git checkout the user has
   //     locally. We deliberately skip the watched_repos ownership
   //     check: if the user has connected the repo we'll mint an
   //     installation token below; if not, resolveGithubToken falls
   //     through to PR_REVIEWER_PAT, which on EC2 has read access to
-  //     everything we care about. Result: `npr` works in any repo.
+  //     everything we care about. Result: `lyncas` works in any repo.
   const supabase = await createSupabaseServerClient();
   if (user.source === "jwt") {
     const { data: ownership } = await supabase

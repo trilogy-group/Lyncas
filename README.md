@@ -203,8 +203,8 @@ you control, and the agent reviews PRs across every install.
 #### Step 1 — Fork the repo
 
 ```bash
-gh repo fork HarshBti1805/Night-PR-Reviewer --clone
-cd Night-PR-Reviewer
+gh repo fork trilogy-group/Lyncas --clone
+cd Lyncas
 ```
 
 #### Step 2 — Provision Supabase
@@ -225,7 +225,7 @@ cd Night-PR-Reviewer
 
 1. **Settings → Developer settings → GitHub Apps → New GitHub App** (on
    your personal account or org).
-2. Name: anything (e.g. `night-pr-reviewer-myorg`).
+2. Name: anything (e.g. `lyncas-myorg`).
 3. Homepage URL: your eventual Vercel URL (you'll know it after step 5,
    can be edited).
 4. Callback URL: `https://<your-vercel-url>/auth/github-app/callback`
@@ -250,7 +250,7 @@ cd Night-PR-Reviewer
 
 - Anthropic console → API keys → create one → save as `ANTHROPIC_API_KEY`.
 - Google account → 2FA → App passwords → create one named
-  `night-pr-reviewer` → save as `GMAIL_APP_PASSWORD`. Save your address as
+  `lyncas` → save as `GMAIL_APP_PASSWORD`. Save your address as
   `GMAIL_USER`.
 
 #### Step 5 — Deploy the dashboard to Vercel
@@ -266,7 +266,7 @@ cd Night-PR-Reviewer
    GITHUB_APP_ID                     = …
    GITHUB_APP_PRIVATE_KEY            = <PEM with literal \n>
    WEBHOOK_SECRET                    = …
-   AGENT_REPO                        = <your-fork-owner>/Night-PR-Reviewer
+   AGENT_REPO                        = <your-fork-owner>/Lyncas
    AGENT_WORKFLOW_PAT                = <fine-grained PAT, actions:write on agent repo>
    AGENT_WORKFLOW                    = pr-review.yml   # optional override
    AGENT_WORKFLOW_REF                = main             # optional override
@@ -297,7 +297,7 @@ Add this **variable** (optional, defaults to `false`):
 
 #### Step 7 — End-to-end smoke test
 
-1. From your fork → **Actions tab → night-pr-reviewer → Run workflow**.
+1. From your fork → **Actions tab → lyncas → Run workflow**.
    The first run should finish in ~1 minute with no errors.
 2. Sign in to your dashboard at `https://<your-vercel-url>/login`.
 3. **Repos → Add repos via GitHub** → install the GitHub App on a test
@@ -374,7 +374,7 @@ for the exact policies.
 ## Project layout
 
 ```
-night-pr-reviewer-v2/
+lyncas/
 ├── agent/                          Python 3.11 agent (runs in CI)
 │   ├── pr_reviewer.py              entry point: scan repos, review PRs
 │   ├── review_graph.py             LangGraph multi-node pipeline

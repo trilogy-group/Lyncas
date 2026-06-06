@@ -140,7 +140,7 @@ PREVIEW_PRESERVE_SEC = 2 * 60 * 60
 # rather than stacking. Mirrors the REVIEW_MARKER pattern in
 # pr_reviewer.py — version-stamped so we can change the layout
 # without re-commenting historical PRs.
-SANDBOX_COMMENT_MARKER = "<!-- night-pr-reviewer:sandbox:v2 -->"
+SANDBOX_COMMENT_MARKER = "<!-- lyncas:sandbox:v2 -->"
 
 # Where we clone the PR into on the DevPod. Per-PR subdirectory
 # under /tmp so two concurrent runs (and back-to-back runs that

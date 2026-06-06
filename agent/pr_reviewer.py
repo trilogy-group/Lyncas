@@ -69,8 +69,8 @@ AUTO_CLOSE_REQUIRED_CONFIDENCE = "high"
 # Switch back to Sonnet if monthly cost exceeds budget threshold.
 MODEL = "claude-opus-4-5"
 MAX_DIFF_CHARS = 60_000  # truncate huge PRs to control token cost
-REVIEW_MARKER = "<!-- night-pr-reviewer:v1 -->"  # used to detect prior reviews
-CLOSE_MARKER = "<!-- night-pr-reviewer:closed:v1 -->"  # used to detect prior auto-close
+REVIEW_MARKER = "<!-- lyncas:v1 -->"  # used to detect prior reviews
+CLOSE_MARKER = "<!-- lyncas:closed:v1 -->"  # used to detect prior auto-close
 
 # --- Pricing (USD per 1M tokens) -------------------------------------------
 # Used to compute the per-review cost line in the PR comment footer and in

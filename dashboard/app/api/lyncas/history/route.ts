@@ -4,7 +4,7 @@ import { normalizeGithubUsername, verifyConnectToken } from "@/lib/devpod";
 
 // /api/lyncas/history
 //
-// Conversation history for the `npr` CLI, keyed by
+// Conversation history for the `lyncas` CLI, keyed by
 // (github_username, repo). The CLI calls this twice per
 // invocation:
 //
@@ -13,11 +13,11 @@ import { normalizeGithubUsername, verifyConnectToken } from "@/lib/devpod";
 //   2. POST — upsert the new {user, assistant} pair appended to
 //             the loaded array AFTER /api/chat returns.
 //
-// And once per `npr --clear`:
+// And once per `lyncas --clear`:
 //
 //   3. DELETE — wipe the row for this (username, repo).
 //
-// Auth: the npr CLI sends its composite token
+// Auth: the lyncas CLI sends its composite token
 //   <github_username>:<DEVPOD_CONNECT_SECRET>
 // as `secret` (in the POST body, or in the DELETE query string),
 // and the route validates it via verifyConnectToken — same pattern
@@ -138,7 +138,7 @@ export async function POST(req: NextRequest) {
   // Composite-token auth: same `verifyConnectToken(secret, username,
   // env)` shape as the register / ping routes. The CLI sends the
   // full `<github_username>:<DEVPOD_CONNECT_SECRET>` it stashed at
-  // ~/.night-pr-reviewer/.token; we bind the secret half to the
+  // ~/.lyncas/.token; we bind the secret half to the
   // username from the query so a token can't write to another
   // user's row.
   if (
@@ -183,7 +183,7 @@ export async function DELETE(req: NextRequest) {
   }
 
   // DELETE carries no body, so the secret lives in the query string.
-  // Mirrors how npr --clear posts the call (a single curl/urllib
+  // Mirrors how lyncas --clear posts the call (a single curl/urllib
   // request from the user's DevPod, no extra round trip needed).
   const url = new URL(req.url);
   const secret = url.searchParams.get("secret");

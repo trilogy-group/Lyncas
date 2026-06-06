@@ -63,7 +63,7 @@ function SocialIcons() {
   return (
     <div className="hidden md:flex items-center gap-3 text-muted">
       <a
-        href="https://github.com/HarshBti1805/night-pr-reviewer"
+        href="https://github.com/trilogy-group/Lyncas"
         target="_blank"
         rel="noreferrer"
         aria-label="GitHub"

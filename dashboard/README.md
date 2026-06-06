@@ -76,7 +76,7 @@ every dashboard view is bookmarkable.
 
 ## Production deploy (Vercel)
 
-1. Import the `Night-PR-Reviewer` repo on Vercel.
+1. Import the `Lyncas` repo on Vercel.
 2. **Project settings → General → Root Directory** → set to `dashboard`.
    This tells Vercel to ignore the `agent/` Python code and only build the
    Next.js app.
@@ -143,7 +143,7 @@ Required env vars on Vercel:
   that created it, so when the agent repo and the target repos live
   under different accounts you need one PAT per account.
 - `AGENT_REPO` — `<owner>/<repo>` of the agent repo (the one that hosts
-  `pr-review.yml`), e.g. `HarshBti1805/Night-PR-Reviewer`. **Not** the
+  `pr-review.yml`), e.g. `trilogy-group/Lyncas`. **Not** the
   repo a PR was opened against.
 
 Optional overrides:

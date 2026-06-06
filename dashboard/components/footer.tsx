@@ -32,7 +32,7 @@ const COLUMNS: FooterColumn[] = [
       { label: "Changelog", href: "/landing#changelog" },
       {
         label: "GitHub",
-        href: "https://github.com/HarshBti1805/night-pr-reviewer",
+        href: "https://github.com/trilogy-group/Lyncas",
         external: true,
       },
     ],
@@ -45,7 +45,7 @@ const COLUMNS: FooterColumn[] = [
       { label: "Terms", href: "/landing#terms" },
       {
         label: "GitHub",
-        href: "https://github.com/HarshBti1805/night-pr-reviewer",
+        href: "https://github.com/trilogy-group/Lyncas",
         external: true,
       },
     ],

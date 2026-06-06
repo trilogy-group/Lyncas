@@ -1,4 +1,4 @@
-# night-pr-webhook.service
+# lyncas-webhook.service
 #
 # systemd unit file for the Lyncas webhook handler. Drop it
 # into the appropriate systemd directory, reload, enable, start. The
@@ -8,23 +8,23 @@
 # --------------------------------------------------------------------
 # System service install (recommended on EC2)
 # --------------------------------------------------------------------
-#   sudo cp agent/night-pr-webhook.service /etc/systemd/system/
+#   sudo cp agent/lyncas-webhook.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
-#   sudo systemctl enable --now night-pr-webhook
-#   sudo systemctl status night-pr-webhook
-#   sudo journalctl -u night-pr-webhook -f       # tail logs
+#   sudo systemctl enable --now lyncas-webhook
+#   sudo systemctl status lyncas-webhook
+#   sudo journalctl -u lyncas-webhook -f       # tail logs
 #
 # --------------------------------------------------------------------
 # User service install (no sudo)
 # --------------------------------------------------------------------
 #   mkdir -p ~/.config/systemd/user
-#   cp agent/night-pr-webhook.service ~/.config/systemd/user/
+#   cp agent/lyncas-webhook.service ~/.config/systemd/user/
 #   # Comment out the User= line below before installing as --user.
 #   loginctl enable-linger "$USER"               # so the service survives logout
 #   systemctl --user daemon-reload
-#   systemctl --user enable --now night-pr-webhook
-#   systemctl --user status night-pr-webhook
-#   journalctl --user -u night-pr-webhook -f
+#   systemctl --user enable --now lyncas-webhook
+#   systemctl --user status lyncas-webhook
+#   journalctl --user -u lyncas-webhook -f
 #
 # --------------------------------------------------------------------
 # Per-host tuning
@@ -32,7 +32,7 @@
 # Adjust the three absolute paths (User=, WorkingDirectory=,
 # EnvironmentFile=, ExecStart=) for your EC2 user and checkout path.
 # The defaults assume `ubuntu` is the unprivileged service user and
-# the repo lives at /home/ubuntu/trilogy/Night-PR-Reviewer-v2 — the
+# the repo lives at /home/ubuntu/trilogy/Lyncas — the
 # same layout agent/start_webhook.sh assumes.
 #
 # To open port 8080 to GitHub's webhook delivery range, configure your
@@ -41,7 +41,7 @@
 
 [Unit]
 Description=Lyncas webhook handler (EC2)
-Documentation=https://github.com/trilogy-group/Night-PR-Reviewer-v2
+Documentation=https://github.com/trilogy-group/Lyncas
 After=network-online.target
 Wants=network-online.target
 
@@ -49,15 +49,15 @@ Wants=network-online.target
 Type=simple
 # Comment out User= when installing as a --user service.
 User=ubuntu
-WorkingDirectory=/home/ubuntu/trilogy/Night-PR-Reviewer-v2
+WorkingDirectory=/home/ubuntu/trilogy/Lyncas
 # EnvironmentFile honors KEY=value lines and ignores blank lines /
 # comments — same format the start_webhook.sh `. agent/.env` path
 # expects, so a single .env serves both bring-up paths.
-EnvironmentFile=/home/ubuntu/trilogy/Night-PR-Reviewer-v2/agent/.env
-ExecStart=/usr/bin/python3 /home/ubuntu/trilogy/Night-PR-Reviewer-v2/agent/webhook_handler.py
+EnvironmentFile=/home/ubuntu/trilogy/Lyncas/agent/.env
+ExecStart=/usr/bin/python3 /home/ubuntu/trilogy/Lyncas/agent/webhook_handler.py
 Restart=on-failure
 RestartSec=5
-# Send stdout/stderr to the journal so `journalctl -u night-pr-webhook`
+# Send stdout/stderr to the journal so `journalctl -u lyncas-webhook`
 # is the single observability surface. webhook_handler.py emits
 # structured [webhook] lines that grep well.
 StandardOutput=journal

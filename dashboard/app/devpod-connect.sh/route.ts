@@ -6,7 +6,7 @@ import { NextResponse } from "next/server";
 //   curl -fsSL https://<deploy>/devpod-connect.sh | bash
 //
 // It downloads the MCP server (served at /api/devpod/mcp-server),
-// drops a `devpod-connect` launcher into ~/.night-pr-reviewer, and
+// drops a `devpod-connect` launcher into ~/.lyncas, and
 // adds that directory to PATH. Idempotent on re-run.
 //
 // Served as text/plain so curl doesn't try to interpret a JSON
@@ -21,7 +21,7 @@ set -e
 echo "🔌 Lyncas — DevPod Connect v1"
 echo ""
 
-INSTALL_DIR="$HOME/.night-pr-reviewer"
+INSTALL_DIR="$HOME/.lyncas"
 DASHBOARD_URL="https://lyncas.vercel.app"
 
 for tool in curl python3; do
@@ -67,7 +67,7 @@ curl -fsSL "$DASHBOARD_URL/api/devpod/mcp-server" \\
 cat > "$INSTALL_DIR/devpod-connect" << 'SCRIPT'
 #!/bin/bash
 set -e
-INSTALL_DIR="$HOME/.night-pr-reviewer"
+INSTALL_DIR="$HOME/.lyncas"
 TOKEN="\${DEVPOD_CONNECT_TOKEN:-}"
 PORT="\${DEVPOD_MCP_PORT:-7777}"
 
@@ -86,7 +86,7 @@ if [ -z "$TOKEN" ]; then
   exit 1
 fi
 
-# Persist the token so the 'npr' CLI can auth without the user
+# Persist the token so the 'lyncas' CLI can auth without the user
 # having to re-export it on every shell. 0600 mode keeps it out of
 # the reach of other users on a shared box.
 umask 077
@@ -98,18 +98,18 @@ SCRIPT
 
 chmod +x "$INSTALL_DIR/devpod-connect"
 
-# Drop the 'npr' CLI alongside devpod-connect. It's a tiny Python
+# Drop the 'lyncas' CLI alongside devpod-connect. It's a tiny Python
 # script that POSTs to /api/chat with the persisted token; the user
-# can run: npr "what changed in the last 3 commits"
+# can run: lyncas "what changed in the last 3 commits"
 # from their DevPod terminal without leaving the shell.
-cat > "$INSTALL_DIR/npr" << 'NPR_SCRIPT'
+cat > "$INSTALL_DIR/lyncas" << 'LYNCAS_SCRIPT'
 #!/usr/bin/env python3
-"""npr — natural-language CLI for Lyncas.
+"""lyncas — natural-language CLI for Lyncas.
 
 Reads a question from argv (or stdin if none), detects the current
 repo from 'git remote get-url origin', and streams Claude's answer
 back to the terminal. Auth is the same DEVPOD_CONNECT_TOKEN that
-devpod-connect persists at ~/.night-pr-reviewer/.token.
+devpod-connect persists at ~/.lyncas/.token.
 
 Conversation history is persisted server-side via the
 /api/lyncas/history endpoint, keyed by (github_username, repo). Two
@@ -120,10 +120,10 @@ flags govern it:
                  and exit without sending a chat request
 
 Examples:
-  npr "review the current branch changes"
-  npr "what changed in the last 3 commits"
-  npr --no-history "explain this single error"
-  npr --clear
+  lyncas "review the current branch changes"
+  lyncas "what changed in the last 3 commits"
+  lyncas --no-history "explain this single error"
+  lyncas --clear
 
 This is intentionally pure stdlib — no requests, no rich, no httpx —
 so users don't have to pip-install anything inside the DevPod.
@@ -138,7 +138,7 @@ import urllib.parse
 import urllib.request
 
 DASHBOARD_URL = "https://lyncas.vercel.app"
-TOKEN_PATH = os.path.expanduser("~/.night-pr-reviewer/.token")
+TOKEN_PATH = os.path.expanduser("~/.lyncas/.token")
 NEWLINE = chr(10)
 FRAME_SEP = NEWLINE + NEWLINE
 
@@ -195,7 +195,7 @@ def username_from_token(token):
 def _history_url(username, repo, secret=None):
     """Build the /api/lyncas/history URL with the username + repo
     query parameters. secret is only appended when DELETE-ing
-    (the npr-history route reads it from the query string for
+    (the lyncas-history route reads it from the query string for
     DELETE and from the body for POST)."""
     q = {"username": username, "repo": repo}
     if secret is not None:
@@ -231,7 +231,7 @@ def load_history(username, repo):
         return out[-HISTORY_LIMIT:]
     except Exception as e:
         sys.stderr.write(
-            "[npr] history fetch failed (continuing without): "
+            "[lyncas] history fetch failed (continuing without): "
             + type(e).__name__ + ": " + str(e) + NEWLINE
         )
         return []
@@ -255,7 +255,7 @@ def save_history(username, repo, token, messages):
             r.read()
     except Exception as e:
         sys.stderr.write(
-            "[npr] history save failed (response not persisted): "
+            "[lyncas] history save failed (response not persisted): "
             + type(e).__name__ + ": " + str(e) + NEWLINE
         )
 
@@ -276,7 +276,7 @@ def clear_history(username, repo, token):
         return True
     except Exception as e:
         sys.stderr.write(
-            "[npr] history clear failed: "
+            "[lyncas] history clear failed: "
             + type(e).__name__ + ": " + str(e) + NEWLINE
         )
         return False
@@ -321,7 +321,7 @@ def stream_chat(message, repo, token, history):
                             try:
                                 evt = json.loads(body)
                                 if isinstance(evt, dict) and "error" in evt:
-                                    sys.stderr.write(NEWLINE + "[npr] error: " + str(evt["error"]) + NEWLINE)
+                                    sys.stderr.write(NEWLINE + "[lyncas] error: " + str(evt["error"]) + NEWLINE)
                                     return 2, "".join(captured)
                             except Exception:
                                 pass
@@ -333,12 +333,12 @@ def stream_chat(message, repo, token, history):
     except urllib.error.HTTPError as e:
         try:
             err = json.loads(e.read())
-            sys.stderr.write("[npr] HTTP " + str(e.code) + ": " + str(err.get("error", "")) + NEWLINE)
+            sys.stderr.write("[lyncas] HTTP " + str(e.code) + ": " + str(err.get("error", "")) + NEWLINE)
         except Exception:
-            sys.stderr.write("[npr] HTTP " + str(e.code) + NEWLINE)
+            sys.stderr.write("[lyncas] HTTP " + str(e.code) + NEWLINE)
         return 1, "".join(captured)
     except Exception as e:
-        sys.stderr.write("[npr] " + type(e).__name__ + ": " + str(e) + NEWLINE)
+        sys.stderr.write("[lyncas] " + type(e).__name__ + ": " + str(e) + NEWLINE)
         return 1, "".join(captured)
 
 
@@ -362,7 +362,7 @@ def main():
     repo = detect_repo()
     if not repo:
         sys.stderr.write(
-            "[npr] could not detect repo (no github origin?). "
+            "[lyncas] could not detect repo (no github origin?). "
             "Run inside a git checkout with a github.com remote." + NEWLINE
         )
         return 1
@@ -370,14 +370,14 @@ def main():
     token = load_token()
     if not token:
         sys.stderr.write(
-            "[npr] no token. Run devpod-connect first, or set "
+            "[lyncas] no token. Run devpod-connect first, or set "
             "DEVPOD_CONNECT_TOKEN." + NEWLINE
         )
         return 1
 
     username = username_from_token(token)
     if not username:
-        sys.stderr.write("[npr] could not parse username from token" + NEWLINE)
+        sys.stderr.write("[lyncas] could not parse username from token" + NEWLINE)
         return 1
 
     if clear_flag:
@@ -392,8 +392,8 @@ def main():
     if not remaining:
         if sys.stdin.isatty():
             sys.stderr.write(
-                "Usage: npr [--no-history|--clear] \\"your question\\"" + NEWLINE
-                + "       echo question | npr" + NEWLINE
+                "Usage: lyncas [--no-history|--clear] \\"your question\\"" + NEWLINE
+                + "       echo question | lyncas" + NEWLINE
             )
             return 64
         message = sys.stdin.read().strip()
@@ -401,7 +401,7 @@ def main():
         message = " ".join(remaining).strip()
 
     if not message:
-        sys.stderr.write("[npr] empty message" + NEWLINE)
+        sys.stderr.write("[lyncas] empty message" + NEWLINE)
         return 64
 
     # Load history unless explicitly opted out.
@@ -426,14 +426,14 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-NPR_SCRIPT
+LYNCAS_SCRIPT
 
-chmod +x "$INSTALL_DIR/npr"
+chmod +x "$INSTALL_DIR/lyncas"
 
 SHELL_RC="$HOME/.bashrc"
 [[ "$SHELL" == *zsh* ]] && SHELL_RC="$HOME/.zshrc"
-grep -q "night-pr-reviewer" "$SHELL_RC" 2>/dev/null || \\
-  echo 'export PATH="$HOME/.night-pr-reviewer:$PATH"' >> "$SHELL_RC"
+grep -q "lyncas" "$SHELL_RC" 2>/dev/null || \\
+  echo 'export PATH="$HOME/.lyncas:$PATH"' >> "$SHELL_RC"
 export PATH="$INSTALL_DIR:$PATH"
 
 echo ""
@@ -443,11 +443,11 @@ echo "Connect your DevPod:"
 echo "  devpod-connect --token YOUR_TOKEN"
 echo ""
 echo "Then ask the agent anything from your shell:"
-echo "  npr \\"what changed in the last 3 commits\\""
+echo "  lyncas \\"what changed in the last 3 commits\\""
 echo ""
 echo "Conversation history (per user, per repo) is on by default."
-echo "  npr --no-history \\"one-shot question\\"   # don't load/save"
-echo "  npr --clear                              # wipe this repo's"
+echo "  lyncas --no-history \\"one-shot question\\"   # don't load/save"
+echo "  lyncas --clear                              # wipe this repo's"
 echo ""
 echo "Token: $DASHBOARD_URL/dashboard/settings"
 `;

@@ -181,8 +181,8 @@ instead.
 ### 6. Idempotency depends on the GitHub PR comment marker
 
 `already_reviewed(repo, pr_number)` checks for
-`<!-- night-pr-reviewer:v1 -->` (REVIEW_MARKER) or
-`<!-- night-pr-reviewer:closed:v1 -->` (CLOSE_MARKER) in PR
+`<!-- lyncas:v1 -->` (REVIEW_MARKER) or
+`<!-- lyncas:closed:v1 -->` (CLOSE_MARKER) in PR
 comments. Don't change the marker strings without bumping the
 version suffix AND understanding that you'll re-review every
 historical PR on the first run after.
@@ -280,7 +280,7 @@ GMAIL_USER=... GMAIL_APP_PASSWORD=... DIGEST_RECIPIENT=... \
 python track_human_actions.py
 
 # 6. Run the prompt-tuner (will open a PR if there are ≥3 failures)
-GITHUB_REPOSITORY=owner/night-pr-reviewer python prompt_tuner.py
+GITHUB_REPOSITORY=trilogy-group/Lyncas python prompt_tuner.py
 
 # 7. Run the benchmark (manual, one-off — costs Opus tokens)
 python benchmark.py --latest 5

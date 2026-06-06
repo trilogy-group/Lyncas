@@ -40,7 +40,7 @@ a human approving the proposed PR.
   `digested_at IS NULL` rows, builds the HTML, sends via Gmail SMTP,
   inserts a `digests` row, then stamps `digested_at`. Order matters —
   digest row first so a partial failure leaves a recoverable trail.
-- **Idempotency via PR-comment marker.** `<!-- night-pr-reviewer:v1 -->`
+- **Idempotency via PR-comment marker.** `<!-- lyncas:v1 -->`
   in the comment body is how `already_reviewed()` decides whether to
   skip on the next cron tick. Cheap, no extra storage, immune to
   Supabase outages, and the user can't accidentally make us re-review
@@ -136,7 +136,7 @@ while shipping Phase 8.
 
 ### 1. Re-review on new commits
 
-- **What.** Today the agent bumps `<!-- night-pr-reviewer:v1 -->` and
+- **What.** Today the agent bumps `<!-- lyncas:v1 -->` and
   never re-touches a PR after that. New commits land in the same PR
   without a refreshed review. Bump the marker version per `head_sha`
   so each push triggers exactly one review.
@@ -145,7 +145,7 @@ while shipping Phase 8.
   highest-leverage feature gap because it directly degrades the
   agent's usefulness on the longest-lived PRs.
 - **Effort.** ~2 hrs. Change the marker to embed the head SHA
-  (`<!-- night-pr-reviewer:v1:<sha7> -->`), update `already_reviewed`
+  (`<!-- lyncas:v1:<sha7> -->`), update `already_reviewed`
   to match prefix + sha, add a unique `(repo, pr_number, head_sha)`
   index on `reviews`.
 - **Urgency condition.** Any week where ≥3 PRs in `human_actions`

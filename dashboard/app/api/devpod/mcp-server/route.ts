@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 // GET /api/devpod/mcp-server
 //
 // Returns the Python MCP server as text/plain. /devpod-connect.sh
-// curls this and writes it to ~/.night-pr-reviewer/mcp_server.py.
+// curls this and writes it to ~/.lyncas/mcp_server.py.
 //
 // The script:
 //   * spins up a local cloudflared tunnel,
@@ -47,7 +47,7 @@ def get_tunnel_url(port):
     # (None, None) here lets main() print a useful error instead
     # of leaving a dead Popen handle hanging around.
     cf_path = shutil.which("cloudflared") or \\
-              os.path.expanduser("~/.night-pr-reviewer/cloudflared")
+              os.path.expanduser("~/.lyncas/cloudflared")
     if not os.path.exists(cf_path):
         return None, None
     proc = subprocess.Popen(
@@ -228,7 +228,7 @@ class MCPHandler(BaseHTTPRequestHandler):
                 # Same lookup rule as get_tunnel_url — system PATH
                 # first, then the no-sudo install-dir fallback.
                 cf_path = shutil.which("cloudflared") or \\
-                          os.path.expanduser("~/.night-pr-reviewer/cloudflared")
+                          os.path.expanduser("~/.lyncas/cloudflared")
                 if not os.path.exists(cf_path):
                     self._json(500, {
                         "error": "cloudflared not found. Re-run the install script.",

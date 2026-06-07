@@ -41,6 +41,7 @@ export default async function DashboardLayout({
         displayName={
           profile?.display_name ?? profile?.github_username ?? null
         }
+        githubUsername={profile?.github_username ?? null}
         avatarUrl={profile?.avatar_url ?? null}
       />
       {children}

@@ -2,6 +2,7 @@ import { redirect } from "next/navigation";
 import { ExternalLinkButton } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Container } from "@/components/ui/container";
+import { GridBackdrop } from "@/components/ui/grid-backdrop";
 import { SectionHeading } from "@/components/ui/section-heading";
 import { ReportCard } from "@/components/report-card";
 import { getPrReports, getWatchedRepos } from "@/lib/queries";
@@ -62,18 +63,18 @@ export default async function DashboardReportsPage() {
   }
 
   return (
-    <Container className="py-10 space-y-8">
+    <div className="relative">
+      <GridBackdrop tone="amber" />
+      <Container className="relative py-10 space-y-8">
       <SectionHeading
         eyebrow="Reports"
-        title="Per-PR analysis at a glance"
+        title="ANALYSIS REPORTS"
         subtitle={
           reports.length === 0
             ? "Reports are generated automatically when PRs are opened on connected repositories."
-            : `${reports.length} ${
-                reports.length === 1 ? "report" : "reports"
-              } across ${watched.length} ${
-                watched.length === 1 ? "repo" : "repos"
-              }, grouped by merge recommendation.`
+            : `${reports.length} ${reports.length === 1 ? "report" : "reports"
+            } across ${watched.length} ${watched.length === 1 ? "repo" : "repos"
+            }, grouped by merge recommendation.`
         }
       />
 
@@ -157,6 +158,7 @@ export default async function DashboardReportsPage() {
           </div>
         </>
       )}
-    </Container>
+      </Container>
+    </div>
   );
 }

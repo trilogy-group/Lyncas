@@ -190,6 +190,90 @@ h1, h2, h3, h4 {
   background-size: 22px 22px;
 }
 
+/* ------------------------------------------------------------------ */
+/* Grid backdrop — a blueprint grid with a warm top glow that fades    */
+/* into the black background as the page scrolls. Anchored to the top  */
+/* of a `position: relative` page wrapper; scrolls away with content.  */
+/* Two layered pseudo-elements: ::before draws the grid lines (masked  */
+/* to fade downward), ::after lays a warm radial glow over the top.    */
+/* Used on the settings + docs surfaces.                               */
+/* ------------------------------------------------------------------ */
+.grid-backdrop {
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 640px;
+  z-index: -10;
+  pointer-events: none;
+  overflow: hidden;
+}
+.grid-backdrop::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.07) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.07) 1px, transparent 1px);
+  background-size: 46px 46px;
+  /* Fade the lines out toward the bottom so the grid melts into black. */
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0.9) 0%,
+    rgba(0, 0, 0, 0.55) 42%,
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0.9) 0%,
+    rgba(0, 0, 0, 0.55) 42%,
+    transparent 100%
+  );
+}
+/* The warm glow (default tone). Per-page variants below swap only the   color stops so the grid + fade stay identical. One distinct scheme   per surface. */
+.grid-backdrop::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(85% 60% at 42% -8%, rgba(255, 122, 60, 0.16), transparent 62%),
+    radial-gradient(55% 45% at 82% -4%, rgba(255, 70, 70, 0.10), transparent 60%);
+}
+/* Blue / violet — docs legacy alias. */
+.grid-backdrop--cool::after {
+  background:
+    radial-gradient(85% 60% at 38% -8%, rgba(96, 165, 250, 0.16), transparent 62%),
+    radial-gradient(55% 48% at 84% -4%, rgba(167, 139, 250, 0.12), transparent 60%);
+}
+/* Cyan / sky — analytics. */
+.grid-backdrop--cyan::after {
+  background:
+    radial-gradient(85% 60% at 40% -8%, rgba(45, 212, 191, 0.16), transparent 62%),
+    radial-gradient(55% 48% at 84% -4%, rgba(56, 189, 248, 0.12), transparent 60%);
+}
+/* Violet / indigo — docs. */
+.grid-backdrop--violet::after {
+  background:
+    radial-gradient(85% 60% at 40% -8%, rgba(167, 139, 250, 0.17), transparent 62%),
+    radial-gradient(55% 48% at 84% -4%, rgba(129, 140, 248, 0.12), transparent 60%);
+}
+/* Emerald / green — repositories. */
+.grid-backdrop--emerald::after {
+  background:
+    radial-gradient(85% 60% at 40% -8%, rgba(52, 211, 153, 0.15), transparent 62%),
+    radial-gradient(55% 48% at 84% -4%, rgba(110, 231, 183, 0.10), transparent 60%);
+}
+/* Amber / gold — reports. */
+.grid-backdrop--amber::after {
+  background:
+    radial-gradient(85% 60% at 40% -8%, rgba(245, 158, 11, 0.16), transparent 62%),
+    radial-gradient(55% 48% at 84% -4%, rgba(251, 191, 36, 0.11), transparent 60%);
+}
+/* Fuchsia / magenta — repositories. Distinct from analytics' cyan. */
+.grid-backdrop--fuchsia::after {
+  background:
+    radial-gradient(85% 60% at 40% -8%, rgba(217, 70, 239, 0.16), transparent 62%),
+    radial-gradient(55% 48% at 84% -4%, rgba(232, 121, 249, 0.11), transparent 60%);
+}
+
 .marquee-row {
   display: flex;
   gap: 4rem;

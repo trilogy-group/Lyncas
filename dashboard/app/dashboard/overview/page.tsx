@@ -1,32 +1,37 @@
 import Link from "next/link";
 import { ActivityChart } from "@/components/activity-chart";
+import { ExportReviewsButton } from "@/components/export-reviews-button";
 import { Filters } from "@/components/filters";
+import { MetricCard } from "@/components/metric-card";
 import { ReviewsTable } from "@/components/reviews-table";
 import { SeverityChart } from "@/components/severity-chart";
 import { Container } from "@/components/ui/container";
+import { GridBackdrop } from "@/components/ui/grid-backdrop";
+import { Sparkline } from "@/components/ui/sparkline";
 import { Stagger, StaggerItem } from "@/components/ui/motion";
-import { SectionHeading } from "@/components/ui/section-heading";
-import { StatCard } from "@/components/ui/stat-card";
-import { Table, TableBody, TableHeader, Td, Th } from "@/components/ui/table";
+import { TableBody, TableHeader, Td, Th } from "@/components/ui/table";
 import { formatCost, severityColor, severityColors } from "@/lib/design";
 import {
-  getAccuracyStats,
   getActivityByDay,
   getAvailableRepos,
+  getOverviewMetrics,
   getRecentReviews,
   getRepoStats,
+  getRepoTrends,
   getSeverityDistribution,
-  getStats,
 } from "@/lib/queries";
 import type { Action, Verdict } from "@/lib/types";
 
-// /dashboard/overview — the authenticated user's "everything the agent
-// has seen" surface. Black/E2B v3 aesthetic, with one inverted stat
-// card (Total reviews) to break up the row visually.
+// /dashboard/overview — analytics surface. KPI cards with
+// period-over-period deltas, an activity area chart + severity
+// histogram, a per-repo table with inline trend sparklines, and the
+// filterable / paginated recent-reviews feed.
 
 export const dynamic = "force-dynamic";
 
-const PAGE_SIZE = 25;
+const PAGE_SIZE = 10;
+const WINDOW_DAYS = 30;
+const TREND_DAYS = 14;
 const VERDICTS: readonly Verdict[] = ["approve", "request_changes", "comment"];
 const ACTIONS: readonly Action[] = ["commented", "closed"];
 
@@ -43,6 +48,25 @@ interface SearchParams {
 
 function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, n));
+}
+
+function pctText(deltaPct: number | null): string | null {
+  if (deltaPct === null || Math.abs(deltaPct) < 0.5) return null;
+  return `${Math.abs(deltaPct).toFixed(0)}%`;
+}
+
+// Direction of a sparkline series: compare the recent half's volume to
+// the earlier half. Returns the severity-ramp color so the cell reads
+// green (rising) / red (falling) / muted (flat or empty).
+function trendColor(counts: number[]): string {
+  const total = counts.reduce((s, c) => s + c, 0);
+  if (total === 0) return "#3a3a3a";
+  const half = Math.floor(counts.length / 2);
+  const first = counts.slice(0, half).reduce((s, c) => s + c, 0);
+  const last = counts.slice(half).reduce((s, c) => s + c, 0);
+  if (last > first) return severityColors.clean;
+  if (last < first) return severityColors.critical;
+  return "#9a9a9a";
 }
 
 export default async function DashboardOverviewPage({
@@ -66,9 +90,9 @@ export default async function DashboardOverviewPage({
   const minSeverity = sp.minSev ? clamp(Number(sp.minSev), 1, 10) : undefined;
   const maxSeverity = sp.maxSev ? clamp(Number(sp.maxSev), 1, 10) : undefined;
 
-  const [stats, recent, repos, repoStats, severity, activity, accuracy] =
+  const [metrics, recent, repos, repoStats, repoTrends, severity, activity] =
     await Promise.all([
-      getStats(30),
+      getOverviewMetrics(WINDOW_DAYS),
       getRecentReviews({
         limit: PAGE_SIZE,
         offset: (page - 1) * PAGE_SIZE,
@@ -82,11 +106,12 @@ export default async function DashboardOverviewPage({
       }),
       getAvailableRepos(),
       getRepoStats(),
-      getSeverityDistribution(30),
-      getActivityByDay(30),
-      getAccuracyStats(30),
+      getRepoTrends(TREND_DAYS),
+      getSeverityDistribution(WINDOW_DAYS),
+      getActivityByDay(WINDOW_DAYS),
     ]);
 
+  const trendByRepo = new Map(repoTrends.map((t) => [t.repo, t.counts]));
   const totalPages = Math.max(1, Math.ceil(recent.totalCount / PAGE_SIZE));
 
   const baseSP = new URLSearchParams();
@@ -103,137 +128,240 @@ export default async function DashboardOverviewPage({
     recent.reviews.length === 0 ? 0 : (page - 1) * PAGE_SIZE + 1;
   const lastShown = (page - 1) * PAGE_SIZE + recent.reviews.length;
 
-  return (
-    <Container className="py-10 space-y-12">
-      <SectionHeading
-        eyebrow="Overview"
-        title="Everything the agent has seen"
-        subtitle="Live feed across every connected repository."
-      />
+  // Windowed page numbers around the current page (max 5 shown).
+  const pageWindow: number[] = [];
+  {
+    const span = 5;
+    let start = Math.max(1, page - Math.floor(span / 2));
+    const end = Math.min(totalPages, start + span - 1);
+    start = Math.max(1, end - span + 1);
+    for (let n = start; n <= end; n++) pageWindow.push(n);
+  }
 
-      {/* KPI row — one inverted card to break up the rhythm. */}
+  const repoCount = repoStats.length;
+
+  return (
+    <div className="relative">
+      <GridBackdrop tone="cyan" />
+      <Container size="wide" className="relative space-y-8 py-10">
+      {/* Header — mono eyebrow + title + meta, export action on the right. */}
+      <header className="flex flex-wrap items-end justify-between gap-4">
+        <div className="space-y-2">
+          <p className="text-[10px] font-mono uppercase tracking-[0.22em] text-muted-strong">
+            &gt; Overview
+          </p>
+          <h1 className="text-[30px] font-semibold leading-none tracking-[-0.02em] text-white">
+            ANALYTICS
+          </h1>
+          <p className="text-[11px] font-mono uppercase tracking-[0.12em] text-muted">
+            Last {WINDOW_DAYS} days across {repoCount}{" "}
+            {repoCount === 1 ? "repository" : "repositories"} · updated just now
+          </p>
+        </div>
+        <ExportReviewsButton reviews={recent.reviews} />
+      </header>
+
+      {/* KPI row. */}
       <Stagger className="grid grid-cols-2 gap-3 lg:grid-cols-5" whenInView>
         <StaggerItem>
-          <StatCard label="Total reviews" value={String(stats.totalReviews)} invert />
+          <MetricCard
+            label="Total reviews"
+            value={metrics.reviews.value.toLocaleString()}
+            glyph="comment"
+            delta={metrics.reviews.delta}
+            deltaText={pctText(metrics.reviews.deltaPct)}
+            hint={`vs prev ${WINDOW_DAYS}d`}
+          />
         </StaggerItem>
         <StaggerItem>
-          <StatCard
+          <MetricCard
             label="Auto-closed"
-            value={String(stats.totalClosed)}
-            accent={stats.totalClosed > 0 ? severityColors.critical : undefined}
+            value={metrics.closed.value.toLocaleString()}
+            glyph="bolt"
+            delta={metrics.closed.delta}
+            deltaText={
+              metrics.closed.delta !== 0
+                ? String(Math.abs(metrics.closed.delta))
+                : null
+            }
+            hint="3 gates passed"
           />
         </StaggerItem>
         <StaggerItem>
-          <StatCard
-            label="Avg severity (30d)"
-            value={stats.avgSeverity ? stats.avgSeverity.toFixed(1) : "—"}
-            hint="out of 10"
+          <MetricCard
+            label={`Avg severity ${WINDOW_DAYS}d`}
+            value={metrics.avgSeverity.value ? metrics.avgSeverity.value.toFixed(1) : "—"}
+            glyph="alert"
+            accent={
+              metrics.avgSeverity.value
+                ? severityColor(metrics.avgSeverity.value)
+                : undefined
+            }
+            delta={metrics.avgSeverity.delta}
+            deltaText={
+              Math.abs(metrics.avgSeverity.delta) >= 0.05
+                ? Math.abs(metrics.avgSeverity.delta).toFixed(1)
+                : null
+            }
+            lowerIsBetter
+            hint="lower is better"
           />
         </StaggerItem>
         <StaggerItem>
-          <StatCard
-            label="Est. cost (30d)"
-            value={formatCost(stats.estimatedCostUSD)}
-            hint="claude opus-4-5"
+          <MetricCard
+            label={`Est. cost ${WINDOW_DAYS}d`}
+            value={formatCost(metrics.cost.value)}
+            glyph="dollar"
+            delta={metrics.cost.delta}
+            deltaText={pctText(metrics.cost.deltaPct)}
+            hint="usage-based"
           />
         </StaggerItem>
         <StaggerItem>
-          <StatCard
-            label="Agent accuracy (30d)"
+          <MetricCard
+            label={`Agent accuracy ${WINDOW_DAYS}d`}
             value={
-              accuracy.total_non_pending > 0
-                ? `${accuracy.accuracy_pct.toFixed(0)}%`
+              metrics.accuracy.total > 0
+                ? `${metrics.accuracy.value.toFixed(0)}%`
                 : "—"
             }
-            hint={
-              accuracy.total_non_pending > 0
-                ? `${accuracy.agreements} / ${accuracy.total_non_pending}`
-                : "no settled obs yet"
-            }
+            glyph="gauge"
             accent={
-              accuracy.total_non_pending > 0 && accuracy.accuracy_pct < 95
+              metrics.accuracy.total > 0 && metrics.accuracy.value < 95
                 ? severityColors.serious
                 : undefined
+            }
+            delta={metrics.accuracy.total > 0 ? metrics.accuracy.delta : null}
+            deltaText={
+              metrics.accuracy.total > 0 && Math.abs(metrics.accuracy.delta) >= 0.5
+                ? `${Math.abs(metrics.accuracy.delta).toFixed(0)}%`
+                : null
+            }
+            hint={
+              metrics.accuracy.total > 0
+                ? `${metrics.accuracy.agreements} / ${metrics.accuracy.total} kept`
+                : "no settled obs yet"
             }
           />
         </StaggerItem>
       </Stagger>
 
+      {/* Charts. */}
+      <section className="grid gap-4 lg:grid-cols-5">
+        <div className="lg:col-span-3">
+          <ActivityChart data={activity} days={WINDOW_DAYS} />
+        </div>
+        <div className="lg:col-span-2">
+          <SeverityChart data={severity} />
+        </div>
+      </section>
+
+      {/* By repository. */}
       {repoStats.length > 0 && (
-        <section className="space-y-3">
-          <div className="flex flex-wrap items-end justify-between gap-2">
-            <div>
-              <h2 className="text-lg font-semibold text-white">By repo</h2>
-              <p className="text-[11px] text-muted font-mono uppercase tracking-[0.14em]">
-                {repoStats.length}
-                {repoStats.length === 1 ? " repo" : " repos"} watched
-              </p>
-            </div>
+        <section className="overflow-hidden rounded-md border border-border bg-card">
+          <div className="flex items-center justify-between gap-2 border-b border-border px-4 py-2.5">
+            <span className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-[0.18em] text-muted-strong">
+              <span className="text-muted/60" aria-hidden>
+                ≡×
+              </span>
+              By repository
+            </span>
             <Link
               href="/dashboard/repos"
-              className="text-[11px] font-mono uppercase tracking-[0.14em] text-muted hover:text-white transition-colors"
+              className="text-[10px] font-mono uppercase tracking-[0.14em] text-muted transition-colors hover:text-white"
             >
-              full breakdown →
+              {WINDOW_DAYS}d →
             </Link>
           </div>
-          <Table>
-            <TableHeader>
-              <tr>
-                <Th>Repo</Th>
-                <Th className="text-right">Reviews</Th>
-                <Th className="text-right">Closed</Th>
-                <Th className="text-right">Avg severity</Th>
-              </tr>
-            </TableHeader>
-            <TableBody>
-              {repoStats.map((r) => (
-                <tr key={r.repo} className="hover:bg-bg-elev transition-colors">
-                  <Td className="font-mono text-xs">
-                    <Link
-                      href={`/dashboard/overview?repo=${encodeURIComponent(r.repo)}`}
-                      className="text-white hover:underline underline-offset-4"
-                    >
-                      {r.repo}
-                    </Link>
-                  </Td>
-                  <Td className="text-right font-mono text-xs tabular-nums">
-                    {r.total_reviews}
-                  </Td>
-                  <Td
-                    className="text-right font-mono text-xs tabular-nums"
-                    style={
-                      r.total_closed > 0
-                        ? { color: severityColors.critical }
-                        : undefined
-                    }
-                  >
-                    {r.total_closed}
-                  </Td>
-                  <Td
-                    className="text-right font-mono text-xs tabular-nums"
-                    style={
-                      r.avg_severity
-                        ? { color: severityColor(r.avg_severity) }
-                        : undefined
-                    }
-                  >
-                    {r.avg_severity ? r.avg_severity.toFixed(1) : "—"}
-                  </Td>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <TableHeader>
+                <tr>
+                  <Th>Repository</Th>
+                  <Th className="text-right">Reviews</Th>
+                  <Th className="text-right">Auto-closed</Th>
+                  <Th className="text-right">Avg severity</Th>
+                  <Th className="text-right">Trend</Th>
                 </tr>
-              ))}
-            </TableBody>
-          </Table>
+              </TableHeader>
+              <TableBody>
+                {repoStats.map((r) => {
+                  const counts = trendByRepo.get(r.repo) ?? [];
+                  return (
+                    <tr
+                      key={r.repo}
+                      className="transition-colors hover:bg-bg-elev"
+                    >
+                      <Td className="font-mono text-xs">
+                        <Link
+                          href={`/dashboard/overview?repo=${encodeURIComponent(r.repo)}`}
+                          className="text-text underline-offset-4 hover:underline"
+                        >
+                          {r.repo}
+                        </Link>
+                      </Td>
+                      <Td className="text-right font-mono text-xs tabular-nums">
+                        {r.total_reviews}
+                      </Td>
+                      <Td
+                        className="text-right font-mono text-xs tabular-nums"
+                        style={
+                          r.total_closed > 0
+                            ? { color: severityColors.critical }
+                            : undefined
+                        }
+                      >
+                        {r.total_closed}
+                      </Td>
+                      <Td className="text-right">
+                        <span className="inline-flex items-center justify-end gap-1.5 font-mono text-xs tabular-nums">
+                          {r.avg_severity ? (
+                            <>
+                              <span
+                                className="inline-block h-1.5 w-1.5 rounded-full"
+                                style={{
+                                  backgroundColor: severityColor(r.avg_severity),
+                                }}
+                                aria-hidden
+                              />
+                              <span style={{ color: severityColor(r.avg_severity) }}>
+                                {r.avg_severity.toFixed(1)}
+                              </span>
+                            </>
+                          ) : (
+                            <span className="text-muted">—</span>
+                          )}
+                        </span>
+                      </Td>
+                      <Td className="text-right">
+                        <div className="flex justify-end">
+                          <Sparkline data={counts} color={trendColor(counts)} />
+                        </div>
+                      </Td>
+                    </tr>
+                  );
+                })}
+              </TableBody>
+            </table>
+          </div>
         </section>
       )}
 
-      <section className="space-y-4">
-        <div className="flex flex-wrap items-end justify-between gap-4">
-          <div>
-            <h2 className="text-lg font-semibold text-white">Recent reviews</h2>
-            <p className="text-[11px] text-muted font-mono uppercase tracking-[0.14em]">
-              {recent.totalCount} total · page {page} of {totalPages}
-            </p>
-          </div>
+      {/* Recent reviews. */}
+      <section className="overflow-hidden rounded-md border border-border bg-card">
+        <div className="flex items-center justify-between gap-2 border-b border-border px-4 py-2.5">
+          <span className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-[0.18em] text-muted-strong">
+            <span className="text-muted/60" aria-hidden>
+              ≡×
+            </span>
+            Recent reviews
+          </span>
+          <span className="text-[10px] font-mono uppercase tracking-[0.14em] text-muted">
+            {recent.totalCount} results
+          </span>
+        </div>
+
+        <div className="border-b border-border px-4 py-3">
           <Filters repos={repos} />
         </div>
 
@@ -242,37 +370,59 @@ export default async function DashboardOverviewPage({
           currentSort={sortBy}
           currentDir={sortDir}
           baseSearchParams={baseSP}
+          flush
         />
 
-        <div className="flex items-center justify-between text-[11px] font-mono uppercase tracking-[0.14em] text-muted">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-4 py-3 text-[11px] font-mono uppercase tracking-[0.14em] text-muted">
           <div>
-            showing {firstShown}–{lastShown} of {recent.totalCount}
+            {firstShown}–{lastShown} of {recent.totalCount}
           </div>
-          <div className="flex gap-2">
-            {page > 1 && (
+          <div className="flex items-center gap-1">
+            {page > 1 ? (
               <Link
                 href={pageLink(page - 1)}
-                className="rounded-sm border border-border px-3 py-1.5 hover:border-border-strong hover:text-white transition-colors"
+                aria-label="Previous page"
+                className="flex h-7 w-7 items-center justify-center rounded-sm border border-border text-muted transition-colors hover:border-border-strong hover:text-white"
               >
-                ← prev
+                ‹
               </Link>
+            ) : (
+              <span className="flex h-7 w-7 items-center justify-center rounded-sm border border-border/50 text-muted/30">
+                ‹
+              </span>
             )}
-            {page < totalPages && (
+            {pageWindow.map((n) => (
+              <Link
+                key={n}
+                href={pageLink(n)}
+                aria-current={n === page ? "page" : undefined}
+                className={
+                  "flex h-7 min-w-7 items-center justify-center rounded-sm border px-2 tabular-nums transition-colors " +
+                  (n === page
+                    ? "border-[#ffa760] text-[#ffa760]"
+                    : "border-border text-muted hover:border-border-strong hover:text-white")
+                }
+              >
+                {n}
+              </Link>
+            ))}
+            {page < totalPages ? (
               <Link
                 href={pageLink(page + 1)}
-                className="rounded-sm border border-border px-3 py-1.5 hover:border-border-strong hover:text-white transition-colors"
+                aria-label="Next page"
+                className="flex h-7 w-7 items-center justify-center rounded-sm border border-border text-muted transition-colors hover:border-border-strong hover:text-white"
               >
-                next →
+                ›
               </Link>
+            ) : (
+              <span className="flex h-7 w-7 items-center justify-center rounded-sm border border-border/50 text-muted/30">
+                ›
+              </span>
             )}
           </div>
         </div>
       </section>
-
-      <section className="grid gap-4 md:grid-cols-2">
-        <SeverityChart data={severity} />
-        <ActivityChart data={activity} />
-      </section>
-    </Container>
+      </Container>
+    </div>
   );
 }

@@ -2300,62 +2300,49 @@ function RepoDropdown({
 // Reads repo_rules.repo_directory_tree (anon-select per migration 009).
 // =========================================================================
 
-// Color-coded accents for the project-structure tree. Buckets are
-// deliberately coarse so the panel reads as a calm, scannable index
-// rather than a confetti of one-off colors.
-const TREE_FOLDER_COLOR = "#e3b341";
+// Project-structure tree icons. Monochrome, currentColor-driven so the
+// row controls tone (muted at rest, brighter on hover / when a folder is
+// open) — a calm, professional file explorer rather than a color grid.
 
-function fileAccent(name: string): string {
-  const ext = name.includes(".") ? name.split(".").pop()!.toLowerCase() : "";
-  if (
-    [
-      "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "rs", "rb",
-      "java", "kt", "php", "c", "cc", "cpp", "h", "hpp", "cs", "swift",
-      "scala", "sh", "bash", "zsh", "lua", "dart",
-    ].includes(ext)
-  )
-    return "#60a5fa"; // code → blue
-  if (
-    ["json", "yaml", "yml", "toml", "ini", "env", "lock", "xml", "cfg", "conf"].includes(ext)
-  )
-    return "#f59e0b"; // config / data → amber-orange
-  if (["css", "scss", "sass", "less", "styl"].includes(ext)) return "#ec4899"; // styles → pink
-  if (["md", "mdx", "txt", "rst", "pdf", "adoc", "license"].includes(ext))
-    return "#9ca3af"; // docs → gray
-  if (
-    ["png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "mp4", "mov", "avif"].includes(ext)
-  )
-    return "#a78bfa"; // media → purple
-  return "#6b7280"; // default → muted
-}
-
-function TreeFolderIcon({ color }: { color: string }) {
+// Open vs. closed folder — the open variant signals an expanded folder
+// the way a desktop file explorer does, so we don't need a chevron.
+function TreeFolderIcon({ open }: { open: boolean }) {
   return (
-    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden>
-      <path
-        d="M1.5 3.75A1.25 1.25 0 0 1 2.75 2.5h2.69c.33 0 .65.13.88.37l.94.94H13.25A1.25 1.25 0 0 1 14.5 5.06v6.19A1.25 1.25 0 0 1 13.25 12.5H2.75A1.25 1.25 0 0 1 1.5 11.25V3.75Z"
-        fill={color}
-        fillOpacity="0.22"
-        stroke={color}
-        strokeWidth="1.1"
-        strokeLinejoin="round"
-      />
+    <svg
+      width="15"
+      height="15"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      {open ? (
+        <path d="M6 14l1.45-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.55 6A2 2 0 0 1 18.45 20H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2" />
+      ) : (
+        <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
+      )}
     </svg>
   );
 }
 
-function TreeFileIcon({ color }: { color: string }) {
+function TreeFileIcon() {
   return (
-    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden>
-      <path
-        d="M4 1.75A.75.75 0 0 1 4.75 1H9l3.25 3.25v10A.75.75 0 0 1 11.5 15H4.75a.75.75 0 0 1-.75-.75V1.75Z"
-        fill={color}
-        fillOpacity="0.14"
-        stroke={color}
-        strokeWidth="1.1"
-        strokeLinejoin="round"
-      />
-      <path d="M8.75 1.25v3.25H12" stroke={color} strokeWidth="1.1" strokeLinejoin="round" />
+    <svg
+      width="15"
+      height="15"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+      <path d="M14 2v4a2 2 0 0 0 2 2h4" />
     </svg>
   );
 }
@@ -2423,8 +2410,27 @@ function buildTree(entries: TreeApiEntry[]): TreeNode[] {
   return root.children;
 }
 
-// One row in the explorer. Folders toggle their children in place;
-// files (and an on-hover icon on folders) link out to GitHub.
+// Vertical indent guides — one faint rail per ancestor level, stretched
+// to the row's full height so consecutive rows read as continuous lines
+// (the VS Code / Finder "tree guide" affordance from the reference).
+function IndentGuides({ depth }: { depth: number }) {
+  if (depth <= 0) return null;
+  return (
+    <>
+      {Array.from({ length: depth }).map((_, i) => (
+        <span
+          key={i}
+          className="w-[16px] shrink-0 self-stretch border-l border-border"
+          aria-hidden
+        />
+      ))}
+    </>
+  );
+}
+
+// One row in the explorer. Folders toggle their children in place (open
+// vs. closed folder icon signals state — no chevron); files and the
+// on-hover icon link out to GitHub.
 function TreeNodeRow({
   node,
   depth,
@@ -2441,17 +2447,9 @@ function TreeNodeRow({
   branch: string;
 }) {
   const isOpen = node.isDir && expanded.has(node.path);
-  const accent = node.isDir ? TREE_FOLDER_COLOR : fileAccent(node.name);
-  const ext =
-    !node.isDir && node.name.includes(".")
-      ? node.name.split(".").pop()!.toLowerCase()
-      : "";
   const ghUrl = `https://github.com/${repo}/${
     node.isDir ? "tree" : "blob"
   }/${branch}/${node.path}`;
-  // 8px base + 13px per level keeps deep nesting legible without running
-  // the labels off the right edge of a 220px rail.
-  const padLeft = 8 + depth * 13;
 
   if (!node.isDir) {
     return (
@@ -2459,27 +2457,20 @@ function TreeNodeRow({
         href={ghUrl}
         target="_blank"
         rel="noopener noreferrer"
-        style={{ paddingLeft: padLeft }}
-        className="group/row flex items-center gap-2 rounded-sm py-[3px] pr-1.5 transition-colors hover:bg-bg-elev"
+        className="group/row flex items-stretch pl-1"
         title={`Open ${node.path} on GitHub`}
       >
-        <span className="w-3 shrink-0" aria-hidden />
-        <span className="shrink-0">
-          <TreeFileIcon color={accent} />
-        </span>
-        <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-text/90">
-          {node.name}
-        </span>
-        {ext && (
-          <span
-            className="shrink-0 rounded-[3px] px-1 py-px font-mono text-[8.5px] uppercase tracking-[0.08em]"
-            style={{ color: accent, backgroundColor: accent + "1f" }}
-          >
-            {ext}
+        <IndentGuides depth={depth} />
+        <span className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-[5px] text-muted transition-colors group-hover/row:bg-bg-elev group-hover/row:text-text">
+          <span className="shrink-0 text-muted/80 transition-colors group-hover/row:text-text">
+            <TreeFileIcon />
           </span>
-        )}
-        <span className="shrink-0 text-muted opacity-0 transition-opacity group-hover/row:opacity-100">
-          <ArrowOutIcon />
+          <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-text/85 transition-colors group-hover/row:text-text">
+            {node.name}
+          </span>
+          <span className="shrink-0 opacity-0 transition-opacity group-hover/row:opacity-100">
+            <ArrowOutIcon />
+          </span>
         </span>
       </a>
     );
@@ -2497,45 +2488,33 @@ function TreeNodeRow({
             onToggleDir(node.path);
           }
         }}
-        style={{ paddingLeft: padLeft }}
-        className="group/row flex cursor-pointer items-center gap-2 rounded-sm py-[3px] pr-1.5 transition-colors hover:bg-bg-elev"
+        className="group/row flex cursor-pointer items-stretch pl-1"
         title={isOpen ? `Collapse ${node.name}` : `Expand ${node.name}`}
       >
-        <svg
-          width="9"
-          height="9"
-          viewBox="0 0 16 16"
-          fill="currentColor"
-          aria-hidden
-          className={
-            "shrink-0 text-muted transition-transform " +
-            (isOpen ? "rotate-90" : "rotate-0")
-          }
-        >
-          <path d="M5 3l6 5-6 5V3z" />
-        </svg>
-        <span className="shrink-0">
-          <TreeFolderIcon color={accent} />
-        </span>
-        <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] font-medium text-text">
-          {node.name}
-          <span className="text-muted">/</span>
-        </span>
-        {!isOpen && node.children.length > 0 && (
-          <span className="shrink-0 font-mono text-[9px] text-muted">
-            {node.children.length}
+        <IndentGuides depth={depth} />
+        <span className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-[5px] transition-colors group-hover/row:bg-bg-elev">
+          <span
+            className={
+              "shrink-0 transition-colors " +
+              (isOpen ? "text-text" : "text-muted/90 group-hover/row:text-text")
+            }
+          >
+            <TreeFolderIcon open={isOpen} />
           </span>
-        )}
-        <a
-          href={ghUrl}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={(e) => e.stopPropagation()}
-          title={`Open ${node.path} on GitHub`}
-          className="shrink-0 text-muted opacity-0 transition-opacity hover:text-text group-hover/row:opacity-100"
-        >
-          <ArrowOutIcon />
-        </a>
+          <span className="min-w-0 flex-1 truncate font-mono text-[12px] font-medium text-text/90">
+            {node.name}
+          </span>
+          <a
+            href={ghUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={(e) => e.stopPropagation()}
+            title={`Open ${node.path} on GitHub`}
+            className="shrink-0 text-muted opacity-0 transition-opacity hover:text-text group-hover/row:opacity-100"
+          >
+            <ArrowOutIcon />
+          </a>
+        </span>
       </div>
       {isOpen &&
         node.children.map((child) => (
@@ -2603,16 +2582,6 @@ function ProjectStructureCard({
     });
   }, []);
 
-  const expandAll = useCallback(() => {
-    const all = new Set<string>();
-    (apiEntries ?? []).forEach((e) => {
-      if (e.dir) all.add(e.path);
-    });
-    setExpanded(all);
-  }, [apiEntries]);
-
-  const collapseAll = useCallback(() => setExpanded(new Set()), []);
-
   return (
     <Card flush>
       <button
@@ -2640,8 +2609,7 @@ function ProjectStructureCard({
           <span className="flex items-center gap-1.5 font-mono text-[9px] text-muted">
             <span className="inline-flex items-center gap-1">
               <span
-                className="inline-block h-1.5 w-1.5 rounded-[1px]"
-                style={{ backgroundColor: TREE_FOLDER_COLOR }}
+                className="inline-block h-1.5 w-1.5 rounded-[1px] bg-text/70"
                 aria-hidden
               />
               {folderCount}
@@ -2671,26 +2639,10 @@ function ProjectStructureCard({
             </div>
           ) : ready ? (
             <div className="space-y-1.5">
-              <div className="flex items-center justify-between gap-2 px-1">
+              <div className="px-2">
                 <span className="font-mono text-[9px] uppercase tracking-[0.14em] text-muted">
                   {repo.split("/")[1] ?? repo}
                 </span>
-                <div className="flex items-center gap-1">
-                  <button
-                    type="button"
-                    onClick={expandAll}
-                    className="rounded-sm border border-border px-1.5 py-0.5 font-mono text-[8.5px] uppercase tracking-[0.12em] text-muted transition-colors hover:border-border-strong hover:text-text"
-                  >
-                    Expand
-                  </button>
-                  <button
-                    type="button"
-                    onClick={collapseAll}
-                    className="rounded-sm border border-border px-1.5 py-0.5 font-mono text-[8.5px] uppercase tracking-[0.12em] text-muted transition-colors hover:border-border-strong hover:text-text"
-                  >
-                    Collapse
-                  </button>
-                </div>
               </div>
               <div className="max-h-[420px] overflow-auto pr-0.5">
                 {nodes.map((node) => (

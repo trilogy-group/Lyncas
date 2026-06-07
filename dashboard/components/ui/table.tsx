@@ -7,12 +7,21 @@ import { clsx } from "clsx";
 export function Table({
   children,
   className,
+  flush = false,
 }: {
   children: React.ReactNode;
   className?: string;
+  /** Drop the table's own border/background so it can sit inside a
+   *  panel that already paints those (the analytics page does this). */
+  flush?: boolean;
 }) {
   return (
-    <div className="overflow-x-auto border border-border bg-card rounded-md">
+    <div
+      className={clsx(
+        "overflow-x-auto",
+        !flush && "border border-border bg-card rounded-md",
+      )}
+    >
       <table className={clsx("w-full text-sm", className)}>{children}</table>
     </div>
   );

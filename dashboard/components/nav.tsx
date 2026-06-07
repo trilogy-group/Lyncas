@@ -77,6 +77,7 @@ export async function Nav() {
     navUser = {
       email: profile?.email ?? user.email ?? null,
       displayName: profile?.display_name ?? profile?.github_username ?? null,
+      githubUsername: profile?.github_username ?? null,
       avatarUrl: profile?.avatar_url ?? null,
     };
   }

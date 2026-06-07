@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { LinkButton } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Container } from "@/components/ui/container";
+import { GridBackdrop } from "@/components/ui/grid-backdrop";
 import { TerminalWindow } from "@/components/ui/terminal-window";
 import { severityColors, verdictColors } from "@/lib/design";
 
@@ -44,6 +45,18 @@ const SECTIONS: SectionSpec[] = [
   { id: "self-learning", label: "Self-learning" },
   { id: "faq", label: "FAQ" },
 ];
+
+// A small, harmonious accent palette for the docs figures / smart-art
+// (step timelines, feature grids, the pipeline diagram). Cycles by
+// index so adjacent items always differ — color carries meaning and
+// rhythm here rather than being purely decorative.
+const DOCS_ACCENTS = [
+  "#60a5fa", // blue
+  "#a78bfa", // violet
+  "#34d399", // teal-green
+  "#f59e0b", // amber
+  "#f472b6", // pink
+] as const;
 
 export default function DocsPage() {
   const [active, setActive] = useState<string>(SECTIONS[0].id);
@@ -89,7 +102,7 @@ export default function DocsPage() {
   }, []);
 
   return (
-    <div className="bg-noise">
+    <div className="relative">
       {/* Reading progress -------------------------------------------- */}
       <motion.div
         style={{ scaleX: progress }}
@@ -97,10 +110,14 @@ export default function DocsPage() {
         aria-hidden
       />
 
+      {/* Grid backdrop — violet/indigo glow, fades into black -------- */}
+      <GridBackdrop tone="violet" />
+
+      <div className="bg-noise">
       {/* ----------------------------------------------------------- */}
       {/* Hero                                                         */}
       {/* ----------------------------------------------------------- */}
-      <section className="relative overflow-hidden border-b border-border dot-grid">
+      <section className="relative overflow-hidden border-b border-border">
         <Container size="wide" className="relative py-14 sm:py-20">
           <div className="grid items-center gap-12 lg:grid-cols-[minmax(0,1fr)_minmax(0,440px)]">
             <motion.div
@@ -260,6 +277,7 @@ export default function DocsPage() {
           </article>
         </div>
       </Container>
+      </div>
     </div>
   );
 }
@@ -338,29 +356,38 @@ function Lead({ children }: { children: React.ReactNode }) {
 }
 
 function FeatureGrid({ children }: { children: React.ReactNode }) {
+  const items = React.Children.toArray(children).filter(
+    React.isValidElement,
+  ) as React.ReactElement<FeatureCellProps>[];
   return (
     <div className="grid gap-px border border-border bg-border sm:grid-cols-2">
-      {children}
+      {items.map((child, i) =>
+        React.cloneElement(child, {
+          _accent: child.props._accent ?? DOCS_ACCENTS[i % DOCS_ACCENTS.length],
+        }),
+      )}
     </div>
   );
 }
 
-function FeatureCell({
-  title,
-  children,
-}: {
+interface FeatureCellProps {
   title: string;
   children: React.ReactNode;
-}) {
+  _accent?: string;
+}
+
+function FeatureCell({ title, children, _accent = "#ffffff" }: FeatureCellProps) {
   return (
-    <div className="group relative bg-bg p-5 transition-colors hover:bg-bg-elev">
+    <div className="group relative overflow-hidden bg-bg p-5 transition-colors hover:bg-bg-elev">
       <span
-        className="absolute inset-x-0 top-0 h-px bg-transparent transition-colors group-hover:bg-white/50"
+        className="absolute inset-x-0 top-0 h-[2px] opacity-0 transition-opacity group-hover:opacity-100"
+        style={{ backgroundColor: _accent }}
         aria-hidden
       />
       <h4 className="mb-1.5 flex items-center gap-2 text-sm font-semibold text-white">
         <span
-          className="h-1.5 w-1.5 shrink-0 bg-border-strong transition-colors group-hover:bg-white"
+          className="h-2 w-2 shrink-0 rounded-[2px] transition-transform group-hover:scale-125"
+          style={{ backgroundColor: _accent }}
           aria-hidden
         />
         {title}
@@ -380,7 +407,10 @@ function Steps({ children }: { children: React.ReactNode }) {
   return (
     <ol className="space-y-0">
       {items.map((child, i) =>
-        React.cloneElement(child, { _last: i === items.length - 1 }),
+        React.cloneElement(child, {
+          _last: i === items.length - 1,
+          _accent: child.props._accent ?? DOCS_ACCENTS[i % DOCS_ACCENTS.length],
+        }),
       )}
     </ol>
   );
@@ -391,16 +421,36 @@ interface StepProps {
   title: string;
   children: React.ReactNode;
   _last?: boolean;
+  _accent?: string;
 }
 
-function Step({ n, title, children, _last = false }: StepProps) {
+function Step({
+  n,
+  title,
+  children,
+  _last = false,
+  _accent = "#ffffff",
+}: StepProps) {
   return (
     <li className="flex gap-4">
       <div className="flex flex-col items-center">
-        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-sm border border-border bg-card font-mono text-sm font-bold tabular-nums text-white">
+        <div
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border font-mono text-sm font-bold tabular-nums"
+          style={{
+            color: _accent,
+            borderColor: _accent,
+            backgroundColor: _accent + "1a",
+          }}
+        >
           {n}
         </div>
-        {!_last && <div className="mt-1 w-px flex-1 bg-border" aria-hidden />}
+        {!_last && (
+          <div
+            className="mt-1 w-px flex-1"
+            style={{ backgroundColor: _accent + "40" }}
+            aria-hidden
+          />
+        )}
       </div>
       <div className={"space-y-1 pt-1 " + (_last ? "" : "pb-6")}>
         <h4 className="text-sm font-semibold text-white">{title}</h4>
@@ -477,23 +527,44 @@ function HowItWorks() {
       </Lead>
 
       <TerminalWindow title="Review pipeline" hint="EVENT → VERDICT">
-        <pre className="overflow-x-auto whitespace-pre font-mono text-[11px] leading-relaxed text-muted-strong">
-{`PR opened / synchronized
+        <pre className="overflow-x-auto whitespace-pre font-mono text-[11px] leading-relaxed text-muted">
+          <span style={{ color: DOCS_ACCENTS[0] }}>
+            PR opened / synchronized
+          </span>
+          {`
         │
         ▼
-GitHub webhook ──► Vercel function (verify HMAC, dispatch only)
+`}
+          <span style={{ color: DOCS_ACCENTS[1] }}>GitHub webhook</span>
+          {` ──► Vercel function (verify HMAC, dispatch only)
         │
         ▼
-GitHub Actions job  ──►  Python agent (pr_reviewer.py)
+`}
+          <span style={{ color: DOCS_ACCENTS[1] }}>GitHub Actions job</span>
+          {`  ──►  Python agent (pr_reviewer.py)
         │
         ▼
-LangGraph pipeline:
-   repo-context ─► reviewer ─► critic ─► [arbiter] ─► final
+`}
+          <span style={{ color: DOCS_ACCENTS[3] }}>LangGraph pipeline:</span>
+          {`
+   `}
+          <span style={{ color: DOCS_ACCENTS[3] }}>
+            repo-context ─► reviewer ─► critic ─► [arbiter] ─► final
+          </span>
+          {`
         │
         ▼
-Structured review comment posted to the PR
+`}
+          <span style={{ color: DOCS_ACCENTS[2] }}>
+            Structured review comment posted to the PR
+          </span>
+          {`
         │
-        ├─► (optional) auto-close behind 3 gates
+        ├─► `}
+          <span style={{ color: severityColors.critical }}>
+            (optional) auto-close behind 3 gates
+          </span>
+          {`
         └─► row written to Postgres ──► this dashboard`}
         </pre>
       </TerminalWindow>

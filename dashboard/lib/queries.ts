@@ -11,6 +11,7 @@ import type {
   HumanAction,
   HumanActionType,
   HumanActionWithReview,
+  OverviewMetrics,
   PrReport,
   PromptTunerRun,
   RepoResearch,
@@ -19,6 +20,7 @@ import type {
   RepoRulesStatus,
   GitHubAppInstallation,
   RepoStat,
+  RepoTrend,
   Review,
   Run,
   SandboxResult,
@@ -228,6 +230,157 @@ export async function getActivityByDay(
     if (byDay.has(day)) byDay.set(day, (byDay.get(day) ?? 0) + 1);
   }
   return Array.from(byDay.entries()).map(([date, count]) => ({ date, count }));
+}
+
+// --- Overview analytics: windowed KPIs with period-over-period deltas ----
+// One pair of round-trips (reviews + human_actions, each covering two
+// windows) feeds all five overview cards. We bucket current-vs-previous
+// in JS rather than firing ten separate count queries.
+
+function pctChange(cur: number, prev: number): number | null {
+  if (prev === 0) return null;
+  return ((cur - prev) / prev) * 100;
+}
+
+export async function getOverviewMetrics(
+  daysWindow = 30,
+): Promise<OverviewMetrics> {
+  const supabase = await createSupabaseServerClient();
+  const now = Date.now();
+  const since = new Date(now - daysWindow * 86_400_000).toISOString();
+  const sincePrev = new Date(now - 2 * daysWindow * 86_400_000).toISOString();
+
+  const [reviewsRes, actionsRes] = await Promise.all([
+    supabase
+      .from("reviews")
+      .select(
+        "created_at, action, severity_score, input_tokens, output_tokens, model",
+      )
+      .gte("created_at", sincePrev),
+    supabase
+      .from("human_actions")
+      .select("action_type, observed_at")
+      .gte("observed_at", sincePrev),
+  ]);
+
+  type ReviewRow = {
+    created_at: string;
+    action: string | null;
+    severity_score: number | null;
+    input_tokens: number | null;
+    output_tokens: number | null;
+    model: string | null;
+  };
+
+  const reviews = (reviewsRes.data ?? []) as ReviewRow[];
+
+  // Accumulators per window.
+  const cur = { n: 0, closed: 0, sevSum: 0, sevN: 0, cost: 0 };
+  const prv = { n: 0, closed: 0, sevSum: 0, sevN: 0, cost: 0 };
+  for (const r of reviews) {
+    const bucket = r.created_at >= since ? cur : prv;
+    bucket.n += 1;
+    if (r.action === "closed") bucket.closed += 1;
+    if (typeof r.severity_score === "number") {
+      bucket.sevSum += r.severity_score;
+      bucket.sevN += 1;
+    }
+    bucket.cost += rowCostUSD(r.model, r.input_tokens, r.output_tokens);
+  }
+
+  const curSev = cur.sevN ? cur.sevSum / cur.sevN : 0;
+  const prvSev = prv.sevN ? prv.sevSum / prv.sevN : 0;
+
+  // Accuracy per window: agreements / settled (non-pending) observations.
+  const actions = (actionsRes.data ?? []) as {
+    action_type: HumanActionType;
+    observed_at: string;
+  }[];
+  const accCur = { agree: 0, settled: 0 };
+  const accPrv = { agree: 0, settled: 0 };
+  for (const a of actions) {
+    const bucket = a.observed_at >= since ? accCur : accPrv;
+    if (AGREEMENT_TYPES.has(a.action_type)) {
+      bucket.agree += 1;
+      bucket.settled += 1;
+    } else if (FAILURE_TYPES.has(a.action_type)) {
+      bucket.settled += 1;
+    }
+  }
+  const curAcc = accCur.settled ? (accCur.agree / accCur.settled) * 100 : 0;
+  const prvAcc = accPrv.settled ? (accPrv.agree / accPrv.settled) * 100 : 0;
+
+  return {
+    reviews: {
+      value: cur.n,
+      prev: prv.n,
+      delta: cur.n - prv.n,
+      deltaPct: pctChange(cur.n, prv.n),
+    },
+    closed: {
+      value: cur.closed,
+      prev: prv.closed,
+      delta: cur.closed - prv.closed,
+      deltaPct: pctChange(cur.closed, prv.closed),
+    },
+    avgSeverity: {
+      value: curSev,
+      prev: prvSev,
+      delta: curSev - prvSev,
+      deltaPct: pctChange(curSev, prvSev),
+    },
+    cost: {
+      value: cur.cost,
+      prev: prv.cost,
+      delta: cur.cost - prv.cost,
+      deltaPct: pctChange(cur.cost, prv.cost),
+    },
+    accuracy: {
+      value: curAcc,
+      prev: prvAcc,
+      delta: curAcc - prvAcc,
+      deltaPct: pctChange(curAcc, prvAcc),
+      total: accCur.settled,
+      agreements: accCur.agree,
+    },
+  };
+}
+
+// Per-repo daily review counts for the overview "By repo" sparkline.
+// Returns one RepoTrend per repo, counts zero-filled to `daysWindow`
+// entries (oldest → newest).
+export async function getRepoTrends(daysWindow = 14): Promise<RepoTrend[]> {
+  const supabase = await createSupabaseServerClient();
+  const since = new Date(Date.now() - daysWindow * 86_400_000).toISOString();
+  const { data, error } = await supabase
+    .from("reviews")
+    .select("repo, created_at")
+    .gte("created_at", since);
+  if (error) return [];
+
+  // Map each YYYY-MM-DD in the window to its index in the counts array.
+  const dayIndex = new Map<string, number>();
+  for (let i = 0; i < daysWindow; i++) {
+    const d = new Date(Date.now() - (daysWindow - 1 - i) * 86_400_000);
+    dayIndex.set(d.toISOString().slice(0, 10), i);
+  }
+
+  const byRepo = new Map<string, number[]>();
+  for (const r of (data ?? []) as { repo: string; created_at: string }[]) {
+    const idx = dayIndex.get(r.created_at.slice(0, 10));
+    if (idx === undefined) continue;
+    let arr = byRepo.get(r.repo);
+    if (!arr) {
+      arr = new Array(daysWindow).fill(0);
+      byRepo.set(r.repo, arr);
+    }
+    arr[idx] += 1;
+  }
+
+  return Array.from(byRepo.entries()).map(([repo, counts]) => ({
+    repo,
+    counts,
+  }));
 }
 
 export async function getAvailableRepos(): Promise<string[]> {

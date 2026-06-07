@@ -115,6 +115,39 @@ export interface ActivityPoint {
   count: number;
 }
 
+// --- Overview analytics: windowed metrics with period-over-period deltas -
+// Backs the /dashboard/overview KPI cards. Each metric carries its current
+// 30d value, the prior 30d value, and a pre-computed delta so the cards can
+// render an up/down trend pill without re-deriving it in the view.
+
+export interface MetricDelta {
+  value: number;
+  prev: number;
+  // Percent change vs the previous window. null when prev is 0 (can't
+  // divide) — the card renders "new" / no pill in that case.
+  deltaPct: number | null;
+  // Absolute change vs the previous window (value - prev).
+  delta: number;
+}
+
+export interface OverviewMetrics {
+  reviews: MetricDelta;
+  closed: MetricDelta;
+  avgSeverity: MetricDelta;
+  cost: MetricDelta;
+  // Accuracy carries the raw numerator/denominator for the "kept / total"
+  // sub-label; total is the count of settled (non-pending) observations.
+  accuracy: MetricDelta & { total: number; agreements: number };
+}
+
+// Per-repo daily review counts over a short window, used to draw the
+// inline sparkline in the overview "By repo" table. `counts` is oldest
+// → newest and always has `window` entries (zero-filled).
+export interface RepoTrend {
+  repo: string;
+  counts: number[];
+}
+
 // Per-repo aggregate, shown on /repos and on the "By repo" overview section.
 // `total_reviews`, `total_closed`, `avg_severity`, and `last_reviewed_at` are
 // all-time. `estimated_cost_usd` is windowed to the last 30 days — Phase 4 of

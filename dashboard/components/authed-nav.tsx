@@ -11,6 +11,7 @@ import { NavBar, type NavLinkSpec, type NavUser } from "./nav-bar";
 interface AuthedNavProps {
   email: string | null;
   displayName: string | null;
+  githubUsername: string | null;
   avatarUrl: string | null;
 }
 
@@ -27,13 +28,19 @@ const LINKS: NavLinkSpec[] = [
   // mental model is "drill from a repo into its PRs"; ahead of
   // Settings because it's a daily-driver surface, not a setup one.
   { href: "/dashboard/reports", label: "Reports" },
-  { href: "/dashboard/settings", label: "Settings" },
-  // Docs — in-app reference for the whole product. Lives last in the
-  // nav because it's a "when you need it" surface, not a daily driver.
+  // Docs — in-app reference for the whole product. Sits ahead of
+  // Settings: it's a "when you need it" reference surface, whereas
+  // Settings is a setup-once destination that belongs last.
   { href: "/dashboard/docs", label: "Docs" },
+  { href: "/dashboard/settings", label: "Settings" },
 ];
 
-export function AuthedNav({ email, displayName, avatarUrl }: AuthedNavProps) {
-  const user: NavUser = { email, displayName, avatarUrl };
+export function AuthedNav({
+  email,
+  displayName,
+  githubUsername,
+  avatarUrl,
+}: AuthedNavProps) {
+  const user: NavUser = { email, displayName, githubUsername, avatarUrl };
   return <NavBar user={user} links={LINKS} />;
 }

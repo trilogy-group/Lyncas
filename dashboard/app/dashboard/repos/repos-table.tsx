@@ -211,7 +211,7 @@ function RepoTr({ r }: { r: RepoRow }) {
       </Td>
       <Td className="whitespace-nowrap text-right font-mono text-xs">
         <Link
-          href={`/repos/${r.repo}/settings`}
+          href={`/dashboard/repos/${r.repo}/settings`}
           className="text-white underline-offset-4 hover:underline"
           title={`Configure ${r.repo}`}
         >
@@ -238,3 +238,4 @@ function StatusPill({ enabled }: { enabled: boolean }) {
     </span>
   );
 }
+

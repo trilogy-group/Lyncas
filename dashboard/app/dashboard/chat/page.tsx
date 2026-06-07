@@ -13,6 +13,7 @@ import { motion } from "framer-motion";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Container } from "@/components/ui/container";
+import { GridBackdrop } from "@/components/ui/grid-backdrop";
 import { DevPodPanel } from "@/components/devpod-panel";
 import { SandboxTestCard } from "@/components/sandbox-test-card";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
@@ -1523,9 +1524,12 @@ function ChatPageInner() {
   // --- render: loading ----------------------------------------------------
   if (loading) {
     return (
-      <Container className="py-10">
-        <Card className="p-10 text-center text-muted text-sm">Loading…</Card>
-      </Container>
+      <div className="relative">
+        <GridBackdrop tone="cool" />
+        <Container className="relative py-10">
+          <Card className="p-10 text-center text-muted text-sm">Loading…</Card>
+        </Container>
+      </div>
     );
   }
 
@@ -1533,13 +1537,20 @@ function ChatPageInner() {
 
   // --- render: main 3-col layout ------------------------------------------
   return (
-    <Container size="wide" className="py-6">
+    <div className="relative">
+      <GridBackdrop tone="cool" />
+      <Container size="wide" className="relative py-6">
       <div className="flex flex-col gap-4 md:flex-row md:gap-4 md:h-[calc(100vh-7rem)] md:min-h-[560px]">
         {/* === LEFT: repo dropdown + quick actions === */}
         <aside className="hidden w-full shrink-0 flex-col gap-4 overflow-y-auto pr-1 md:flex md:w-[220px]">
           <Card className="p-3" flush>
             <div className="flex items-center justify-between px-1 pb-2 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
-              <span>Active room</span>
+              <span className="flex items-center gap-1.5">
+                <span aria-hidden className="text-muted/50">
+                  ☰ ✕
+                </span>
+                Active room
+              </span>
               <kbd
                 className="rounded-sm border border-border bg-bg-elev px-1 text-[9px] uppercase tracking-[0.14em] text-muted"
                 aria-hidden
@@ -1593,7 +1604,10 @@ function ChatPageInner() {
           />
 
           <Card className="p-3" flush>
-            <div className="px-1 pb-2 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
+            <div className="flex items-center gap-1.5 px-1 pb-2 text-[10px] font-mono uppercase tracking-[0.18em] text-muted">
+              <span aria-hidden className="text-muted/50">
+                ☰ ✕
+              </span>
               Quick actions
             </div>
             <QuickActionGrid
@@ -1985,7 +1999,8 @@ function ChatPageInner() {
           background: rgba(0, 0, 0, 0.04);
         }
       `}</style>
-    </Container>
+      </Container>
+    </div>
   );
 }
 

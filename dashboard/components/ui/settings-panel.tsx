@@ -111,12 +111,15 @@ export function Toggle({
   onChange,
   disabled = false,
   label,
+  color = "#ff8a3d",
 }: {
   checked: boolean;
   onChange: (next: boolean) => void;
   disabled?: boolean;
   /** Accessible label, since the visual label lives in the row title. */
   label: string;
+  /** On-state track color. Defaults to the dashboard orange accent. */
+  color?: string;
 }) {
   return (
     <button
@@ -130,7 +133,7 @@ export function Toggle({
         "relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40 focus-visible:ring-offset-2 focus-visible:ring-offset-black",
         disabled && "cursor-not-allowed opacity-50",
       )}
-      style={{ backgroundColor: checked ? "#ff8a3d" : "#3a3a3a" }}
+      style={{ backgroundColor: checked ? color : "#3a3a3a" }}
     >
       <span
         className={clsx(

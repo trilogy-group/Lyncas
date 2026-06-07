@@ -164,7 +164,7 @@ export default async function ReposPage() {
                   </Td>
                   <Td className="whitespace-nowrap text-right font-mono text-xs">
                     <Link
-                      href={`/repos/${r.repo}/settings`}
+                      href={`/dashboard/repos/${r.repo}/settings`}
                       className="text-text hover:underline underline-offset-4"
                       title={`Configure ${r.repo}`}
                     >

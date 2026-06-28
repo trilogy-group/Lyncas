@@ -19,14 +19,26 @@ MCP server through a sequence of commands:
                                persist the result row so the
                                dashboard doesn't show a stuck
                                "running…" spinner.
-  2. Install dependencies     — npm install / pip install -r ... whichever
-                               manifests are present. Best-effort.
-  3. Run the test suite       — MCP server's run_tests handler auto-detects
-                               the runner based on lockfiles.
-  4. Build                    — npm run build / go build / no-op for Python.
-                               Auto-detected by the MCP server's "build"
-                               handler with a 180s timeout (Next.js cold
-                               builds routinely take 60–120s).
+  1b. Detect the stack        — one probe round-trip lists the manifests /
+                               lockfiles in the tree; the orchestrator
+                               (NOT the MCP server) picks the package
+                               manager + the install / test / build
+                               commands. See _detect_command /
+                               _stack_commands. Supported: Node (npm /
+                               pnpm / yarn / bun), Python (requirements /
+                               pyproject / pipfile), Go, Rust, Java
+                               (maven / gradle), Ruby, PHP, .NET.
+  2. Install dependencies     — the detected stack's install command,
+                               with a 300s MCP timeout (cargo / maven /
+                               dotnet restores can be slow). Best-effort.
+  3. Run the test suite       — the detected stack's test command, sent
+                               explicitly to the MCP server's run_tests
+                               (300s). Exit-code-aware: a non-zero exit
+                               flags as failing even when the heuristic
+                               counter can't parse a count.
+  4. Build                    — the detected stack's build command via the
+                               MCP "build" handler (180s timeout). Python
+                               uses `compileall` as a cheap syntax check.
   5. Start the app (optional) — try canonical entrypoints across the three
                                supported stacks (Next.js, Python, Go) and
                                let the app pick its own port.
@@ -81,8 +93,10 @@ Env contract:
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -176,6 +190,29 @@ APP_BIND_TIMEOUT_SEC = 8
 
 GITHUB_API = "https://api.github.com"
 
+# --- Phase 4: Claude-generated tests --------------------------------------
+# Generation runs ONLY here (the EC2 / webhook path): the DevPod has no
+# Anthropic key (CLAUDE.md rule 5) and the Vercel route has no budget for a
+# Claude call + a test run. Generated tests are advisory — they never affect
+# the gate or the verdict — and live in a quarantined dir that is wiped with
+# the rest of the clone tree, so they never touch the author's branch.
+ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
+# Sonnet is plenty for scaffolding deterministic unit tests and ~5x cheaper
+# than Opus. Override with LYNCAS_GEN_TESTS_MODEL.
+GEN_TESTS_MODEL = os.environ.get(
+    "LYNCAS_GEN_TESTS_MODEL", "claude-sonnet-4-5"
+)
+# Quarantine directory (relative to the clone root) the generated tests are
+# written into. Chosen to be obviously non-authored so nobody mistakes it
+# for a real suite, and so a stray `git add .` would be a visible mistake.
+GEN_TESTS_DIR = "__lyncas_generated_tests__"
+# Bounds to keep token spend + round-trips predictable.
+MAX_GEN_SOURCE_FILES = 5
+MAX_GEN_FILE_BYTES = 6000
+MAX_GEN_FILES_WRITTEN = 3
+GEN_MAX_TOKENS = 4096
+
 
 # --- HTTP helper ----------------------------------------------------------
 
@@ -262,19 +299,286 @@ def _checkout_command(repo: str, pr_number: int, github_token: str) -> str:
     )
 
 
-def _install_command(pr_number: int) -> str:
-    """Best-effort dependency install across the three supported
-    stacks. The shell `(a || b || c || echo)` chain matches the
-    user's spec: try npm, then pip, then `go mod download`, then
-    no-op. The trailing `echo no deps` keeps the exit code zero so
-    we don't confuse a missing manifest with an install failure."""
+# --- Stack detection (Phase 2) -------------------------------------------
+#
+# Detection now lives in the orchestrator (here + the run-pr-tests route)
+# instead of the MCP server. The MCP server is a dumb executor that runs
+# whatever `command` we hand it (see mcp-server/route.ts). The flow is:
+#
+#   1. _detect_command(): a single shell probe that prints which manifests
+#      / lockfiles exist in the clone tree plus the raw package.json (for
+#      script parsing). One round-trip, no decisions made DevPod-side.
+#   2. _parse_detect(): turn that stdout into a {flag: bool} dict + parsed
+#      package.json scripts.
+#   3. _stack_commands(): pick the language + package manager and return
+#      the (label, install, test, build) command strings to run.
+#
+# Keep this matrix in lockstep with resolveStack() in
+# dashboard/app/api/devpod/run-pr-tests/route.ts — the EC2 path and the
+# chat-button path must detect identically or their verdicts drift.
+
+DETECT_DONE_MARKER = "LYNCAS_DETECT_DONE"
+
+# (flag key, filename) pairs probed by _detect_command. gradle + csproj
+# are handled separately because they need an OR / glob test.
+_DETECT_FILES = [
+    ("pkg", "package.json"),
+    ("pnpm_lock", "pnpm-lock.yaml"),
+    ("yarn_lock", "yarn.lock"),
+    ("bun_lock", "bun.lockb"),
+    ("npm_lock", "package-lock.json"),
+    ("requirements", "requirements.txt"),
+    ("pyproject", "pyproject.toml"),
+    ("setuppy", "setup.py"),
+    ("pipfile", "Pipfile"),
+    ("gomod", "go.mod"),
+    ("cargo", "Cargo.toml"),
+    ("gemfile", "Gemfile"),
+    ("pom", "pom.xml"),
+    ("composer", "composer.json"),
+]
+
+
+def _detect_command(pr_number: int) -> str:
+    """Single shell probe that emits a compact descriptor of the clone
+    tree on stdout. Each manifest/lockfile becomes a
+    `LYNCAS_DETECT:<key>=0|1` line; package.json (if present) is dumped
+    between LYNCAS_PKG_START/END markers so the orchestrator can parse
+    its `scripts`. Always exits 0 so a missing tree reads as "nothing
+    detected" rather than an error."""
     workdir = _clone_dir(pr_number)
+    parts = [f"cd {workdir} 2>/dev/null || exit 0"]
+    for key, fname in _DETECT_FILES:
+        parts.append(
+            f'( [ -f {fname} ] && echo "LYNCAS_DETECT:{key}=1" '
+            f'|| echo "LYNCAS_DETECT:{key}=0" )'
+        )
+    parts.append(
+        '( ( [ -f build.gradle ] || [ -f build.gradle.kts ] ) '
+        '&& echo "LYNCAS_DETECT:gradle=1" '
+        '|| echo "LYNCAS_DETECT:gradle=0" )'
+    )
+    parts.append(
+        '( ls *.csproj >/dev/null 2>&1 '
+        '&& echo "LYNCAS_DETECT:csproj=1" '
+        '|| echo "LYNCAS_DETECT:csproj=0" )'
+    )
+    parts.append(
+        '( [ -f package.json ] '
+        '&& ( echo LYNCAS_PKG_START; head -c 8000 package.json; '
+        'echo; echo LYNCAS_PKG_END ) || true )'
+    )
+    parts.append(f"echo {DETECT_DONE_MARKER}")
+    return " ; ".join(parts)
+
+
+def _parse_detect(stdout: str) -> dict[str, Any]:
+    """Parse _detect_command output into a flag dict. `_scripts` holds
+    the package.json scripts map (empty if absent / unparseable)."""
+    flags: dict[str, Any] = {}
+    pkg_lines: list[str] = []
+    in_pkg = False
+    for line in (stdout or "").splitlines():
+        s = line.strip()
+        if s == "LYNCAS_PKG_START":
+            in_pkg = True
+            continue
+        if s == "LYNCAS_PKG_END":
+            in_pkg = False
+            continue
+        if in_pkg:
+            pkg_lines.append(line)
+            continue
+        if s.startswith("LYNCAS_DETECT:"):
+            kv = s[len("LYNCAS_DETECT:"):]
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                flags[k] = v.strip() == "1"
+    scripts: dict[str, str] = {}
+    if pkg_lines:
+        try:
+            pkg = json.loads("\n".join(pkg_lines))
+            raw = pkg.get("scripts")
+            if isinstance(raw, dict):
+                scripts = {k: str(v) for k, v in raw.items()}
+        except Exception:
+            pass
+    flags["_scripts"] = scripts
+    return flags
+
+
+def _node_pm(flags: dict[str, Any]) -> str:
+    """Pick the JS package manager from the lockfile present, defaulting
+    to npm. Lockfile beats any `packageManager` field guess."""
+    if flags.get("pnpm_lock"):
+        return "pnpm"
+    if flags.get("yarn_lock"):
+        return "yarn"
+    if flags.get("bun_lock"):
+        return "bun"
+    return "npm"
+
+
+def _stack_commands(
+    pr_number: int, flags: dict[str, Any]
+) -> tuple[str, str, str, str]:
+    """Return (label, install_cmd, test_cmd, build_cmd) for the detected
+    stack. Every command is self-contained (cd into the workdir, redirect
+    stderr) so the caller can hand it straight to the MCP server.
+
+    Language precedence when a repo mixes manifests: Node → Python → Go →
+    Rust → Java → Ruby → PHP → .NET. The first match wins for the
+    test/build runner; this mirrors resolveStack() in the TS route."""
+    workdir = _clone_dir(pr_number)
+    cd = f"cd {workdir} && "
+    scripts = flags.get("_scripts", {}) or {}
+
+    def has_script(name: str) -> bool:
+        val = scripts.get(name, "")
+        if name == "test":
+            # npm's `init` placeholder isn't a real test command.
+            return bool(val) and "no test specified" not in val
+        return bool(val)
+
+    # --- Node / JS / TS ---
+    if flags.get("pkg"):
+        pm = _node_pm(flags)
+        if pm == "npm":
+            install = "npm install --no-audit --no-fund 2>&1"
+            run = "npm run"
+            test_script = "npm test"
+        elif pm == "pnpm":
+            install = (
+                "corepack pnpm install --frozen-lockfile 2>&1 "
+                "|| pnpm install 2>&1"
+            )
+            run = "pnpm run"
+            test_script = "pnpm test"
+        elif pm == "yarn":
+            install = (
+                "yarn install --frozen-lockfile 2>&1 || yarn install 2>&1"
+            )
+            run = "yarn run"
+            test_script = "yarn test"
+        else:  # bun
+            install = "bun install 2>&1"
+            run = "bun run"
+            test_script = "bun test"
+
+        if has_script("test"):
+            test = f"{test_script} 2>&1"
+        else:
+            # No test script — try the common runners' binaries via npx
+            # without triggering a network install.
+            test = (
+                "npx --no-install vitest run 2>&1 "
+                "|| npx --no-install jest 2>&1 "
+                "|| npx --no-install mocha 2>&1 "
+                '|| echo "no test runner detected"'
+            )
+        if has_script("build"):
+            build = f"{run} build 2>&1"
+        else:
+            build = 'echo "no build script in package.json"'
+        return f"Node ({pm})", cd + install, cd + test, cd + build
+
+    # --- Python ---
+    if (
+        flags.get("requirements")
+        or flags.get("pyproject")
+        or flags.get("setuppy")
+        or flags.get("pipfile")
+    ):
+        if flags.get("requirements"):
+            install = "pip install -r requirements.txt 2>&1"
+        elif flags.get("pyproject") or flags.get("setuppy"):
+            install = "pip install -e . 2>&1 || pip install . 2>&1"
+        else:  # pipfile
+            install = "pip install pipenv 2>&1 && pipenv install --dev 2>&1"
+        # pytest first; fall back to stdlib unittest discovery.
+        test = (
+            "python -m pytest -q 2>&1 "
+            "|| python -m unittest discover -v 2>&1"
+        )
+        # No universal build step; compileall is a cheap syntax check
+        # across the whole tree, which catches import-time SyntaxErrors
+        # the way a real build would.
+        build = "python -m compileall -q . 2>&1"
+        return "Python", cd + install, cd + test, cd + build
+
+    # --- Go ---
+    if flags.get("gomod"):
+        install = "go mod download 2>&1"
+        # -v so individual --- PASS/FAIL lines print (the heuristic
+        # counter keys on those); -race needs cgo so fall back without.
+        test = (
+            "go test ./... -v -race -cover 2>&1 "
+            "|| go test ./... -v -cover 2>&1"
+        )
+        build = "go build ./... 2>&1"
+        return "Go", cd + install, cd + test, cd + build
+
+    # --- Rust ---
+    if flags.get("cargo"):
+        return (
+            "Rust",
+            cd + "cargo fetch 2>&1",
+            cd + "cargo test 2>&1",
+            cd + "cargo build 2>&1",
+        )
+
+    # --- Java / Kotlin ---
+    if flags.get("pom"):
+        return (
+            "Java (maven)",
+            cd + "mvn -q -DskipTests dependency:resolve 2>&1 || true",
+            cd + "mvn -q test 2>&1",
+            cd + "mvn -q -DskipTests package 2>&1",
+        )
+    if flags.get("gradle"):
+        gw = "( [ -x ./gradlew ] && ./gradlew"
+        return (
+            "Java (gradle)",
+            cd + f"{gw} dependencies 2>&1 ) || gradle dependencies 2>&1 || true",
+            cd + f"{gw} test 2>&1 ) || gradle test 2>&1",
+            cd + f"{gw} build -x test 2>&1 ) || gradle build -x test 2>&1",
+        )
+
+    # --- Ruby ---
+    if flags.get("gemfile"):
+        return (
+            "Ruby",
+            cd + "bundle install 2>&1",
+            cd + "bundle exec rspec 2>&1 || bundle exec rake test 2>&1",
+            cd + 'echo "Ruby project — no build step"',
+        )
+
+    # --- PHP ---
+    if flags.get("composer"):
+        return (
+            "PHP",
+            cd + "composer install 2>&1",
+            cd
+            + "( [ -x ./vendor/bin/phpunit ] && ./vendor/bin/phpunit 2>&1 ) "
+            "|| composer test 2>&1",
+            cd + 'echo "PHP project — no build step"',
+        )
+
+    # --- .NET ---
+    if flags.get("csproj"):
+        return (
+            ".NET",
+            cd + "dotnet restore 2>&1",
+            cd + "dotnet test 2>&1",
+            cd + "dotnet build 2>&1",
+        )
+
+    # --- Unknown ---
     return (
-        f"cd {workdir} && "
-        f"( [ -f package.json ] && npm install --no-audit --no-fund 2>&1 || "
-        f"  [ -f requirements.txt ] && pip install -r requirements.txt 2>&1 || "
-        f"  [ -f go.mod ] && go mod download 2>&1 || "
-        f'  echo "no deps detected" )'
+        "unknown",
+        cd + 'echo "no deps detected"',
+        cd + 'echo "no test runner detected"',
+        cd + 'echo "no build needed"',
     )
 
 
@@ -421,38 +725,55 @@ def _truncate(text: str, limit: int = MAX_OUTPUT_BYTES) -> str:
 
 
 def _count_passed_failed(stdout: str) -> tuple[int, int]:
-    """Heuristic test-counter that handles the most common runners
-    without requiring structured output. Best-effort: a "no tests
-    detected" run reports zero and overall='no_tests' upstream.
+    """Heuristic test-counter spanning the runners in the Phase 2
+    matrix. Best-effort: a "no tests detected" run reports 0/0 and is
+    classified as no_tests upstream. Strategies are tried in order and
+    the first that yields a non-zero count wins, so a noisy log doesn't
+    double-count across formats.
 
     Recognized:
-      * jest:          "Tests:  3 failed, 7 passed"
-      * pytest:        "5 passed, 1 failed"
-      * mocha:         " 7 passing", " 2 failing"
-      * go test json:  one {"Action":"pass"} per package — counted
-                       if we see a {"Action":"pass" string, fall
-                       back to 0/0 otherwise.
+      * jest / pytest / cargo: "N passed", "M failed"
+      * mocha:                 "N passing", "M failing"
+      * go test -v:            per-test "--- PASS:" / "--- FAIL:" lines
+      * rspec:                 "N examples, M failures"
+      * dotnet:                "Passed: N", "Failed: M"
     """
-    import re
 
-    passed = 0
-    failed = 0
+    def first_int(pattern: str) -> int:
+        m = re.search(pattern, stdout)
+        return int(m.group(1)) if m else 0
 
-    m = re.search(r"(\d+)\s+passed", stdout)
-    if m:
-        passed = int(m.group(1))
-    m = re.search(r"(\d+)\s+failed", stdout)
-    if m:
-        failed = int(m.group(1))
-    if passed == 0 and failed == 0:
-        m = re.search(r"(\d+)\s+passing", stdout)
-        if m:
-            passed = int(m.group(1))
-        m = re.search(r"(\d+)\s+failing", stdout)
-        if m:
-            failed = int(m.group(1))
+    # 1. jest / pytest / cargo ("N passed; M failed").
+    passed = first_int(r"(\d+)\s+passed")
+    failed = first_int(r"(\d+)\s+failed")
+    if passed or failed:
+        return passed, failed
 
-    return passed, failed
+    # 2. mocha.
+    passed = first_int(r"(\d+)\s+passing")
+    failed = first_int(r"(\d+)\s+failing")
+    if passed or failed:
+        return passed, failed
+
+    # 3. go test -v — count the per-test result lines directly.
+    go_pass = len(re.findall(r"^--- PASS:", stdout, re.MULTILINE))
+    go_fail = len(re.findall(r"^--- FAIL:", stdout, re.MULTILINE))
+    if go_pass or go_fail:
+        return go_pass, go_fail
+
+    # 4. rspec.
+    examples = first_int(r"(\d+)\s+examples?")
+    failures = first_int(r"(\d+)\s+failures?")
+    if examples or failures:
+        return max(examples - failures, 0), failures
+
+    # 5. dotnet ("Passed!  - Failed: 0, Passed: 5, ...").
+    passed = first_int(r"Passed:\s*(\d+)")
+    failed = first_int(r"Failed:\s*(\d+)")
+    if passed or failed:
+        return passed, failed
+
+    return 0, 0
 
 
 def _looks_like_no_tests(stdout: str, stderr: str) -> bool:
@@ -467,15 +788,737 @@ def _looks_like_no_tests(stdout: str, stderr: str) -> bool:
     return any(n in blob for n in needles)
 
 
+# --- Phase 3: quality checks ----------------------------------------------
+#
+# Diff-aware static analysis, security, and coverage that run LEFT of the
+# preview gate. Every check is best-effort and tool-guarded: a missing
+# tool reads as "skip", never "fail". Only the diff secret scan is
+# blocking (configurable per repo); lint / type-check / audit / SAST /
+# coverage are advisory. The structured results are persisted in
+# pr_sandbox_results.checks (migration 022) and streamed to the chat card.
+#
+# Keep this mirrored with the equivalent logic in
+# dashboard/app/api/devpod/run-pr-tests/route.ts.
+
+CHECK_SKIP_MARKER = "LYNCAS_SKIP"
+
+# High-confidence secret patterns scanned against ADDED diff lines only.
+# Deliberately conservative — we'd rather miss a low-confidence match than
+# block a good PR on a false positive. (label, compiled regex).
+_SECRET_PATTERNS: list[tuple[str, Any]] = [
+    ("AWS access key id", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("GitHub token", re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}")),
+    ("Google API key", re.compile(r"AIza[0-9A-Za-z_\-]{35}")),
+    ("Slack token", re.compile(r"xox[baprs]-[0-9A-Za-z-]{10,}")),
+    ("Private key block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    (
+        "Hardcoded credential",
+        re.compile(
+            r"(?i)(api[_-]?key|secret|password|passwd|token|access[_-]?key)"
+            r"\s*[:=]\s*['\"][A-Za-z0-9_\-]{16,}['\"]"
+        ),
+    ),
+]
+
+
+def _fetch_pr_files(
+    repo: str, pr_number: int, token: str
+) -> list[dict[str, Any]]:
+    """Fetch the PR's changed files (filename + patch) via the GitHub API.
+
+    Used for diff awareness: the secret scan reads the added lines, and the
+    `diff.changed_files` count + SAST scoping read the paths. Robust against
+    the shallow clone (no git history needed). Returns [] on any failure —
+    diff-dependent checks then degrade to "skip" rather than throwing."""
+    if not token:
+        return []
+    status, data = _github_request(
+        "GET",
+        f"/repos/{repo}/pulls/{pr_number}/files?per_page=100",
+        token,
+    )
+    if status != 200 or not isinstance(data, list):
+        return []
+    return [f for f in data if isinstance(f, dict)]
+
+
+def _scan_secrets(files: list[dict[str, Any]]) -> dict[str, Any]:
+    """Regex-scan the ADDED lines of the PR diff for secrets. Newly-added
+    only (lines starting with '+'), so a pre-existing secret in the repo
+    doesn't block every PR. Returns a check dict; status 'skip' when there
+    were no files to scan (API miss)."""
+    if not files:
+        return {
+            "status": "skip",
+            "tool": "regex-diff",
+            "count": 0,
+            "findings": [],
+        }
+    findings: list[str] = []
+    seen: set[str] = set()
+    for f in files:
+        patch = f.get("patch") or ""
+        path = f.get("filename") or "?"
+        for line in patch.splitlines():
+            if not line.startswith("+") or line.startswith("+++"):
+                continue
+            content = line[1:]
+            for label, rx in _SECRET_PATTERNS:
+                if rx.search(content):
+                    key = f"{path}: {label}"
+                    if key not in seen:
+                        seen.add(key)
+                        findings.append(key)
+                    break
+    return {
+        "status": "fail" if findings else "pass",
+        "tool": "regex-diff",
+        "count": len(findings),
+        "findings": findings[:20],
+    }
+
+
+def _summarize_check(output: str, *, ok: bool) -> str:
+    """Compress a check's raw output into a one-line summary for the comment
+    / SSE. On success we say so; on failure we surface the last non-empty
+    line (usually the error tally)."""
+    if ok:
+        return "passed"
+    for line in reversed((output or "").splitlines()):
+        s = line.strip()
+        if s:
+            return s[:200]
+    return "failed"
+
+
+def _lint_command(cd: str, flags: dict[str, Any]) -> tuple[str, str] | None:
+    """(tool, command) for the detected stack's linter, or None to skip.
+    Each command echoes CHECK_SKIP_MARKER when the tool isn't installed so
+    the orchestrator can tell "no linter" from "lint failed"."""
+    skip = f"echo {CHECK_SKIP_MARKER}"
+    if flags.get("pkg"):
+        return "eslint", cd + (
+            "if npx --no-install eslint --version >/dev/null 2>&1; then "
+            f"npx --no-install eslint . 2>&1; else {skip}; fi"
+        )
+    if flags.get("requirements") or flags.get("pyproject") or flags.get(
+        "setuppy"
+    ) or flags.get("pipfile"):
+        return "ruff/flake8", cd + (
+            "if command -v ruff >/dev/null 2>&1; then ruff check . 2>&1; "
+            "elif command -v flake8 >/dev/null 2>&1; then flake8 2>&1; "
+            f"else {skip}; fi"
+        )
+    if flags.get("gomod"):
+        return "go vet", cd + "go vet ./... 2>&1"
+    if flags.get("cargo"):
+        return "clippy", cd + (
+            "if cargo clippy --version >/dev/null 2>&1; then "
+            f"cargo clippy 2>&1; else {skip}; fi"
+        )
+    return None
+
+
+def _typecheck_command(
+    cd: str, flags: dict[str, Any]
+) -> tuple[str, str] | None:
+    """(tool, command) for the detected stack's type-checker, or None."""
+    skip = f"echo {CHECK_SKIP_MARKER}"
+    if flags.get("pkg"):
+        return "tsc", cd + (
+            "if [ -f tsconfig.json ] && npx --no-install tsc --version "
+            ">/dev/null 2>&1; then npx --no-install tsc --noEmit 2>&1; "
+            f"else {skip}; fi"
+        )
+    if flags.get("requirements") or flags.get("pyproject") or flags.get(
+        "setuppy"
+    ) or flags.get("pipfile"):
+        return "mypy/pyright", cd + (
+            "if command -v mypy >/dev/null 2>&1; then mypy . 2>&1; "
+            "elif command -v pyright >/dev/null 2>&1; then pyright 2>&1; "
+            f"else {skip}; fi"
+        )
+    return None
+
+
+def _audit_command(cd: str, flags: dict[str, Any]) -> tuple[str, str] | None:
+    """(tool, command) for the detected stack's dependency-vulnerability
+    audit, or None. Advisory — a non-zero exit means vulns were found, not
+    that the PR is broken."""
+    skip = f"echo {CHECK_SKIP_MARKER}"
+    if flags.get("pkg"):
+        return "npm audit", cd + (
+            "if [ -f package-lock.json ]; then npm audit 2>&1; "
+            f"else {skip}; fi"
+        )
+    if flags.get("requirements") or flags.get("pyproject") or flags.get(
+        "setuppy"
+    ) or flags.get("pipfile"):
+        return "pip-audit", cd + (
+            "if command -v pip-audit >/dev/null 2>&1; then pip-audit 2>&1; "
+            f"else {skip}; fi"
+        )
+    if flags.get("gomod"):
+        return "govulncheck", cd + (
+            "if command -v govulncheck >/dev/null 2>&1; then "
+            f"govulncheck ./... 2>&1; else {skip}; fi"
+        )
+    if flags.get("cargo"):
+        return "cargo audit", cd + (
+            "if command -v cargo-audit >/dev/null 2>&1; then "
+            f"cargo audit 2>&1; else {skip}; fi"
+        )
+    return None
+
+
+def _sast_command(
+    cd: str, changed_files: list[str]
+) -> tuple[str, str] | None:
+    """(tool, command) for semgrep over the PR's changed files, or None when
+    nothing changed. EC2-only (the heavy check, per the plan's watch-out).
+    Skips itself when semgrep isn't installed."""
+    paths = [p for p in changed_files if p]
+    if not paths:
+        return None
+    # Quote each path; cap the count so a giant PR doesn't blow the arg list.
+    quoted = " ".join(f"'{p}'" for p in paths[:200])
+    skip = f"echo {CHECK_SKIP_MARKER}"
+    return "semgrep", cd + (
+        "if command -v semgrep >/dev/null 2>&1; then "
+        f"semgrep --config auto --error {quoted} 2>&1; else {skip}; fi"
+    )
+
+
+def _parse_coverage(test_output: str) -> dict[str, Any]:
+    """Opportunistically read a coverage percentage out of the test output
+    we already captured — no extra command run. Recognizes pytest-cov's
+    TOTAL line and Istanbul/jest's 'All files' row. Advisory; 'skip' when
+    no coverage was reported."""
+    if not test_output:
+        return {"status": "skip", "pct": None, "tool": "n/a"}
+    m = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+(?:\.\d+)?)%", test_output)
+    if m:
+        return {"status": "ok", "pct": float(m.group(1)), "tool": "pytest-cov"}
+    m = re.search(r"All files\s*\|\s*([\d.]+)", test_output)
+    if m:
+        try:
+            return {
+                "status": "ok",
+                "pct": float(m.group(1)),
+                "tool": "istanbul",
+            }
+        except ValueError:
+            pass
+    return {"status": "skip", "pct": None, "tool": "n/a"}
+
+
+# --- Phase 4: Claude-generated unit tests (advisory) ----------------------
+
+
+def _anthropic_generate(system: str, user: str) -> str | None:
+    """Call the Anthropic Messages API via urllib (keeps this module
+    stdlib-only, like the GitHub calls). Returns the concatenated text
+    blocks, or None on any failure / missing key."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        return None
+    body = json.dumps(
+        {
+            "model": GEN_TESTS_MODEL,
+            "max_tokens": GEN_MAX_TOKENS,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        ANTHROPIC_API,
+        data=body,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": ANTHROPIC_VERSION,
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            data = json.loads(r.read())
+        blocks = data.get("content") or []
+        texts = [
+            b.get("text", "")
+            for b in blocks
+            if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        joined = "\n".join(t for t in texts if t)
+        return joined or None
+    except Exception as e:
+        print(
+            f"[sandbox] gen-tests Anthropic call failed: "
+            f"{type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _gen_framework(flags: dict[str, Any]) -> str | None:
+    """Which generation pathway applies to the detected stack. Only Node
+    and Python are supported (the two most tractable to generate + run);
+    everything else returns None → skipped."""
+    if flags.get("pkg"):
+        return "node"
+    if (
+        flags.get("requirements")
+        or flags.get("pyproject")
+        or flags.get("setuppy")
+        or flags.get("pipfile")
+    ):
+        return "python"
+    return None
+
+
+def _select_source_files(
+    changed_files: list[str], flags: dict[str, Any]
+) -> list[str]:
+    """Pick the PR's changed *source* files worth generating tests for —
+    skips test files, type stubs, and vendored / build output. Capped to
+    MAX_GEN_SOURCE_FILES to bound the prompt size."""
+    node = bool(flags.get("pkg"))
+    out: list[str] = []
+    for f in changed_files:
+        low = f.lower()
+        base = low.rsplit("/", 1)[-1]
+        if any(
+            seg in low
+            for seg in (
+                "node_modules/",
+                "dist/",
+                "build/",
+                ".next/",
+                "vendor/",
+                "migrations/",
+            )
+        ):
+            continue
+        if node:
+            if not low.endswith(
+                (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+            ):
+                continue
+            if low.endswith(".d.ts"):
+                continue
+            if ".test." in base or ".spec." in base or "__tests__/" in low:
+                continue
+        else:
+            if not low.endswith(".py"):
+                continue
+            if (
+                base.startswith("test_")
+                or base.endswith("_test.py")
+                or low.startswith("tests/")
+                or "/tests/" in low
+            ):
+                continue
+        out.append(f)
+        if len(out) >= MAX_GEN_SOURCE_FILES:
+            break
+    return out
+
+
+def _read_remote_files(
+    tunnel_url: str, repo: str, cwd: str, paths: list[str]
+) -> dict[str, str]:
+    """Cat the given paths from the clone tree on the DevPod, bounded per
+    file. Returns {path: contents}. Used to give Claude the post-merge
+    source as context for test generation."""
+    if not paths:
+        return {}
+    parts = [f"cd {cwd} 2>/dev/null || exit 0"]
+    for p in paths:
+        parts.append(f"echo 'LYNCAS_FILE:{p}'")
+        parts.append(f"head -c {MAX_GEN_FILE_BYTES} '{p}' 2>/dev/null")
+        parts.append("echo ''")
+        parts.append("echo 'LYNCAS_FILE_END'")
+    resp = _post_execute(
+        tunnel_url,
+        {
+            "type": "run_command",
+            "repo": repo,
+            "command": " ; ".join(parts),
+            "timeout": 60,
+        },
+    )
+    files: dict[str, str] = {}
+    cur: str | None = None
+    buf: list[str] = []
+    for line in (resp.get("stdout", "") or "").splitlines():
+        if line.startswith("LYNCAS_FILE:"):
+            cur = line[len("LYNCAS_FILE:"):].strip()
+            buf = []
+        elif line.strip() == "LYNCAS_FILE_END":
+            if cur is not None:
+                files[cur] = "\n".join(buf).strip("\n")
+            cur, buf = None, []
+        elif cur is not None:
+            buf.append(line)
+    return files
+
+
+def _build_gen_prompt(
+    framework: str, js_runner: str, sources: dict[str, str]
+) -> tuple[str, str]:
+    """Compose (system, user) for the test-generation call. The user
+    message carries the changed source files + framework-specific import
+    guidance so the generated tests have the best chance of resolving."""
+    system = (
+        "You are a senior software engineer who writes focused, "
+        "deterministic unit tests. You output ONLY a single JSON object "
+        "and nothing else."
+    )
+    if framework == "node":
+        if js_runner == "vitest":
+            runner_note = (
+                "Use Vitest. Import helpers explicitly: "
+                "`import { describe, it, expect } from 'vitest';`."
+            )
+        else:
+            runner_note = (
+                "Use Jest. Rely on the injected globals "
+                "(describe / it / expect) — do NOT import the test runner."
+            )
+        import_note = (
+            "The test files will be saved under "
+            f"`{GEN_TESTS_DIR}/` at the repository root. Import the code "
+            "under test with a RELATIVE path from that directory and omit "
+            "the file extension — e.g. for source `src/util/math.ts` use "
+            "`import { add } from '../src/util/math';`."
+        )
+        lang_note = runner_note + " " + import_note
+    else:
+        lang_note = (
+            "Use pytest: plain functions named `test_*` using `assert`. "
+            "The test files will be saved under "
+            f"`{GEN_TESTS_DIR}/` at the repository root, and pytest runs "
+            "from the repo root — import source modules by their module "
+            "path from the root, e.g. for `pkg/foo.py` use "
+            "`from pkg.foo import thing`. If an import is ambiguous, write "
+            "the most plausible one anyway — an import error is itself "
+            "useful signal about an API break."
+        )
+
+    blocks = []
+    for path, content in sources.items():
+        blocks.append(f"=== FILE: {path} ===\n{content}")
+    files_blob = "\n\n".join(blocks)
+
+    user = (
+        "Write unit tests for the functions / exports that changed in this "
+        "PR, based on the source files below.\n\n"
+        f"Framework & imports: {lang_note}\n\n"
+        "Hard rules:\n"
+        "- Tests MUST be deterministic: no network, no real database, no "
+        "filesystem writes, no reliance on wall-clock time or unseeded "
+        "randomness.\n"
+        "- Only test behavior you can infer from the code shown; do not "
+        "invent APIs that aren't present.\n"
+        "- Prefer a few high-value tests over many shallow ones.\n\n"
+        "Respond with ONLY this JSON shape (no prose, no code fences):\n"
+        '{"tests": [{"path": "test_generated_<name>.<ext>", '
+        '"content": "<full file contents>"}]}\n'
+        f"At most {MAX_GEN_FILES_WRITTEN} files.\n\n"
+        f"Changed source files:\n\n{files_blob}"
+    )
+    return system, user
+
+
+def _safe_gen_path(p: Any) -> str | None:
+    """Sanitize a model-supplied test path so it can't escape the
+    quarantine dir. Allows a relative path of safe characters only."""
+    if not isinstance(p, str):
+        return None
+    p = p.strip().lstrip("/")
+    if not p or ".." in p.split("/"):
+        return None
+    if not re.match(r"^[A-Za-z0-9_][A-Za-z0-9_./-]*$", p):
+        return None
+    return p
+
+
+def _parse_gen_response(text: str) -> list[tuple[str, str]]:
+    """Pull the {"tests":[...]} payload out of Claude's response. Tolerant
+    of stray prose / code fences: we slice from the first '{' to the last
+    '}' and json.loads that."""
+    if not text:
+        return []
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return []
+    try:
+        obj = json.loads(text[start : end + 1])
+    except Exception:
+        return []
+    tests = obj.get("tests") if isinstance(obj, dict) else None
+    if not isinstance(tests, list):
+        return []
+    out: list[tuple[str, str]] = []
+    for item in tests:
+        if not isinstance(item, dict):
+            continue
+        path = _safe_gen_path(item.get("path"))
+        content = item.get("content")
+        if path and isinstance(content, str) and content.strip():
+            out.append((path, content))
+        if len(out) >= MAX_GEN_FILES_WRITTEN:
+            break
+    return out
+
+
+def _write_generated_tests(
+    tunnel_url: str, repo: str, cwd: str, files: list[tuple[str, str]]
+) -> int:
+    """Write the generated test files into the quarantine dir via base64
+    (avoids all shell-quoting pitfalls in the file content). Returns the
+    number of files written, or 0 on failure."""
+    parts = [f"mkdir -p '{cwd}/{GEN_TESTS_DIR}'"]
+    count = 0
+    for path, content in files:
+        full = f"{cwd}/{GEN_TESTS_DIR}/{path}"
+        parent = full.rsplit("/", 1)[0]
+        b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        parts.append(f"mkdir -p '{parent}'")
+        parts.append(f"echo '{b64}' | base64 -d > '{full}'")
+        count += 1
+    parts.append("echo GEN_WRITE_DONE")
+    resp = _post_execute(
+        tunnel_url,
+        {
+            "type": "run_command",
+            "repo": repo,
+            "command": " && ".join(parts),
+            "timeout": 60,
+        },
+    )
+    ok = bool(resp.get("success") is True or resp.get("exit_code") == 0)
+    if ok and "GEN_WRITE_DONE" in (resp.get("stdout", "") or ""):
+        return count
+    return 0
+
+
+def _run_generated_tests(
+    tunnel_url: str, repo: str, cwd: str, framework: str, js_runner: str
+) -> dict[str, Any]:
+    """Run the quarantined generated tests and return the raw MCP response.
+    Node tries the detected runner first, then the other (both are common);
+    Python uses pytest scoped to the quarantine dir."""
+    d = GEN_TESTS_DIR
+    if framework == "node":
+        if js_runner == "vitest":
+            cmd = (
+                f"cd {cwd} && ( npx --no-install vitest run {d} 2>&1 "
+                f"|| npx --no-install jest {d} 2>&1 )"
+            )
+        else:
+            cmd = (
+                f"cd {cwd} && ( npx --no-install jest {d} 2>&1 "
+                f"|| npx --no-install vitest run {d} 2>&1 )"
+            )
+    else:
+        cmd = f"cd {cwd} && python -m pytest {d} -q 2>&1"
+    return _post_execute(
+        tunnel_url,
+        {
+            "type": "run_command",
+            "repo": repo,
+            "command": cmd,
+            "timeout": 300,
+        },
+    )
+
+
+def _generate_tests_check(
+    tunnel_url: str,
+    repo: str,
+    cwd: str,
+    flags: dict[str, Any],
+    changed_files: list[str],
+) -> dict[str, Any]:
+    """Generate, write, and run advisory unit tests for the PR's diff.
+
+    Always returns a `generated` check dict; status is 'skip' for every
+    non-fatal off-ramp (no key, unsupported stack, nothing changed,
+    generation/write failed). 'fail' (advisory) means a generated test
+    failed or wouldn't import — `bug_candidate` flags those as seeds for
+    the auto-fix builder. Never blocks the gate or the verdict."""
+
+    def skip(summary: str, framework: str = "n/a") -> dict[str, Any]:
+        return {
+            "status": "skip",
+            "framework": framework,
+            "written": 0,
+            "passed": 0,
+            "failed": 0,
+            "summary": summary,
+            "bug_candidate": False,
+        }
+
+    if os.environ.get("DISABLE_GENERATED_TESTS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return skip("disabled")
+    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        return skip("no Anthropic key")
+    framework = _gen_framework(flags)
+    if framework is None:
+        return skip("unsupported stack")
+    sources = _select_source_files(changed_files, flags)
+    if not sources:
+        return skip("no changed source files", framework)
+
+    to_read = list(sources)
+    if framework == "node":
+        to_read.append("package.json")
+    contents = _read_remote_files(tunnel_url, repo, cwd, to_read)
+    src_contents = {p: c for p, c in contents.items() if p in sources and c}
+    if not src_contents:
+        return skip("could not read changed files", framework)
+
+    js_runner = "jest"
+    if framework == "node":
+        pkg = contents.get("package.json", "") or ""
+        if '"vitest"' in pkg:
+            js_runner = "vitest"
+        elif '"jest"' in pkg:
+            js_runner = "jest"
+    fw_label = js_runner if framework == "node" else "pytest"
+
+    system, user = _build_gen_prompt(framework, js_runner, src_contents)
+    text = _anthropic_generate(system, user)
+    if not text:
+        return skip("generation returned nothing", fw_label)
+    files = _parse_gen_response(text)
+    if not files:
+        return skip("no valid tests generated", fw_label)
+    written = _write_generated_tests(tunnel_url, repo, cwd, files)
+    if written <= 0:
+        return skip("failed to write generated tests", fw_label)
+
+    resp = _run_generated_tests(tunnel_url, repo, cwd, framework, js_runner)
+    out = (resp.get("stdout", "") or "") + "\n" + (resp.get("stderr", "") or "")
+    passed, failed = _count_passed_failed(out)
+    exit0 = bool(resp.get("success") is True or resp.get("exit_code") == 0)
+    low = out.lower()
+    import_err = any(
+        s in low
+        for s in (
+            "cannot find module",
+            "modulenotfounderror",
+            "no module named",
+            "importerror",
+            "syntaxerror",
+            "cannot resolve",
+        )
+    )
+
+    base = {"framework": fw_label, "written": written}
+    if import_err:
+        return {
+            **base,
+            "status": "fail",
+            "passed": passed,
+            "failed": failed,
+            "summary": (
+                "generated tests failed to import/compile "
+                "(possible API break or unresolved imports)"
+            ),
+            "bug_candidate": True,
+        }
+    if failed > 0:
+        return {
+            **base,
+            "status": "fail",
+            "passed": passed,
+            "failed": failed,
+            "summary": (
+                f"{failed} generated test(s) failed — "
+                "possible bug or flaky test"
+            ),
+            "bug_candidate": True,
+        }
+    if passed > 0 and exit0:
+        return {
+            **base,
+            "status": "pass",
+            "passed": passed,
+            "failed": failed,
+            "summary": f"{passed} generated test(s) passed",
+            "bug_candidate": False,
+        }
+    return {
+        **base,
+        "status": "skip",
+        "passed": passed,
+        "failed": failed,
+        "summary": "no runnable generated tests",
+        "bug_candidate": False,
+    }
+
+
+def _run_check(
+    tunnel_url: str,
+    repo: str,
+    builder: tuple[str, str] | None,
+    *,
+    timeout: int = 180,
+) -> dict[str, Any]:
+    """Run one quality check on the DevPod and classify the result.
+
+    `builder` is the (tool, command) pair from a *_command helper, or None
+    when the check doesn't apply to the stack → 'skip'. The command echoes
+    CHECK_SKIP_MARKER when its tool is missing → also 'skip'. Otherwise the
+    exit code decides pass/fail. Network/MCP errors degrade to 'skip' so an
+    advisory check can never sink the run."""
+    if builder is None:
+        return {"status": "skip", "tool": "n/a", "summary": "not applicable"}
+    tool, cmd = builder
+    resp = _post_execute(
+        tunnel_url,
+        {
+            "type": "run_command",
+            "repo": repo,
+            "command": cmd,
+            "timeout": timeout,
+        },
+    )
+    stdout = resp.get("stdout", "") or ""
+    stderr = resp.get("stderr", "") or ""
+    if resp.get("error"):
+        return {
+            "status": "skip",
+            "tool": tool,
+            "summary": f"could not run: {resp['error']}"[:200],
+        }
+    if CHECK_SKIP_MARKER in stdout:
+        return {"status": "skip", "tool": tool, "summary": "tool not available"}
+    ok = bool(resp.get("success") is True or resp.get("exit_code") == 0)
+    return {
+        "status": "pass" if ok else "fail",
+        "tool": tool,
+        "summary": _summarize_check(stdout + "\n" + stderr, ok=ok),
+    }
+
+
 def _compute_verdict(
     *,
     clone_success: bool,
     install_success: bool,
     tests_passed: int,
     tests_failed: int,
+    tests_ok: bool,
     no_tests: bool,
     build_attempted: bool,
     build_success: bool,
+    secrets_blocking_failed: bool,
     app_started: bool,
     app_url: str | None,
 ) -> str:
@@ -483,12 +1526,21 @@ def _compute_verdict(
     documented in the spec. The order of conditions matters: a
     failed build is more PR-relevant than failed tests (because a
     build failure blocks merge regardless), so we surface
-    'build_failed' even if tests also failed."""
+    'build_failed' even if tests also failed.
+
+    `tests_ok` is the exit-code-aware test signal (Phase 2): it's False
+    whenever the test command exited non-zero even if the heuristic
+    counter couldn't extract a failure count, so a runner we can't parse
+    still flags as tests_failed instead of silently passing."""
     if not clone_success or not install_success:
         return "error"
     if build_attempted and not build_success:
         return "build_failed"
-    if tests_failed > 0:
+    # A newly-added secret in the diff is high-severity and blocking (when
+    # the repo opts in) — surface it ahead of the test outcome.
+    if secrets_blocking_failed:
+        return "security_failed"
+    if not no_tests and not tests_ok:
         return "tests_failed"
     if no_tests:
         return "no_tests"
@@ -497,6 +1549,52 @@ def _compute_verdict(
     if app_started and app_url:
         return "pass"
     return "pass_no_preview"
+
+
+def _compute_gate(
+    *,
+    clone_success: bool,
+    install_success: bool,
+    build_attempted: bool,
+    build_success: bool,
+    tests_failed: int,
+    tests_ok: bool,
+    no_tests: bool,
+    secrets_blocking_failed: bool,
+    secrets_count: int,
+    block_on_test_failure: bool,
+    require_tests_for_preview: bool,
+) -> tuple[bool, str]:
+    """Phase 1 preview gate. Decide whether the live preview (start_app +
+    expose_port) is allowed to run. Returns (gate_passed, gate_reason);
+    gate_reason is "" when the gate passes.
+
+    Blocking conditions, in priority order:
+      1. clone / install failed — nothing meaningful to preview.
+      2. build attempted and failed — the app won't boot.
+      3. authored tests failed (when block_on_test_failure) — a preview
+         would imply "this works" when it demonstrably doesn't.
+      4. no tests at all (only when require_tests_for_preview) — strict
+         repos that mandate coverage before a preview goes out.
+
+    Lint / type-check / security / generated-test signals are NOT part of
+    this gate yet; those arrive in later phases of SANDBOX_TESTING_PLAN.md."""
+    if not clone_success or not install_success:
+        return False, "clone or install failed"
+    if build_attempted and not build_success:
+        return False, "build failed"
+    if secrets_blocking_failed:
+        plural = "secret" if secrets_count == 1 else "secrets"
+        n = secrets_count or "a"
+        return False, f"{n} {plural} detected in the diff"
+    if block_on_test_failure and not no_tests and not tests_ok:
+        if tests_failed > 0:
+            plural = "test" if tests_failed == 1 else "tests"
+            return False, f"{tests_failed} {plural} failed"
+        return False, "tests failed"
+    if require_tests_for_preview and no_tests:
+        return False, "no tests found and this repo requires tests for a preview"
+    return True, ""
 
 
 def _verdict_to_db_overall(verdict: str) -> str:
@@ -540,14 +1638,35 @@ def _upsert_result(row: dict[str, Any]) -> None:
         # as an upsert keyed on the on_conflict columns.
         "Prefer": "resolution=merge-duplicates,return=representation",
     }
-    body = json.dumps([row]).encode("utf-8")
-    req = urllib.request.Request(
-        endpoint, data=body, headers=headers, method="POST"
-    )
-    try:
+    # Phase 3 columns (migration 022) that older databases won't have. If
+    # the upsert fails because of them, we strip and retry so the core row
+    # still lands on a pre-022 schema (soft-fail-on-DB-error contract).
+    optional_keys = ("checks", "gate_passed", "gate_reason")
+
+    def _attempt(payload: dict[str, Any]) -> None:
+        body = json.dumps([payload]).encode("utf-8")
+        req = urllib.request.Request(
+            endpoint, data=body, headers=headers, method="POST"
+        )
         with urllib.request.urlopen(req, timeout=15) as r:
             r.read()
+
+    try:
+        _attempt(row)
     except Exception as e:
+        if any(k in row for k in optional_keys):
+            print(
+                f"[sandbox] persist with Phase 3 columns failed "
+                f"({type(e).__name__}: {e}); retrying without them — "
+                "apply migration 022 to persist checks/gate_passed",
+                file=sys.stderr,
+            )
+            stripped = {k: v for k, v in row.items() if k not in optional_keys}
+            try:
+                _attempt(stripped)
+                return
+            except Exception as e2:
+                e = e2
         print(
             f"[sandbox] persist failed: {type(e).__name__}: {e}",
             file=sys.stderr,
@@ -586,6 +1705,54 @@ def _user_id_for_repo(repo: str) -> str | None:
             file=sys.stderr,
         )
     return None
+
+
+def _repo_gate_config(repo: str) -> tuple[bool, bool, bool]:
+    """Return the sandbox preview-gate config for `repo` as
+    (block_on_test_failure, require_tests_for_preview, block_on_secrets).
+
+    Reads repo_rules via PostgREST. Migration-tolerant: selects `*` and
+    reads each key with a fallback, so the gate keeps working with its
+    documented defaults (block_test=True, require=False, block_secrets=True)
+    even before migrations 021/022 are applied or for repos with no rules
+    row at all."""
+    block_default, require_default, secrets_default = True, False, True
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_KEY")
+    if not url or not key:
+        return block_default, require_default, secrets_default
+    endpoint = (
+        url.rstrip("/")
+        + f"/rest/v1/repo_rules?repo=eq.{urllib.parse.quote(repo)}"
+        "&select=*&limit=1"
+    )
+    req = urllib.request.Request(
+        endpoint,
+        headers={
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+            if isinstance(data, list) and data:
+                row = data[0]
+                block = row.get("sandbox_block_on_test_failure")
+                require = row.get("sandbox_require_tests_for_preview")
+                secrets = row.get("sandbox_block_on_secrets")
+                return (
+                    block_default if block is None else bool(block),
+                    require_default if require is None else bool(require),
+                    secrets_default if secrets is None else bool(secrets),
+                )
+    except Exception as e:
+        print(
+            f"[sandbox] gate config lookup failed: {type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+    return block_default, require_default, secrets_default
 
 
 # --- GitHub comment -------------------------------------------------------
@@ -685,6 +1852,7 @@ def _verdict_header(verdict: str, app_url: str | None) -> str:
         ),
         "tests_failed": "❌ Sandbox FAILED — tests failed",
         "build_failed": "❌ Sandbox FAILED — build failed",
+        "security_failed": "❌ Sandbox FAILED — secret detected in diff",
         "no_tests": "🟡 Sandbox build OK — no tests found",
         "error": "⚠️ Sandbox ERROR — could not run",
     }
@@ -700,6 +1868,104 @@ def _step_row(label: str, ok: bool | None, *, skipped: bool = False) -> str:
         return f"| {label} | ⏭ skipped |"
     icon = "✅" if ok else ("❌" if ok is False else "—")
     return f"| {label} | {icon} |"
+
+
+def _render_checks_section(checks: dict[str, Any]) -> list[str]:
+    """Render the Phase 3 quality-check rows for the PR comment. Returns []
+    when no checks ran (pre-clone failure / no install) so the comment stays
+    clean. Advisory failures render ⚠️; the blocking secret scan renders ❌."""
+    if not checks:
+        return []
+
+    def advisory_icon(status: str) -> str:
+        return {"pass": "✅", "fail": "⚠️", "skip": "⏭"}.get(status, "—")
+
+    rows: list[str] = []
+
+    def add(label: str, result: dict[str, Any] | None) -> None:
+        if not result:
+            return
+        status = result.get("status", "skip")
+        tool = result.get("tool", "")
+        suffix = f" ({tool})" if tool and tool != "n/a" else ""
+        detail = (
+            "passed"
+            if status == "pass"
+            else "skipped"
+            if status == "skip"
+            else (result.get("summary") or "issues found")
+        )
+        rows.append(
+            f"| {label}{suffix} | {advisory_icon(status)} {detail} |"
+        )
+
+    add("Lint", checks.get("lint"))
+    add("Type-check", checks.get("typecheck"))
+
+    sec = checks.get("security") or {}
+    add("Dependency audit", sec.get("audit"))
+    add("SAST", sec.get("sast"))
+
+    secrets = sec.get("secrets") or {}
+    if secrets:
+        s_status = secrets.get("status", "skip")
+        s_count = secrets.get("count", 0)
+        if s_status == "fail":
+            icon, detail = "❌", f"{s_count} found in diff"
+        elif s_status == "skip":
+            icon, detail = "⏭", "skipped"
+        else:
+            icon, detail = "✅", "none in diff"
+        rows.append(f"| Secret scan | {icon} {detail} |")
+
+    cov = checks.get("coverage") or {}
+    if cov.get("status") == "ok" and cov.get("pct") is not None:
+        rows.append(f"| Coverage | {cov['pct']}% ({cov.get('tool', '')}) |")
+
+    gen = checks.get("generated") or {}
+    if gen and (gen.get("status") != "skip" or gen.get("written")):
+        g_status = gen.get("status", "skip")
+        fw = gen.get("framework", "")
+        label = f"Generated tests ({fw})" if fw and fw != "n/a" else "Generated tests"
+        if g_status == "pass":
+            rows.append(f"| {label} | ✅ {gen.get('passed', 0)} passed (advisory) |")
+        elif g_status == "fail":
+            rows.append(
+                f"| {label} | ⚠️ {gen.get('summary', 'failed')} (advisory) |"
+            )
+        else:
+            rows.append(f"| {label} | ⏭ {gen.get('summary', 'skipped')} |")
+
+    diff = checks.get("diff") or {}
+    if diff:
+        n = diff.get("changed_files", 0)
+        rows.append(f"| Diff | {n} file{'' if n == 1 else 's'} changed |")
+
+    if not rows:
+        return []
+
+    out = ["", "**Quality checks**", "", "| Check | Result |", "| --- | --- |"]
+    out.extend(rows)
+
+    # Spell out the secret findings — these are the high-signal, blocking
+    # ones, so list the offending file:type pairs under the table.
+    findings = secrets.get("findings") if isinstance(secrets, dict) else None
+    if findings:
+        out.append("")
+        out.append("> 🔒 **Potential secrets in the diff:**")
+        for fnd in findings[:10]:
+            out.append(f"> - {fnd}")
+
+    # A failing generated test is advisory but high-signal — it may
+    # reproduce a real bug (the seed for the auto-fix builder).
+    if gen and gen.get("bug_candidate"):
+        out.append("")
+        out.append(
+            "> 🧪 **A generated test failed** — this may reproduce a real "
+            "bug introduced by the diff (advisory). Generated tests are "
+            "auto-written and quarantined; review before trusting."
+        )
+    return out
 
 
 def _format_pr_comment(summary: dict[str, Any]) -> str:
@@ -740,20 +2006,32 @@ def _format_pr_comment(summary: dict[str, Any]) -> str:
         lines.append(_step_row("Build", summary.get("build_success")))
     else:
         lines.append(_step_row("Build", None, skipped=True))
+    gate_blocked = summary.get("gate_passed") is False
     if summary.get("app_started"):
         if app_url:
             lines.append(f"| App | ✅ running at port {summary.get('app_port', '?')} |")
         else:
             lines.append("| App | ✅ started — preview URL unavailable |")
+    elif gate_blocked:
+        lines.append("| App | 🔒 preview withheld |")
     else:
         lines.append(_step_row("App", None, skipped=True))
 
     if app_url:
         lines.append("")
         lines.append(f"🔗 **[Open Live Preview]({app_url})**")
+    elif gate_blocked:
+        lines.append("")
+        lines.append(
+            "🔒 **Preview withheld** — "
+            f"{summary.get('gate_reason') or 'checks did not pass'}. "
+            "Fix the issue and push again to get a live preview."
+        )
     elif summary.get("app_started"):
         lines.append("")
         lines.append("⚠️ App started but preview URL unavailable.")
+
+    lines.extend(_render_checks_section(summary.get("checks") or {}))
 
     if summary.get("build_attempted"):
         out = (summary.get("build_output") or "").strip()
@@ -779,8 +2057,10 @@ def _format_pr_comment(summary: dict[str, Any]) -> str:
         lines.append("</details>")
 
     lines.append("")
+    stack = summary.get("stack")
+    stack_note = f"Stack: {stack} · " if stack and stack != "unknown" else ""
     lines.append(
-        f"*Sandbox ran in {duration_ms}ms on EC2 · "
+        f"*{stack_note}Sandbox ran in {duration_ms}ms on EC2 · "
         f"DevPod workspace: {workspace_id}*"
     )
     return "\n".join(lines)
@@ -1006,6 +2286,8 @@ def run() -> dict[str, Any]:
             "clone_success": False,
             "install_success": False,
             "install_output": "",
+            "gate_passed": False,
+            "gate_reason": "clone or install failed",
             "duration_ms": duration_ms,
             "workspace_id": workspace_id,
         }
@@ -1047,6 +2329,24 @@ def run() -> dict[str, Any]:
         print(f"[sandbox] Verdict: error ({duration_ms}ms)")
         return early_summary
 
+    # --- Step A2: detect the stack (Phase 2) ----------------------------
+    # One probe round-trip; the orchestrator (not the MCP server) decides
+    # which install / test / build commands to run. Falls back to the
+    # "unknown" matrix (harmless echoes) if the probe returns nothing.
+    detect_resp = _post_execute(
+        tunnel_url,
+        {
+            "type": "run_command",
+            "repo": repo,
+            "command": _detect_command(pr_number),
+        },
+    )
+    detect_flags = _parse_detect(detect_resp.get("stdout", "") or "")
+    stack_label, install_cmd, test_cmd, build_cmd = _stack_commands(
+        pr_number, detect_flags
+    )
+    print(f"[sandbox] detected stack: {stack_label}")
+
     # --- Step B: install dependencies (best-effort) ---------------------
     install_success = False
     install_output = ""
@@ -1056,7 +2356,11 @@ def run() -> dict[str, Any]:
             {
                 "type": "run_command",
                 "repo": repo,
-                "command": _install_command(pr_number),
+                "command": install_cmd,
+                # Cargo / maven / dotnet restores can exceed the default
+                # 120s run_command cap; give install more room (older MCP
+                # servers ignore `timeout` and stay at 120s).
+                "timeout": 300,
             },
         )
         install_success = bool(
@@ -1076,6 +2380,9 @@ def run() -> dict[str, Any]:
     tests_failed = 0
     test_output = ""
     no_tests = False
+    # Exit-code-aware "did tests pass" signal. Defaults to True so the
+    # skipped-test path (clone/install failed) doesn't read as a failure.
+    tests_ok = True
     if clone_success and install_success:
         test_resp = _post_execute(
             tunnel_url,
@@ -1083,6 +2390,10 @@ def run() -> dict[str, Any]:
                 "type": "run_tests",
                 "repo": repo,
                 "cwd": cwd,
+                # Phase 2: the orchestrator supplies the test command;
+                # the MCP server runs it verbatim (older servers re-detect
+                # for the big three and use this for everything else).
+                "command": test_cmd,
             },
         )
         stdout = test_resp.get("stdout", "") or ""
@@ -1091,9 +2402,17 @@ def run() -> dict[str, Any]:
         test_output = stdout + ("\n" + stderr if stderr else "")
         if test_resp.get("error"):
             test_output += f"\n[sandbox] mcp error: {test_resp['error']}"
-        no_tests = _looks_like_no_tests(stdout, stderr) or (
-            tests_passed == 0 and tests_failed == 0
+        test_exit_zero = bool(
+            test_resp.get("success") is True
+            or test_resp.get("exit_code") == 0
         )
+        no_tests = _looks_like_no_tests(stdout, stderr) or (
+            tests_passed == 0 and tests_failed == 0 and test_exit_zero
+        )
+        # Tests are OK iff none parsed as failed AND the runner exited 0.
+        # The exit-code half catches runners whose output we can't count:
+        # a non-zero exit with no parsed failures still flags as failing.
+        tests_ok = no_tests or (test_exit_zero and tests_failed == 0)
 
     # --- Step D: build (Next.js / Go / Python no-op) --------------------
     # Always attempt when clone+install both succeeded, regardless of
@@ -1110,6 +2429,9 @@ def run() -> dict[str, Any]:
                 "type": "build",
                 "repo": repo,
                 "cwd": cwd,
+                # Phase 2: orchestrator-supplied build command. Older MCP
+                # servers ignore it and fall back to their own detection.
+                "command": build_cmd,
             },
         )
         # Forward-compat: if the user is running an older MCP server
@@ -1139,18 +2461,135 @@ def run() -> dict[str, Any]:
             if build_resp.get("error"):
                 build_output += f"\n[sandbox] mcp error: {build_resp['error']}"
 
+    # --- Quality checks (Phase 3) ---------------------------------------
+    # Diff-aware static analysis + security + coverage, all LEFT of the
+    # gate. Run only when clone+install succeeded (lint / typecheck / audit
+    # need the deps). Every check is best-effort and tool-guarded; only the
+    # diff secret scan can block (per-repo opt-in). The structured results
+    # feed the persisted `checks` blob, the PR comment, and the gate.
+    checks: dict[str, Any] = {}
+    secrets_result: dict[str, Any] = {
+        "status": "skip",
+        "tool": "regex-diff",
+        "count": 0,
+        "findings": [],
+    }
+    if clone_success and install_success:
+        comment_token = (
+            os.environ.get("GITHUB_TOKEN", "").strip()
+            or os.environ.get("GITHUB_TOKEN_PAT", "").strip()
+        )
+        pr_files = _fetch_pr_files(repo, pr_number, comment_token)
+        changed_files = [
+            f.get("filename", "")
+            for f in pr_files
+            if isinstance(f, dict) and f.get("filename")
+        ]
+        secrets_result = _scan_secrets(pr_files)
+
+        cd_prefix = f"cd {cwd} && "
+        lint_result = _run_check(
+            tunnel_url, repo, _lint_command(cd_prefix, detect_flags)
+        )
+        typecheck_result = _run_check(
+            tunnel_url, repo, _typecheck_command(cd_prefix, detect_flags)
+        )
+        audit_result = _run_check(
+            tunnel_url, repo, _audit_command(cd_prefix, detect_flags)
+        )
+        # SAST is the heavy check — EC2 path only (per the plan watch-out),
+        # scoped to the PR's changed files, with a longer timeout.
+        sast_result = _run_check(
+            tunnel_url,
+            repo,
+            _sast_command(cd_prefix, changed_files),
+            timeout=300,
+        )
+        coverage_result = _parse_coverage(test_output)
+
+        checks = {
+            "diff": {"changed_files": len(changed_files), "base": None},
+            "lint": lint_result,
+            "typecheck": typecheck_result,
+            "security": {
+                "secrets": secrets_result,
+                "audit": audit_result,
+                "sast": sast_result,
+            },
+            "coverage": coverage_result,
+        }
+        print(
+            "[sandbox] checks — "
+            f"lint:{lint_result['status']} "
+            f"types:{typecheck_result['status']} "
+            f"audit:{audit_result['status']} "
+            f"sast:{sast_result['status']} "
+            f"secrets:{secrets_result['status']}"
+            f"({secrets_result.get('count', 0)})"
+        )
+
+        # --- Phase 4: Claude-generated tests (advisory, EC2-only) -------
+        generated_result = _generate_tests_check(
+            tunnel_url, repo, cwd, detect_flags, changed_files
+        )
+        checks["generated"] = generated_result
+        print(
+            "[sandbox] generated tests: "
+            f"{generated_result['status']} "
+            f"(wrote {generated_result.get('written', 0)}, "
+            f"{generated_result.get('passed', 0)} passed, "
+            f"{generated_result.get('failed', 0)} failed)"
+        )
+        if generated_result.get("bug_candidate"):
+            # Seam for the auto-fix builder (Improvements.md #5): a failing
+            # generated test is a candidate reproduced bug. We surface it
+            # loudly + persist the flag; opening a self-fix PR is a separate
+            # roadmap item and intentionally NOT automated here.
+            print(
+                "[sandbox] generated-tests: failing case detected — "
+                "candidate for auto-fix builder"
+            )
+
+    # --- Preview gate (Phase 1 + Phase 3) -------------------------------
+    # Decide whether the live preview is allowed BEFORE starting the app.
+    # Previously the app started whenever clone+install+build passed,
+    # regardless of the test outcome — so a PR with failing (or zero)
+    # tests still produced a Cloudflare URL. The gate withholds the
+    # preview on a real test failure (and, for strict repos, when no
+    # tests exist at all). Phase 3 adds a blocking diff secret scan.
+    # Config is per-repo via repo_rules.
+    (
+        block_on_test_failure,
+        require_tests_for_preview,
+        block_on_secrets,
+    ) = _repo_gate_config(repo)
+    secrets_blocking_failed = (
+        block_on_secrets and secrets_result.get("status") == "fail"
+    )
+    gate_passed, gate_reason = _compute_gate(
+        clone_success=clone_success,
+        install_success=install_success,
+        build_attempted=build_attempted,
+        build_success=build_success,
+        tests_failed=tests_failed,
+        tests_ok=tests_ok,
+        no_tests=no_tests,
+        secrets_blocking_failed=secrets_blocking_failed,
+        secrets_count=int(secrets_result.get("count", 0) or 0),
+        block_on_test_failure=block_on_test_failure,
+        require_tests_for_preview=require_tests_for_preview,
+    )
+    if not gate_passed:
+        print(f"[sandbox] preview gate: BLOCKED — {gate_reason}")
+
     # --- Step E: start app + detect/expose port -------------------------
-    # We start the app whenever clone+install succeeded AND build (if
-    # attempted) succeeded. A failing build is conclusive evidence
-    # that the app won't boot meaningfully, so skipping the start
-    # avoids the user seeing a green "App running" next to a red
-    # "Build failed".
+    # Runs only when the preview gate passed. A blocked gate means a
+    # failing build, failing tests, or (strict repos) missing tests — none
+    # of which should yield a live preview.
     app_started = False
     app_port: int | None = None
     app_url: str | None = None
-    if clone_success and install_success and (
-        not build_attempted or build_success
-    ):
+    if gate_passed:
         # Belt-and-braces: confirm a build artifact actually
         # exists before launching the app. For Next.js this
         # means /tmp/pr-test-<n>/.next; missing → run
@@ -1237,9 +2676,11 @@ def run() -> dict[str, Any]:
         install_success=install_success,
         tests_passed=tests_passed,
         tests_failed=tests_failed,
+        tests_ok=tests_ok,
         no_tests=no_tests,
         build_attempted=build_attempted,
         build_success=build_success,
+        secrets_blocking_failed=secrets_blocking_failed,
         app_started=app_started,
         app_url=app_url,
     )
@@ -1262,6 +2703,10 @@ def run() -> dict[str, Any]:
         "clone_success": clone_success,
         "install_success": install_success,
         "install_output": _truncate(install_output),
+        "gate_passed": gate_passed,
+        "gate_reason": gate_reason,
+        "stack": stack_label,
+        "checks": checks,
         "duration_ms": duration_ms,
         "workspace_id": workspace_id,
     }
@@ -1294,6 +2739,11 @@ def run() -> dict[str, Any]:
             "install_success": install_success,
             "overall": overall_db,
             "duration_ms": duration_ms,
+            # Phase 3 columns (migration 022). _upsert_result drops these
+            # and retries if the migration hasn't been applied yet.
+            "checks": checks,
+            "gate_passed": gate_passed,
+            "gate_reason": gate_reason,
         }
     )
 

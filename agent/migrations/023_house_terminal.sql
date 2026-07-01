@@ -1,4 +1,4 @@
--- 023_house_terminal.sql
+2-- 023_house_terminal.sql
 --
 -- Adds the "house terminal" layer: a Lyncas-controlled Linux box
 -- (EC2 for now) that exposes an interactive PTY over a WebSocket,

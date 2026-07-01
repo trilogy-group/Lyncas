@@ -2,7 +2,7 @@ import { redirect } from "next/navigation";
 import { Container } from "@/components/ui/container";
 import { GridBackdrop } from "@/components/ui/grid-backdrop";
 import { SectionHeading } from "@/components/ui/section-heading";
-import { WebTerminal } from "@/components/web-terminal";
+import { WebTerminal, type DeployTarget } from "@/components/web-terminal";
 import { getUser } from "@/lib/supabase/server";
 
 // /dashboard/terminal
@@ -18,9 +18,28 @@ import { getUser } from "@/lib/supabase/server";
 
 export const dynamic = "force-dynamic";
 
-export default async function DashboardTerminalPage() {
+export default async function DashboardTerminalPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ deploy?: string; pr?: string }>;
+}) {
   const user = await getUser().catch(() => null);
   if (!user) redirect("/login");
+
+  // Optional chat-triggered deploy: /dashboard/terminal?deploy=<owner/repo>&pr=<n>
+  // WebTerminal runs agent/pr_deploy.sh live in the PTY when this is set.
+  const sp = await searchParams;
+  let initialDeploy: DeployTarget | null = null;
+  if (sp.deploy && sp.pr) {
+    const prNum = Number(sp.pr);
+    if (
+      /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(sp.deploy) &&
+      Number.isInteger(prNum) &&
+      prNum > 0
+    ) {
+      initialDeploy = { repo: sp.deploy, pr: prNum };
+    }
+  }
 
   return (
     <div className="relative">
@@ -41,7 +60,7 @@ export default async function DashboardTerminalPage() {
           </p>
         </div>
 
-        <WebTerminal />
+        <WebTerminal initialDeploy={initialDeploy} />
       </Container>
     </div>
   );

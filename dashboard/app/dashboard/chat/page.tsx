@@ -17,6 +17,7 @@ import { Container } from "@/components/ui/container";
 import { GridBackdrop } from "@/components/ui/grid-backdrop";
 import { DevPodPanel } from "@/components/devpod-panel";
 import { SandboxTestCard } from "@/components/sandbox-test-card";
+import { DeployPrCard } from "@/components/deploy-pr-card";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 import { downloadMarkdownDocx } from "@/lib/docx-report";
 
@@ -678,6 +679,14 @@ function ChatPageInner() {
     }
     return null;
   }, [messages, input]);
+  // Set when the chat model emits ACTION: DEPLOY_PR — the server sends a
+  // { deploy: { repo, pr } } SSE frame and we render a DeployPrCard the
+  // user clicks to launch the sandbox deploy (in the Terminal tab, or
+  // via the DevPod fallback).
+  const [pendingDeploy, setPendingDeploy] = useState<{
+    repo: string;
+    pr: number;
+  } | null>(null);
   const [repoPanelOpen, setRepoPanelOpen] = useState<boolean | null>(null);
   const [researchPanelOpen, setResearchPanelOpen] = useState<boolean | null>(
     null,
@@ -1394,9 +1403,20 @@ function ChatPageInner() {
                 const parsed = JSON.parse(payload) as {
                   t?: string;
                   error?: string;
+                  deploy?: { repo?: string; pr?: number };
                 };
                 if (parsed.error) {
                   flagInterrupted(parsed.error);
+                  continue;
+                }
+                if (
+                  parsed.deploy &&
+                  typeof parsed.deploy.pr === "number"
+                ) {
+                  setPendingDeploy({
+                    repo: parsed.deploy.repo || repo,
+                    pr: parsed.deploy.pr,
+                  });
                   continue;
                 }
                 if (typeof parsed.t === "string") {
@@ -1763,6 +1783,17 @@ function ChatPageInner() {
                   <SandboxTestCard
                     repo={selectedRepo}
                     prNumber={activePrNumber}
+                  />
+                )}
+
+              {hasRepo &&
+                !roomTransition &&
+                pendingDeploy !== null &&
+                pendingDeploy.repo === selectedRepo && (
+                  <DeployPrCard
+                    key={`${pendingDeploy.repo}#${pendingDeploy.pr}`}
+                    repo={pendingDeploy.repo}
+                    prNumber={pendingDeploy.pr}
                   />
                 )}
 

@@ -81,9 +81,11 @@ Supported actions:
   ACTION: OPEN_PR {number}
   ACTION: COMMENT_PR {number} {your comment text on one line}
   ACTION: MERGE_PR {number}
+  ACTION: DEPLOY_PR {number}
 
 Rules:
 - Use ACTION blocks ONLY when the user explicitly requests the action ("close pr 42", "merge this pr", etc.). Do not invent actions.
+- Use ACTION: DEPLOY_PR {number} when the user asks to test, deploy, run, spin up, or get a live/Cloudflare preview of a PR ("test pr 12 and deploy it", "give me a live preview of #7", "deploy pr 3 in the terminal"). This is a SAFE, read-only sandbox operation (it clones and runs the PR to produce a preview URL) — do NOT ask for confirmation. In your prose, say one short sentence like "Launching a sandbox deploy of PR #N — use the card below to watch it in the Terminal." The user will get a launch card; you do not run it yourself.
 - Always confirm BEFORE merging. For "merge pr 42" requests, first reply with "Are you sure you want to merge PR #42? Reply 'yes, merge' to proceed." and DO NOT include ACTION: MERGE_PR. Only include ACTION: MERGE_PR after the user explicitly confirms ("yes, merge", "confirmed", etc.). The same confirmation rule applies to bulk merges — never emit ACTION: MERGE_PR for multiple PRs without an explicit confirmation in the prior turn.
 - For COMMENT_PR, the comment text follows the number on the SAME line. Keep it under 1000 characters and use plain text (no triple backticks — they break the parser). Markdown without code fences is fine.
 - When closing/opening multiple PRs, include one ACTION block per PR at the end of your response. Example for closing 3 PRs:
@@ -1004,6 +1006,26 @@ async function streamFromAnthropic(opts: {
         // instructed to keep ACTIONs contiguous at the end, but a
         // stray prose line shouldn't abort the bulk operation.
         const actionRegion = accum.slice(actionStart);
+
+        // DEPLOY_PR is NOT executed server-side — it's surfaced to the
+        // client as a `deploy` frame so the chat UI can render a launch
+        // card (Open in Terminal / DevPod fallback). Emit one per unique
+        // PR, and do it regardless of write-token: deploying is a
+        // read-only sandbox op, not a GitHub write.
+        const deploySeen = new Set<number>();
+        for (const rawLine of actionRegion.split("\n")) {
+          const dm = /^ACTION:\s*DEPLOY_PR\s+(\d{1,6})\s*$/.exec(rawLine.trim());
+          if (!dm) continue;
+          const prNum = Number(dm[1]);
+          if (deploySeen.has(prNum)) continue;
+          deploySeen.add(prNum);
+          controller_.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({ deploy: { repo, pr: prNum } })}\n\n`,
+            ),
+          );
+        }
+
         const parsed: ParsedAction[] = [];
         for (const rawLine of actionRegion.split("\n")) {
           const line = rawLine.trim();

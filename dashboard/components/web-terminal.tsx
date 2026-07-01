@@ -25,6 +25,12 @@ import type { FitAddon as XFitAddon } from "@xterm/addon-fit";
 // the same EC2 box as the webhook handler. Everyone who opens the tab
 // lands in the same environment. Isolation is tracked separately.
 
+// Path to the Lyncas checkout on the house-terminal (EC2) box. Must
+// match where the repo lives on that machine — same assumption as
+// agent/start_webhook.sh (~/trilogy/Lyncas). Change here if your box
+// uses a different layout.
+const EC2_REPO_PATH = "~/trilogy/Lyncas";
+
 type Status =
   | "loading"
   | "offline"
@@ -32,6 +38,11 @@ type Status =
   | "connected"
   | "closed"
   | "error";
+
+export interface DeployTarget {
+  repo: string;
+  pr: number;
+}
 
 interface InfoOnline {
   connected: true;
@@ -43,16 +54,31 @@ interface InfoOnline {
 }
 type InfoResponse = { connected: false } | InfoOnline;
 
-export function WebTerminal() {
+export function WebTerminal({
+  initialDeploy = null,
+}: {
+  initialDeploy?: DeployTarget | null;
+}) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<XTerm | null>(null);
   const fitRef = useRef<XFitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const roRef = useRef<ResizeObserver | null>(null);
 
+  // Kept in a ref so the (stable) connect() callback can read the
+  // latest deploy target without being recreated. deployRanRef guards
+  // against firing the command twice (e.g. React strict-mode remount).
+  const deployRef = useRef<DeployTarget | null>(initialDeploy);
+  const deployRanRef = useRef(false);
+
   const [status, setStatus] = useState<Status>("loading");
   const [label, setLabel] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [deploying, setDeploying] = useState<DeployTarget | null>(null);
+
+  useEffect(() => {
+    deployRef.current = initialDeploy;
+  }, [initialDeploy]);
 
   // Push the current terminal geometry to the server so the remote PTY
   // wraps lines correctly.
@@ -121,6 +147,21 @@ export function WebTerminal() {
       term.focus();
       // Give layout a tick to settle before measuring geometry.
       requestAnimationFrame(fitAndResize);
+
+      // Auto-run a chat-triggered deploy once, after the prompt settles.
+      const dep = deployRef.current;
+      if (dep && !deployRanRef.current) {
+        const repoOk = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(dep.repo);
+        const prOk = Number.isInteger(dep.pr) && dep.pr > 0;
+        if (repoOk && prOk) {
+          deployRanRef.current = true;
+          setDeploying(dep);
+          const cmd = `bash ${EC2_REPO_PATH}/agent/pr_deploy.sh ${dep.repo} ${dep.pr}\n`;
+          setTimeout(() => {
+            if (ws.readyState === WebSocket.OPEN) ws.send("0" + cmd);
+          }, 700);
+        }
+      }
     };
 
     ws.onmessage = (ev: MessageEvent) => {
@@ -231,6 +272,11 @@ export function WebTerminal() {
           <span className="truncate font-mono text-[11px] text-muted">
             {label ? `${label} — /bin/bash` : "house terminal"}
           </span>
+          {deploying && (
+            <span className="hidden truncate rounded-sm border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 font-mono text-[10px] text-emerald-200 sm:inline">
+              deploying {deploying.repo.split("/")[1] ?? deploying.repo} #{deploying.pr}
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <StatusPill status={status} />

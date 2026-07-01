@@ -4,6 +4,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -2047,7 +2048,38 @@ function RepoDropdown({
   lastReviewByRepo?: LastReviewLookup;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const buttonRef = useRef<HTMLButtonElement | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
+  // The open panel is positioned `fixed` (anchored to the trigger) so it
+  // is never clipped by the sidebar's `overflow-y-auto`. We re-measure on
+  // open and whenever the page scrolls or resizes while open.
+  const [panelPos, setPanelPos] = useState<{
+    top: number;
+    left: number;
+    width: number;
+  } | null>(null);
+
+  useLayoutEffect(() => {
+    if (!open) {
+      setPanelPos(null);
+      return;
+    }
+    function measure() {
+      const el = buttonRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      setPanelPos({ top: r.bottom + 4, left: r.left, width: r.width });
+    }
+    measure();
+    window.addEventListener("resize", measure);
+    // `true` (capture) so we also catch scrolling of inner containers
+    // such as the left sidebar, not just the window.
+    window.addEventListener("scroll", measure, true);
+    return () => {
+      window.removeEventListener("resize", measure);
+      window.removeEventListener("scroll", measure, true);
+    };
+  }, [open]);
   // Tracks the prior `open` value so we can reset query/activeIdx
   // ONLY on the open->closed->open transition, not on every render.
   // Resetting via useState initializer + key-rotation would be
@@ -2085,11 +2117,24 @@ function RepoDropdown({
   // every other "search inside dropdown" UI.
   useEffect(() => {
     if (!open) return;
+    // This dropdown is rendered TWICE (desktop sidebar + mobile picker)
+    // sharing one `open` state, but only one is visible at a time (the
+    // other is `display:none` via md: classes). A hidden instance whose
+    // container is `display:none` reports `offsetParent === null`. Such
+    // an instance must NOT treat clicks as "outside" — otherwise the
+    // hidden twin closes the dropdown on mousedown, before the visible
+    // option's onClick (mouseup) can commit. That was the "clicking does
+    // nothing, only the keyboard works" bug.
+    function isHidden(): boolean {
+      const el = containerRef.current;
+      return !el || (el.offsetParent === null && el.getClientRects().length === 0);
+    }
     function onDocClick(e: MouseEvent) {
-      if (!containerRef.current) return;
+      if (!containerRef.current || isHidden()) return;
       if (!containerRef.current.contains(e.target as Node)) onOpenChange(false);
     }
     function onKey(e: KeyboardEvent) {
+      if (isHidden()) return;
       if (e.key === "Escape") {
         if (query) {
           setQuery("");
@@ -2146,6 +2191,7 @@ function RepoDropdown({
   return (
     <div ref={containerRef} className="relative">
       <button
+        ref={buttonRef}
         type="button"
         onClick={() => !disabled && !empty && onOpenChange(!open)}
         disabled={disabled || empty}
@@ -2205,10 +2251,16 @@ function RepoDropdown({
         </div>
       )}
 
-      {open && (
+      {open && panelPos && (
         <div
           role="listbox"
-          className="absolute left-0 right-0 z-30 mt-1 overflow-hidden rounded-sm border border-border bg-bg shadow-lg"
+          style={{
+            position: "fixed",
+            top: panelPos.top,
+            left: panelPos.left,
+            width: panelPos.width,
+          }}
+          className="z-50 overflow-hidden rounded-sm border border-border bg-bg shadow-lg"
         >
           <div className="border-b border-border bg-bg-elev p-2">
             <input
@@ -2247,12 +2299,12 @@ function RepoDropdown({
                     onMouseEnter={() => setActiveIdx(idx)}
                     onClick={() => commit(r.repo)}
                     className={
-                      "flex w-full items-center gap-2.5 px-2.5 py-2 text-left text-xs transition-colors " +
-                      (isHighlight
-                        ? "bg-bg-elev text-text"
-                        : active
-                          ? "bg-bg-elev/60 text-text"
-                          : "text-muted hover:bg-bg-elev hover:text-text")
+                      "flex w-full items-center gap-2.5 border-l-2 px-2.5 py-2 text-left text-xs transition-colors " +
+                      (active
+                        ? "border-[#4ade80] bg-bg-elev text-text"
+                        : isHighlight
+                          ? "border-border-strong bg-bg-elev text-text"
+                          : "border-transparent text-muted hover:bg-bg-elev hover:text-text")
                     }
                     title={r.repo}
                   >
@@ -2283,7 +2335,17 @@ function RepoDropdown({
                       </div>
                     </div>
                     {active && (
-                      <span className="text-[9px] font-mono uppercase tracking-[0.14em] text-muted">
+                      <span className="flex shrink-0 items-center gap-1 text-[9px] font-mono uppercase tracking-[0.14em] text-[#4ade80]">
+                        <svg
+                          xmlns="http://www.w3.org/2000/svg"
+                          width="10"
+                          height="10"
+                          viewBox="0 0 16 16"
+                          fill="currentColor"
+                          aria-hidden
+                        >
+                          <path d="M6.5 11.5L3 8l1-1 2.5 2.5L12 4l1 1z" />
+                        </svg>
                         active
                       </span>
                     )}

@@ -7,3 +7,7 @@ langgraph>=0.2.0
 # deps, but pinned explicitly so a fresh install never lands on a
 # version without the public-key primitives we need.
 cryptography>=42.0
+# Used by terminal_server.py (the "house terminal") to serve an
+# interactive PTY over a WebSocket to the dashboard /dashboard/terminal
+# tab. Only needed on the box that hosts the shared runner.
+websockets>=12.0

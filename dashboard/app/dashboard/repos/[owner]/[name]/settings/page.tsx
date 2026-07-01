@@ -33,6 +33,9 @@ interface FormState {
   custom_instructions: string;
   rules_file_content: string;
   rules_file_name: string | null;
+  sandbox_block_on_test_failure: boolean;
+  sandbox_require_tests_for_preview: boolean;
+  sandbox_block_on_secrets: boolean;
 }
 
 const DEFAULT_FORM: FormState = {
@@ -44,6 +47,9 @@ const DEFAULT_FORM: FormState = {
   custom_instructions: "",
   rules_file_content: "",
   rules_file_name: null,
+  sandbox_block_on_test_failure: true,
+  sandbox_require_tests_for_preview: false,
+  sandbox_block_on_secrets: true,
 };
 
 // Page theme accent — emerald green, matching this surface's grid
@@ -268,6 +274,11 @@ export default function RepoSettingsPage({ params }: PageProps) {
             custom_instructions: r.custom_instructions ?? "",
             rules_file_content: r.rules_file_content ?? "",
             rules_file_name: r.rules_file_content ? "saved file" : null,
+            sandbox_block_on_test_failure:
+              r.sandbox_block_on_test_failure ?? true,
+            sandbox_require_tests_for_preview:
+              r.sandbox_require_tests_for_preview ?? false,
+            sandbox_block_on_secrets: r.sandbox_block_on_secrets ?? true,
           });
           setDirectoryTree(r.repo_directory_tree ?? null);
         }
@@ -354,6 +365,10 @@ export default function RepoSettingsPage({ params }: PageProps) {
             form.rules_file_content.length > 0
               ? form.rules_file_content
               : null,
+          sandbox_block_on_test_failure: form.sandbox_block_on_test_failure,
+          sandbox_require_tests_for_preview:
+            form.sandbox_require_tests_for_preview,
+          sandbox_block_on_secrets: form.sandbox_block_on_secrets,
         },
         { onConflict: "repo" },
       );
@@ -528,6 +543,63 @@ export default function RepoSettingsPage({ params }: PageProps) {
                 <span className="font-mono text-muted-strong">{severity}</span>{" "}
                 are eligible for auto-close.
               </p>
+            </div>
+          </SettingsPanel>
+
+          {/* ---- Sandbox preview gate ------------------------------------- */}
+          <SettingsPanel
+            title="Sandbox preview gate"
+            meta={form.sandbox_block_on_test_failure ? "Strict" : "Lenient"}
+          >
+            <p className="mb-4 text-xs leading-relaxed text-muted">
+              Controls when the DevPod sandbox produces a live preview
+              (Cloudflare URL) for a PR. A preview should mean the PR
+              actually passed its checks.
+            </p>
+
+            <div className="border-t border-border">
+              <SettingsRows>
+                <SettingsRow
+                  title="Block preview on test failure"
+                  description="When on, a failing test suite withholds the live preview. A failing build always withholds it."
+                  control={
+                    <Toggle
+                      label="Block preview on test failure"
+                      checked={form.sandbox_block_on_test_failure}
+                      onChange={(v) =>
+                        update({ sandbox_block_on_test_failure: v })
+                      }
+                      color={ACCENT}
+                    />
+                  }
+                />
+                <SettingsRow
+                  title="Require tests for preview"
+                  description="When on, a PR with no tests at all also has its preview withheld. Leave off for repos without a test suite."
+                  control={
+                    <Toggle
+                      label="Require tests for preview"
+                      checked={form.sandbox_require_tests_for_preview}
+                      onChange={(v) =>
+                        update({ sandbox_require_tests_for_preview: v })
+                      }
+                      color={ACCENT}
+                    />
+                  }
+                />
+                <SettingsRow
+                  title="Block preview on secrets in diff"
+                  description="When on, a newly-added secret (API key, token, private key) detected in the PR diff withholds the preview and fails the run. Lint, type-check, and dependency audit always run but stay advisory."
+                  control={
+                    <Toggle
+                      label="Block preview on secrets in diff"
+                      checked={form.sandbox_block_on_secrets}
+                      onChange={(v) => update({ sandbox_block_on_secrets: v })}
+                      color={ACCENT}
+                    />
+                  }
+                />
+              </SettingsRows>
             </div>
           </SettingsPanel>
 

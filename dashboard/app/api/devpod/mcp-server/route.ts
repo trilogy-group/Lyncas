@@ -135,11 +135,27 @@ class MCPHandler(BaseHTTPRequestHandler):
 
         print(f"[mcp] {cmd_type}: {command[:80]}")
 
+        # Phase 2: an explicit command supplied by the orchestrator
+        # always wins. The orchestrator now owns stack detection (see
+        # devpod_tester.py / run-pr-tests route); the legacy
+        # auto-detect branches below are kept only as a fallback for
+        # older orchestrators that still post a bare run_tests/build
+        # with no command.
+        explicit = body.get("command", "")
+
         try:
             if cmd_type == "run_command":
+                # Optional per-call timeout (Phase 2). Defaults to the
+                # historical 120s; capped at 600s so a stuck install
+                # can't pin the DevPod forever.
+                to = body.get("timeout", 120)
+                try:
+                    to = min(int(to), 600)
+                except Exception:
+                    to = 120
                 result = subprocess.run(
                     command, shell=True, capture_output=True,
-                    text=True, timeout=120,
+                    text=True, timeout=to,
                     cwd=os.path.expanduser("~")
                 )
                 self._json(200, {
@@ -150,16 +166,23 @@ class MCPHandler(BaseHTTPRequestHandler):
                 })
 
             elif cmd_type == "run_tests":
-                # Auto-detect test runner
                 cwd = body.get("cwd", os.path.expanduser("~"))
-                if os.path.exists(os.path.join(cwd, "package.json")):
+                if explicit:
+                    cmd = explicit
+                    runner = "orchestrator"
+                # Legacy auto-detect (older orchestrators only).
+                elif os.path.exists(os.path.join(cwd, "package.json")):
                     cmd = "npm test -- --json 2>/dev/null || npm test"
+                    runner = "auto-detected"
                 elif os.path.exists(os.path.join(cwd, "requirements.txt")):
                     cmd = "pytest --json-report --json-report-file=/tmp/pytest-report.json -v 2>&1; cat /tmp/pytest-report.json 2>/dev/null"
+                    runner = "auto-detected"
                 elif os.path.exists(os.path.join(cwd, "go.mod")):
                     cmd = "go test ./... -json"
+                    runner = "auto-detected"
                 else:
-                    cmd = command or "echo 'No test runner detected'"
+                    cmd = "echo 'No test runner detected'"
+                    runner = "auto-detected"
 
                 result = subprocess.run(
                     cmd, shell=True, capture_output=True,
@@ -170,17 +193,29 @@ class MCPHandler(BaseHTTPRequestHandler):
                     "stderr": result.stderr[-2000:],
                     "exit_code": result.returncode,
                     "success": result.returncode == 0,
-                    "test_runner": "auto-detected"
+                    "test_runner": runner
                 })
 
             elif cmd_type == "build":
-                # Per-language build detection. Mirrors the
-                # auto-detect pattern in run_tests above. Timeout
-                # is 180s because Next.js builds (npm run build)
-                # routinely take 60–120s on cold caches; the spec
-                # caps us at 180s so a runaway webpack doesn't tie
-                # up the DevPod.
+                # Timeout is 180s because Next.js builds (npm run
+                # build) routinely take 60–120s on cold caches; the
+                # spec caps us at 180s so a runaway webpack doesn't
+                # tie up the DevPod.
                 cwd = body.get("cwd", os.path.expanduser("~"))
+                if explicit:
+                    result = subprocess.run(
+                        explicit, shell=True, capture_output=True,
+                        text=True, timeout=180, cwd=cwd
+                    )
+                    self._json(200, {
+                        "stdout": result.stdout[-20000:],
+                        "stderr": result.stderr[-2000:],
+                        "exit_code": result.returncode,
+                        "success": result.returncode == 0,
+                        "build_runner": "orchestrator"
+                    })
+                    return
+                # Legacy auto-detect (older orchestrators only).
                 pkg = os.path.join(cwd, "package.json")
                 if os.path.exists(pkg):
                     # Cheap-and-cheerful "does it have a build

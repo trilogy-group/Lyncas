@@ -89,6 +89,17 @@ Env contract:
                           still post the GitHub comment so a webhook
                           log inspection can recover the outcome
                           manually.
+  ANTHROPIC_API_KEY       enables Phase 4 generated tests (advisory) and
+                          the auto-fix builder. Absent -> both skip.
+  ALLOW_AUTO_FIX_PR       "false" (default) | "true". When true AND a
+                          generated test reproduces a likely bug, opens a
+                          fix PR against the contributor's branch + emails.
+  LYNCAS_GEN_TESTS_MODEL  override for the test-gen model (Sonnet default).
+  LYNCAS_AUTOFIX_MODEL    override for the fix model (Opus default).
+  DISABLE_GENERATED_TESTS "true" kill-switch for generation.
+  GMAIL_USER / GMAIL_APP_PASSWORD / DIGEST_RECIPIENT
+                          optional — used only to email an opened auto-fix
+                          PR; missing -> the email step soft-skips.
 """
 
 from __future__ import annotations
@@ -212,6 +223,20 @@ MAX_GEN_SOURCE_FILES = 5
 MAX_GEN_FILE_BYTES = 6000
 MAX_GEN_FILES_WRITTEN = 3
 GEN_MAX_TOKENS = 4096
+
+# --- Phase 4b: auto-fix builder -------------------------------------------
+# When a generated test reproduces a likely bug, the builder asks Claude for
+# a minimal fix and opens a PR *against the contributor's branch* (base =
+# PR head ref) so merging it fixes the PR — never against the default branch.
+# OFF by default (mirrors ALLOW_AUTO_CLOSE): opening PRs on someone's behalf
+# is a high-trust action, so it's strictly opt-in via env.
+ALLOW_AUTO_FIX_PR = os.environ.get(
+    "ALLOW_AUTO_FIX_PR", "false"
+).strip().lower() in ("1", "true", "yes")
+# Opus is worth it for the actual code fix (vs Sonnet for test scaffolding).
+AUTOFIX_MODEL = os.environ.get("LYNCAS_AUTOFIX_MODEL", "claude-opus-4-5")
+AUTOFIX_MAX_TOKENS = 8000
+AUTOFIX_BRANCH_PREFIX = "lyncas-autofix"
 
 
 # --- HTTP helper ----------------------------------------------------------
@@ -1015,7 +1040,13 @@ def _parse_coverage(test_output: str) -> dict[str, Any]:
 # --- Phase 4: Claude-generated unit tests (advisory) ----------------------
 
 
-def _anthropic_generate(system: str, user: str) -> str | None:
+def _anthropic_generate(
+    system: str,
+    user: str,
+    *,
+    model: str = GEN_TESTS_MODEL,
+    max_tokens: int = GEN_MAX_TOKENS,
+) -> str | None:
     """Call the Anthropic Messages API via urllib (keeps this module
     stdlib-only, like the GitHub calls). Returns the concatenated text
     blocks, or None on any failure / missing key."""
@@ -1024,8 +1055,8 @@ def _anthropic_generate(system: str, user: str) -> str | None:
         return None
     body = json.dumps(
         {
-            "model": GEN_TESTS_MODEL,
-            "max_tokens": GEN_MAX_TOKENS,
+            "model": model,
+            "max_tokens": max_tokens,
             "system": system,
             "messages": [{"role": "user", "content": user}],
         }
@@ -1340,25 +1371,34 @@ def _generate_tests_check(
     cwd: str,
     flags: dict[str, Any],
     changed_files: list[str],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Generate, write, and run advisory unit tests for the PR's diff.
 
-    Always returns a `generated` check dict; status is 'skip' for every
-    non-fatal off-ramp (no key, unsupported stack, nothing changed,
-    generation/write failed). 'fail' (advisory) means a generated test
-    failed or wouldn't import — `bug_candidate` flags those as seeds for
-    the auto-fix builder. Never blocks the gate or the verdict."""
+    Returns `(check_dict, artifacts)`. The check dict's status is 'skip'
+    for every non-fatal off-ramp (no key, unsupported stack, nothing
+    changed, generation/write failed). 'fail' (advisory) means a generated
+    test failed or wouldn't import — `bug_candidate` flags those as seeds
+    for the auto-fix builder. Never blocks the gate or the verdict.
 
-    def skip(summary: str, framework: str = "n/a") -> dict[str, Any]:
-        return {
-            "status": "skip",
-            "framework": framework,
-            "written": 0,
-            "passed": 0,
-            "failed": 0,
-            "summary": summary,
-            "bug_candidate": False,
-        }
+    `artifacts` is non-None only when a failing (bug-candidate) run gives
+    the auto-fix builder what it needs: the source contents, the generated
+    test files, and the failure output."""
+
+    def skip(
+        summary: str, framework: str = "n/a"
+    ) -> tuple[dict[str, Any], None]:
+        return (
+            {
+                "status": "skip",
+                "framework": framework,
+                "written": 0,
+                "passed": 0,
+                "failed": 0,
+                "summary": summary,
+                "bug_candidate": False,
+            },
+            None,
+        )
 
     if os.environ.get("DISABLE_GENERATED_TESTS", "").strip().lower() in (
         "1",
@@ -1421,47 +1461,389 @@ def _generate_tests_check(
     )
 
     base = {"framework": fw_label, "written": written}
-    if import_err:
-        return {
-            **base,
-            "status": "fail",
-            "passed": passed,
-            "failed": failed,
-            "summary": (
-                "generated tests failed to import/compile "
-                "(possible API break or unresolved imports)"
-            ),
-            "bug_candidate": True,
-        }
-    if failed > 0:
-        return {
-            **base,
-            "status": "fail",
-            "passed": passed,
-            "failed": failed,
-            "summary": (
-                f"{failed} generated test(s) failed — "
-                "possible bug or flaky test"
-            ),
-            "bug_candidate": True,
-        }
-    if passed > 0 and exit0:
-        return {
-            **base,
-            "status": "pass",
-            "passed": passed,
-            "failed": failed,
-            "summary": f"{passed} generated test(s) passed",
-            "bug_candidate": False,
-        }
-    return {
-        **base,
-        "status": "skip",
-        "passed": passed,
-        "failed": failed,
-        "summary": "no runnable generated tests",
-        "bug_candidate": False,
+    artifacts = {
+        "framework": framework,
+        "js_runner": js_runner,
+        "sources": src_contents,
+        "tests": files,
+        "output": out[-6000:],
     }
+    if import_err:
+        return (
+            {
+                **base,
+                "status": "fail",
+                "passed": passed,
+                "failed": failed,
+                "summary": (
+                    "generated tests failed to import/compile "
+                    "(possible API break or unresolved imports)"
+                ),
+                "bug_candidate": True,
+            },
+            artifacts,
+        )
+    if failed > 0:
+        return (
+            {
+                **base,
+                "status": "fail",
+                "passed": passed,
+                "failed": failed,
+                "summary": (
+                    f"{failed} generated test(s) failed — "
+                    "possible bug or flaky test"
+                ),
+                "bug_candidate": True,
+            },
+            artifacts,
+        )
+    if passed > 0 and exit0:
+        return (
+            {
+                **base,
+                "status": "pass",
+                "passed": passed,
+                "failed": failed,
+                "summary": f"{passed} generated test(s) passed",
+                "bug_candidate": False,
+            },
+            None,
+        )
+    return (
+        {
+            **base,
+            "status": "skip",
+            "passed": passed,
+            "failed": failed,
+            "summary": "no runnable generated tests",
+            "bug_candidate": False,
+        },
+        None,
+    )
+
+
+# --- Phase 4b: auto-fix builder (find bug -> propose fix -> open PR) -------
+
+
+def _gh_get_pr_meta(
+    repo: str, pr_number: int, token: str
+) -> dict[str, Any] | None:
+    """Fetch the PR's head ref/sha + head repo so the builder can (a) verify
+    the PR is open and same-repo (we can't push a branch to a fork we don't
+    own) and (b) base the fix branch on the contributor's head."""
+    status, data = _github_request(
+        "GET", f"/repos/{repo}/pulls/{pr_number}", token
+    )
+    if status != 200 or not isinstance(data, dict):
+        return None
+    head = data.get("head") or {}
+    head_repo = (head.get("repo") or {}).get("full_name")
+    return {
+        "state": data.get("state"),
+        "merged": bool(data.get("merged")),
+        "head_ref": head.get("ref"),
+        "head_sha": head.get("sha"),
+        "head_repo": head_repo,
+    }
+
+
+def _gh_create_branch(
+    repo: str, branch: str, sha: str, token: str
+) -> bool:
+    status, _ = _github_request(
+        "POST",
+        f"/repos/{repo}/git/refs",
+        token,
+        {"ref": f"refs/heads/{branch}", "sha": sha},
+    )
+    return status in (200, 201)
+
+
+def _gh_get_file_sha(
+    repo: str, path: str, ref: str, token: str
+) -> str | None:
+    q = urllib.parse.quote(path, safe="/")
+    status, data = _github_request(
+        "GET",
+        f"/repos/{repo}/contents/{q}?ref={urllib.parse.quote(ref)}",
+        token,
+    )
+    if status == 200 and isinstance(data, dict):
+        sha = data.get("sha")
+        return sha if isinstance(sha, str) else None
+    return None
+
+
+def _gh_put_file(
+    repo: str,
+    path: str,
+    branch: str,
+    message: str,
+    content: str,
+    sha: str | None,
+    token: str,
+) -> bool:
+    body: dict[str, Any] = {
+        "message": message,
+        "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+        "branch": branch,
+    }
+    if sha:
+        body["sha"] = sha
+    q = urllib.parse.quote(path, safe="/")
+    status, _ = _github_request(
+        "PUT", f"/repos/{repo}/contents/{q}", token, body
+    )
+    return status in (200, 201)
+
+
+def _gh_open_pr(
+    repo: str, head: str, base: str, title: str, body: str, token: str
+) -> dict[str, Any] | None:
+    status, data = _github_request(
+        "POST",
+        f"/repos/{repo}/pulls",
+        token,
+        {"head": head, "base": base, "title": title, "body": body},
+    )
+    if status in (200, 201) and isinstance(data, dict):
+        return data
+    return None
+
+
+def _build_fix_prompt(
+    artifacts: dict[str, Any],
+) -> tuple[str, str]:
+    """Compose (system, user) for the auto-fix call. We hand Claude the
+    changed source, the generated test(s) that failed, and the failure
+    output, and ask it to first JUDGE whether this is a real bug before
+    proposing a minimal fix."""
+    system = (
+        "You are a meticulous senior engineer triaging an automated test "
+        "failure. A test was auto-generated against a PR's diff and it "
+        "failed. Your job is FIRST to judge whether the failure reflects a "
+        "REAL bug in the source (not a wrong or flaky generated test), and "
+        "ONLY THEN to propose a minimal fix. Be conservative: if the "
+        "generated test is incorrect or you're unsure, say so and propose "
+        "no fix. You output ONLY a single JSON object."
+    )
+
+    src_blocks = []
+    for path, content in (artifacts.get("sources") or {}).items():
+        src_blocks.append(f"=== SOURCE FILE: {path} ===\n{content}")
+    test_blocks = []
+    for path, content in artifacts.get("tests") or []:
+        test_blocks.append(f"=== GENERATED TEST: {path} ===\n{content}")
+    output = artifacts.get("output") or ""
+
+    user = (
+        "A generated unit test failed against this PR. Decide if it reveals "
+        "a real bug, and if so propose the smallest fix.\n\n"
+        "Rules:\n"
+        "- Only modify the SOURCE files shown below; never edit the tests.\n"
+        "- Return FULL new contents for each source file you change.\n"
+        "- Keep the change minimal and behavior-preserving except for the "
+        "bug.\n"
+        "- If the generated test is wrong / flaky / unsure, set "
+        '"is_real_bug" false and return an empty "fixes" array.\n\n'
+        "Respond with ONLY this JSON (no prose, no code fences):\n"
+        '{"is_real_bug": true|false, "confidence": "high|medium|low", '
+        '"explanation": "<one short paragraph>", '
+        '"fixes": [{"path": "<source path>", "content": "<full file>"}]}\n\n'
+        "Changed source files:\n\n"
+        + "\n\n".join(src_blocks)
+        + "\n\nGenerated test(s):\n\n"
+        + "\n\n".join(test_blocks)
+        + "\n\nTest failure output:\n\n"
+        + output
+    )
+    return system, user
+
+
+def _parse_fix_response(
+    text: str, allowed_paths: set[str]
+) -> dict[str, Any] | None:
+    """Pull the fix JSON out of Claude's response and validate it. Returns
+    None unless it's a confidently-real bug with at least one fix that only
+    touches files we showed (so the model can't write arbitrary paths)."""
+    if not text:
+        return None
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return None
+    try:
+        obj = json.loads(text[start : end + 1])
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    if not obj.get("is_real_bug"):
+        return None
+    if str(obj.get("confidence", "")).lower() == "low":
+        return None
+    raw_fixes = obj.get("fixes")
+    if not isinstance(raw_fixes, list) or not raw_fixes:
+        return None
+    fixes: list[tuple[str, str]] = []
+    for item in raw_fixes:
+        if not isinstance(item, dict):
+            continue
+        path = item.get("path")
+        content = item.get("content")
+        if (
+            isinstance(path, str)
+            and path in allowed_paths
+            and isinstance(content, str)
+            and content.strip()
+        ):
+            fixes.append((path, content))
+    if not fixes:
+        return None
+    return {
+        "confidence": str(obj.get("confidence", "")).lower(),
+        "explanation": str(obj.get("explanation", "")).strip(),
+        "fixes": fixes,
+    }
+
+
+def _send_autofix_email(
+    repo: str, pr_number: int, pr_url: str, explanation: str
+) -> bool:
+    """Best-effort notification that an auto-fix PR was opened. Soft-fails
+    (logs + returns False) if the Gmail env vars aren't configured — we
+    never want a mail hiccup to fail the sandbox run."""
+    import smtplib
+    from email.message import EmailMessage
+
+    user = os.environ.get("GMAIL_USER", "").strip()
+    password = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
+    if not user or not password:
+        print("[sandbox] auto-fix: Gmail not configured — skipping email")
+        return False
+    recipient = os.environ.get("DIGEST_RECIPIENT", "").strip() or user
+    try:
+        msg = EmailMessage()
+        msg["From"] = user
+        msg["To"] = recipient
+        msg["Subject"] = f"[Lyncas] Auto-fix PR opened for {repo}#{pr_number}"
+        msg.set_content(
+            f"Lyncas detected a likely bug in {repo}#{pr_number} via a "
+            f"generated test and opened a fix PR:\n\n{pr_url}\n\n"
+            f"Why:\n{explanation}\n\n"
+            "This was auto-generated — review before merging."
+        )
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+            s.login(user, password)
+            s.send_message(msg)
+        return True
+    except Exception as e:
+        print(
+            f"[sandbox] auto-fix email failed: {type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+        return False
+
+
+def _autofix_pr(
+    repo: str,
+    pr_number: int,
+    token: str,
+    artifacts: dict[str, Any],
+) -> dict[str, Any]:
+    """Builder bit (Improvements.md #5): a generated test reproduced a
+    likely bug → ask Claude to judge + fix it → open a PR against the
+    contributor's branch → email. Opt-in (ALLOW_AUTO_FIX_PR) and full of
+    off-ramps; every failure degrades to a 'skip'/'error' status and never
+    raises into the sandbox run."""
+
+    def done(status: str, summary: str, **extra: Any) -> dict[str, Any]:
+        return {"status": status, "summary": summary, **extra}
+
+    if not ALLOW_AUTO_FIX_PR:
+        return done("skip", "auto-fix disabled (ALLOW_AUTO_FIX_PR)")
+    if not token:
+        return done("skip", "no GitHub token")
+
+    meta = _gh_get_pr_meta(repo, pr_number, token)
+    if not meta:
+        return done("skip", "could not load PR metadata")
+    if meta.get("state") != "open" or meta.get("merged"):
+        return done("skip", "PR not open")
+    if meta.get("head_repo") != repo:
+        # Fork PR: we can't push a branch to the fork, so there's nowhere to
+        # open the fix from. (A future version could fork+PR, but that's out
+        # of scope.)
+        return done("skip", "fork PR — cannot push fix branch")
+    head_ref = meta.get("head_ref")
+    head_sha = meta.get("head_sha")
+    if not head_ref or not head_sha:
+        return done("skip", "missing PR head ref/sha")
+    if str(head_ref).startswith(f"{AUTOFIX_BRANCH_PREFIX}/"):
+        # Don't open an auto-fix for an auto-fix PR — that would loop.
+        return done("skip", "PR is itself an auto-fix branch")
+
+    system, user = _build_fix_prompt(artifacts)
+    text = _anthropic_generate(
+        system, user, model=AUTOFIX_MODEL, max_tokens=AUTOFIX_MAX_TOKENS
+    )
+    if not text:
+        return done("skip", "fix generation returned nothing")
+    allowed = set((artifacts.get("sources") or {}).keys())
+    fix = _parse_fix_response(text, allowed)
+    if not fix:
+        return done("skip", "model judged not a real bug / no valid fix")
+
+    branch = f"{AUTOFIX_BRANCH_PREFIX}/{pr_number}-{int(time.time())}"
+    if not _gh_create_branch(repo, branch, head_sha, token):
+        return done("error", "failed to create fix branch")
+
+    commit_msg = f"fix: address bug in PR #{pr_number} found by Lyncas"
+    written = 0
+    for path, content in fix["fixes"]:
+        file_sha = _gh_get_file_sha(repo, path, branch, token)
+        if _gh_put_file(repo, path, branch, commit_msg, content, file_sha, token):
+            written += 1
+        else:
+            print(
+                f"[sandbox] auto-fix: failed to write {path}",
+                file=sys.stderr,
+            )
+    if written == 0:
+        return done("error", "failed to commit any fix files")
+
+    files_list = "\n".join(f"- `{p}`" for p, _ in fix["fixes"])
+    pr_body = (
+        "## 🤖 Lyncas auto-fix\n\n"
+        f"A generated test against #{pr_number} reproduced a likely bug. "
+        "This PR proposes a minimal fix.\n\n"
+        f"**Confidence:** {fix['confidence']}\n\n"
+        f"**Why:** {fix['explanation']}\n\n"
+        f"**Files changed:**\n{files_list}\n\n"
+        "> Auto-generated by Lyncas — review before merging. Merge this into "
+        f"the PR branch (`{head_ref}`) to apply the fix."
+    )
+    pr_title = f"Lyncas auto-fix for #{pr_number}"
+    opened = _gh_open_pr(repo, branch, head_ref, pr_title, pr_body, token)
+    if not opened:
+        return done(
+            "error", "failed to open fix PR", branch=branch
+        )
+
+    fix_pr_url = opened.get("html_url")
+    fix_pr_number = opened.get("number")
+    print(f"[sandbox] auto-fix: opened PR {fix_pr_url}")
+    emailed = _send_autofix_email(
+        repo, pr_number, fix_pr_url or "", fix["explanation"]
+    )
+    return done(
+        "opened",
+        f"opened fix PR #{fix_pr_number} ({fix['confidence']} confidence)",
+        pr_url=fix_pr_url,
+        pr_number=fix_pr_number,
+        confidence=fix["confidence"],
+        emailed=emailed,
+    )
 
 
 def _run_check(
@@ -1935,6 +2317,11 @@ def _render_checks_section(checks: dict[str, Any]) -> list[str]:
             )
         else:
             rows.append(f"| {label} | ⏭ {gen.get('summary', 'skipped')} |")
+        autofix = gen.get("autofix") if isinstance(gen, dict) else None
+        if isinstance(autofix, dict) and autofix.get("status") == "opened":
+            url = autofix.get("pr_url") or ""
+            link = f"[#{autofix.get('pr_number')}]({url})" if url else "opened"
+            rows.append(f"| ↳ Auto-fix PR | 🤖 {link} ({autofix.get('confidence', '')}) |")
 
     diff = checks.get("diff") or {}
     if diff:
@@ -2529,7 +2916,7 @@ def run() -> dict[str, Any]:
         )
 
         # --- Phase 4: Claude-generated tests (advisory, EC2-only) -------
-        generated_result = _generate_tests_check(
+        generated_result, gen_artifacts = _generate_tests_check(
             tunnel_url, repo, cwd, detect_flags, changed_files
         )
         checks["generated"] = generated_result
@@ -2540,15 +2927,20 @@ def run() -> dict[str, Any]:
             f"{generated_result.get('passed', 0)} passed, "
             f"{generated_result.get('failed', 0)} failed)"
         )
-        if generated_result.get("bug_candidate"):
-            # Seam for the auto-fix builder (Improvements.md #5): a failing
-            # generated test is a candidate reproduced bug. We surface it
-            # loudly + persist the flag; opening a self-fix PR is a separate
-            # roadmap item and intentionally NOT automated here.
+        if generated_result.get("bug_candidate") and gen_artifacts:
+            # Auto-fix builder (Improvements.md #5): a failing generated test
+            # is a candidate reproduced bug. We ask Claude to judge + fix it
+            # and open a PR against the contributor's branch. Opt-in via
+            # ALLOW_AUTO_FIX_PR; soft-fails so it never breaks the run.
             print(
                 "[sandbox] generated-tests: failing case detected — "
                 "candidate for auto-fix builder"
             )
+            autofix = _autofix_pr(
+                repo, pr_number, comment_token, gen_artifacts
+            )
+            generated_result["autofix"] = autofix
+            print(f"[sandbox] auto-fix: {autofix['status']} — {autofix['summary']}")
 
     # --- Preview gate (Phase 1 + Phase 3) -------------------------------
     # Decide whether the live preview is allowed BEFORE starting the app.

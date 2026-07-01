@@ -23,6 +23,10 @@ const LINKS: NavLinkSpec[] = [
   { href: "/dashboard/chat", label: "Chat" },
   { href: "/dashboard/overview", label: "Overview" },
   { href: "/dashboard/repos", label: "Repos" },
+  // Terminal — live interactive shell on the Lyncas house runner
+  // (EC2). Lets a dashboard-only user work on a real machine without
+  // connecting their own DevPod. First slice of Improvements.md item 4.
+  { href: "/dashboard/terminal", label: "Terminal" },
   // Reports (migration 018) — per-PR synthesis layer on top of the
   // reviewer + sandbox signals. Placed after Repos because the
   // mental model is "drill from a repo into its PRs"; ahead of

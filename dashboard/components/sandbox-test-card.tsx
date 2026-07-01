@@ -1,12 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { motion } from "framer-motion";
 import { downloadReportDocx } from "@/lib/docx-report";
 import { renderMarkdown } from "@/lib/markdown";
 import type {
   DevpodStatusResponse,
   PrReport,
+  SandboxChecks,
   SandboxProgressEvent,
   SandboxStep,
   SandboxVerdict,
@@ -48,6 +49,9 @@ const STEPS: ReadonlyArray<{
 }> = [
   { step: "clone", label: "Clone PR branch" },
   { step: "install", label: "Install dependencies" },
+  { step: "lint", label: "Lint" },
+  { step: "typecheck", label: "Type-check" },
+  { step: "security", label: "Security (secrets · audit)" },
   { step: "tests", label: "Run tests" },
   { step: "build", label: "Build" },
   { step: "app", label: "Start app & open preview" },
@@ -70,6 +74,12 @@ interface FinalResult {
   buildSuccess: boolean | null;
   buildOutput: string | null;
   appStarted: boolean | null;
+  // Phase 1 preview gate. gatePassed === false means the live preview
+  // was intentionally withheld (e.g. tests failed); gateReason explains.
+  gatePassed: boolean | null;
+  gateReason: string | null;
+  // Phase 3 structured quality checks, populated on the complete event.
+  checks: SandboxChecks | null;
   error: string | null;
 }
 
@@ -86,6 +96,9 @@ const INITIAL_FINAL: FinalResult = {
   buildSuccess: null,
   buildOutput: null,
   appStarted: null,
+  gatePassed: null,
+  gateReason: null,
+  checks: null,
   error: null,
 };
 
@@ -151,6 +164,12 @@ function verdictStyle(v: SandboxVerdict | null): {
         icon: "❌",
         label: "Build failed",
       };
+    case "security_failed":
+      return {
+        pillClass: "border-rose-500/40 bg-rose-500/10 text-rose-200",
+        icon: "🔑",
+        label: "Secret detected in diff",
+      };
     case "error":
     default:
       return {
@@ -173,6 +192,9 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
     () => ({
       clone: "pending",
       install: "pending",
+      lint: "pending",
+      typecheck: "pending",
+      security: "pending",
       tests: "pending",
       build: "pending",
       app: "pending",
@@ -227,6 +249,9 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
     (): Record<SandboxStep, StepStatus> => ({
       clone: "pending",
       install: "pending",
+      lint: "pending",
+      typecheck: "pending",
+      security: "pending",
       tests: "pending",
       build: "pending",
       app: "pending",
@@ -391,6 +416,9 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
               verdict: evt.overall ?? prev.verdict ?? "error",
               url: evt.url ?? prev.url,
               duration_ms: evt.duration_ms ?? prev.duration_ms,
+              gatePassed: evt.gate_passed ?? prev.gatePassed,
+              gateReason: evt.gate_reason ?? prev.gateReason,
+              checks: evt.checks ?? prev.checks,
               error: evt.error ?? prev.error,
             }));
             // Mark any still-pending steps as skipped so the UI
@@ -591,10 +619,27 @@ export function SandboxTestCard({ repo, prNumber }: SandboxTestCardProps) {
                   ? final.url
                     ? "App — running with preview"
                     : "App — started, preview unavailable"
-                  : "App — not started"
+                  : final.gatePassed === false
+                    ? "App — preview withheld"
+                    : "App — not started"
               }
             />
           </div>
+
+          {final.checks && <ChecksSummary checks={final.checks} />}
+
+          {/* Preview withheld by the gate (Phase 1). Shown when the
+              sandbox deliberately skipped the live preview because the
+              PR didn't pass its checks. */}
+          {final.gatePassed === false && !final.url && (
+            <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-2 text-amber-100">
+              <span className="font-medium">🔒 Preview withheld</span>
+              {final.gateReason ? ` — ${final.gateReason}.` : "."}{" "}
+              <span className="opacity-80">
+                Fix the issue and re-run to get a live preview.
+              </span>
+            </div>
+          )}
 
           {/* Prominent live-preview button */}
           {final.url && (
@@ -767,6 +812,160 @@ function SummaryRow({
     <div className="flex items-center gap-2">
       <span className="w-4 text-center">{icon}</span>
       <span>{label}</span>
+    </div>
+  );
+}
+
+// --- Phase 3: quality-checks breakdown -----------------------------------
+// Renders the lint / type-check / audit / SAST / secrets / coverage results
+// the SSE complete event carried. Advisory checks (everything but secrets)
+// show ⚠️ on failure; the blocking secret scan shows ❌. "skip" is neutral.
+function CheckRow({
+  label,
+  status,
+  detail,
+  blocking = false,
+}: {
+  label: string;
+  status: "pass" | "fail" | "skip" | "ok";
+  detail?: string;
+  blocking?: boolean;
+}) {
+  const icon =
+    status === "pass" || status === "ok"
+      ? "✅"
+      : status === "skip"
+        ? "⏭"
+        : blocking
+          ? "❌"
+          : "⚠️";
+  return (
+    <div className="flex items-center gap-2">
+      <span className="w-4 text-center">{icon}</span>
+      <span className="text-muted">{label}</span>
+      {detail && <span className="text-foreground/70">— {detail}</span>}
+    </div>
+  );
+}
+
+function ChecksSummary({ checks }: { checks: SandboxChecks }) {
+  const sec = checks.security ?? {};
+  const secrets = sec.secrets;
+  const cov = checks.coverage;
+  const rows: ReactNode[] = [];
+
+  if (checks.lint)
+    rows.push(
+      <CheckRow
+        key="lint"
+        label={`Lint (${checks.lint.tool})`}
+        status={checks.lint.status}
+        detail={checks.lint.status === "fail" ? checks.lint.summary : undefined}
+      />,
+    );
+  if (checks.typecheck)
+    rows.push(
+      <CheckRow
+        key="typecheck"
+        label={`Type-check (${checks.typecheck.tool})`}
+        status={checks.typecheck.status}
+        detail={
+          checks.typecheck.status === "fail"
+            ? checks.typecheck.summary
+            : undefined
+        }
+      />,
+    );
+  if (sec.audit)
+    rows.push(
+      <CheckRow
+        key="audit"
+        label={`Dependency audit (${sec.audit.tool})`}
+        status={sec.audit.status}
+      />,
+    );
+  if (sec.sast)
+    rows.push(
+      <CheckRow
+        key="sast"
+        label="SAST (semgrep)"
+        status={sec.sast.status}
+        detail={sec.sast.status === "skip" ? sec.sast.summary : undefined}
+      />,
+    );
+  if (secrets)
+    rows.push(
+      <CheckRow
+        key="secrets"
+        label="Secret scan"
+        status={secrets.status}
+        blocking
+        detail={
+          secrets.status === "fail"
+            ? `${secrets.count} in diff`
+            : secrets.status === "pass"
+              ? "none in diff"
+              : undefined
+        }
+      />,
+    );
+  if (cov?.status === "ok" && cov.pct != null)
+    rows.push(
+      <CheckRow key="cov" label="Coverage" status="ok" detail={`${cov.pct}%`} />,
+    );
+
+  const gen = checks.generated;
+  if (gen && (gen.status !== "skip" || gen.written > 0)) {
+    const fw = gen.framework && gen.framework !== "n/a" ? ` (${gen.framework})` : "";
+    rows.push(
+      <CheckRow
+        key="generated"
+        label={`Generated tests${fw}`}
+        status={gen.status}
+        detail={
+          gen.status === "pass"
+            ? `${gen.passed} passed · advisory`
+            : `${gen.summary} · advisory`
+        }
+      />,
+    );
+    if (gen.autofix?.status === "opened") {
+      rows.push(
+        <CheckRow
+          key="autofix"
+          label="↳ Auto-fix PR"
+          status="ok"
+          detail={
+            gen.autofix.pr_number
+              ? `#${gen.autofix.pr_number} opened (${gen.autofix.confidence ?? ""})`
+              : "opened"
+          }
+        />,
+      );
+    }
+  }
+
+  if (!rows.length) return null;
+
+  return (
+    <div className="space-y-1 rounded-md border border-border bg-background/30 px-2.5 py-2">
+      <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-muted">
+        Quality checks
+        {checks.diff && ` · ${checks.diff.changed_files} files changed`}
+      </div>
+      <div className="space-y-1 pt-0.5">{rows}</div>
+      {secrets?.findings && secrets.findings.length > 0 && (
+        <div className="mt-1 rounded-md border border-rose-500/40 bg-rose-500/10 px-2 py-1.5 text-rose-200">
+          <div className="font-medium">🔑 Potential secrets:</div>
+          <ul className="mt-0.5 list-inside list-disc">
+            {secrets.findings.slice(0, 6).map((f) => (
+              <li key={f} className="font-mono text-[10px]">
+                {f}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   );
 }

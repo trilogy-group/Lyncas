@@ -247,6 +247,22 @@ export interface RepoRule {
   // Populated by the agent (upsert_repo_directory_tree). Displayed
   // read-only in the dashboard.
   repo_directory_tree: string | null;
+  // --- Sandbox preview gate (migration 021, Phase 1) ---------------------
+  // Optional because rows created before migration 021 won't have them;
+  // the sandbox runners and settings UI fall back to the documented
+  // defaults (block=true, require=false).
+  //
+  // When true, a failing authored test suite withholds the DevPod live
+  // preview (Cloudflare URL). Default true.
+  sandbox_block_on_test_failure?: boolean;
+  // When true, the absence of any tests also withholds the preview
+  // (strict repos). Default false.
+  sandbox_require_tests_for_preview?: boolean;
+  // --- Sandbox security gate (migration 022, Phase 3) --------------------
+  // When true (default), a newly-added secret detected in the PR diff
+  // withholds the live preview and marks the run as security_failed. The
+  // other Phase 3 checks (lint / type-check / audit / SAST) stay advisory.
+  sandbox_block_on_secrets?: boolean;
 }
 
 // --- Repo research cache (migration 013) ---------------------------------
@@ -515,6 +531,10 @@ export type SandboxVerdict =
   | "pass_no_preview"
   | "tests_failed"
   | "build_failed"
+  // Phase 3: a blocking security check failed (a newly-added secret in
+  // the diff). Distinct from tests/build so the UI + PR comment can say
+  // "secret detected" rather than a generic failure. Maps to db "fail".
+  | "security_failed"
   | "no_tests"
   | "error";
 
@@ -525,6 +545,7 @@ export function verdictToDbOverall(v: SandboxVerdict): SandboxOverall {
       return "pass";
     case "tests_failed":
     case "build_failed":
+    case "security_failed":
       return "fail";
     case "no_tests":
       return "no_tests";
@@ -532,6 +553,68 @@ export function verdictToDbOverall(v: SandboxVerdict): SandboxOverall {
     default:
       return "error";
   }
+}
+
+// --- Phase 3: quality checks (lint / type-check / security / coverage) ----
+// Persisted in pr_sandbox_results.checks (migration 022) and streamed on
+// the SSE `complete` event. Every check is best-effort: "skip" means the
+// tool wasn't available or the check didn't apply to the detected stack,
+// NOT that it failed. Only the secret scan is blocking; the rest are
+// advisory and never withhold the preview on their own.
+export type CheckStatus = "pass" | "fail" | "skip";
+
+export interface CheckResult {
+  status: CheckStatus;
+  tool: string;
+  summary: string;
+}
+
+export interface SecretScanResult {
+  status: CheckStatus;
+  tool: string;
+  count: number;
+  findings: string[];
+}
+
+// Phase 4: Claude-generated unit tests. Advisory by default and EC2-only
+// (the DevPod has no Anthropic key, the Vercel route no budget) — so the
+// chat path reports status "skip" / "runs on EC2". `bug_candidate` is true
+// when a generated test FAILED, which is the high-signal seed for the
+// auto-fix builder (a generated test that reproduces a real bug).
+// Phase 4b: result of the auto-fix builder when a generated test
+// reproduces a likely bug. EC2-only; "opened" means a fix PR was created
+// against the contributor's branch.
+export interface AutoFixResult {
+  status: "opened" | "skip" | "error";
+  summary: string;
+  pr_url?: string;
+  pr_number?: number;
+  confidence?: string;
+  emailed?: boolean;
+}
+
+export interface GeneratedTestsResult {
+  status: CheckStatus;
+  framework: string;
+  written: number;
+  passed: number;
+  failed: number;
+  summary: string;
+  bug_candidate?: boolean;
+  autofix?: AutoFixResult;
+}
+
+export interface SandboxChecks {
+  diff?: { changed_files: number; base: string | null };
+  lint?: CheckResult;
+  typecheck?: CheckResult;
+  security?: {
+    secrets?: SecretScanResult;
+    audit?: CheckResult;
+    sast?: CheckResult;
+  };
+  coverage?: { status: "ok" | "skip"; pct: number | null; tool: string };
+  generated?: GeneratedTestsResult;
 }
 
 export interface SandboxResult {
@@ -550,6 +633,12 @@ export interface SandboxResult {
   overall: SandboxOverall | null;
   created_at: string;
   duration_ms: number | null;
+  // --- Phase 3 (migration 022) ------------------------------------------
+  // Structured quality-check results + the explicit gate decision. All
+  // optional: rows written before migration 022 won't have them.
+  checks?: SandboxChecks | null;
+  gate_passed?: boolean | null;
+  gate_reason?: string | null;
 }
 
 // SSE event shape emitted by /api/devpod/run-pr-tests. Each step
@@ -563,9 +652,15 @@ export interface SandboxResult {
 // types). The "expose" event was folded into "app": expose_port
 // runs as the tail of the app step and the resulting URL is
 // surfaced in app's "done" event.
+// Phase 3 inserts lint / typecheck / security between install and tests.
+// The chat card streams each as its own row; "security" aggregates the
+// secret scan + dependency audit + SAST into one step.
 export type SandboxStep =
   | "clone"
   | "install"
+  | "lint"
+  | "typecheck"
+  | "security"
   | "tests"
   | "build"
   | "app"
@@ -656,4 +751,17 @@ export interface SandboxProgressEvent {
   // stderr-style excerpt that the card renders in a collapsible
   // <pre>.
   build_output?: string;
+  // --- Sandbox preview gate (Phase 1) -----------------------------------
+  // Carried on the terminal `complete` event. When gate_passed is false
+  // the sandbox intentionally withheld the live preview (e.g. tests
+  // failed); gate_reason is a short human-readable explanation. Absent
+  // on per-step events.
+  gate_passed?: boolean;
+  gate_reason?: string;
+  // --- Phase 3 quality checks -------------------------------------------
+  // Per-step events (lint / typecheck / security) carry a short `detail`
+  // string for the inline summary. The terminal `complete` event carries
+  // the full structured `checks` blob the card renders + persists.
+  detail?: string;
+  checks?: SandboxChecks;
 }

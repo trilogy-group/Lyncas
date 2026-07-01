@@ -120,6 +120,7 @@ flags govern it:
                  and exit without sending a chat request
 
 Examples:
+  lyncas                                    # interactive chat session
   lyncas "review the current branch changes"
   lyncas "what changed in the last 3 commits"
   lyncas --no-history "explain this single error"
@@ -351,6 +352,155 @@ def stream_chat(message, repo, token, history):
         return 1, "".join(captured)
 
 
+# --- interactive REPL ----------------------------------------------------
+# A claude/ollama-style chat session for the terminal. Pure stdlib: all
+# styling is hand-rolled ANSI built from chr(27) (ESC) so the script
+# carries zero backslash escapes — it's served as a JS template literal
+# and literal backslashes would otherwise need double-escaping.
+ENABLE_COLOR = True
+
+
+def supports_color():
+    """Honour NO_COLOR / TERM=dumb and only colorize a real TTY."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("TERM") == "dumb":
+        return False
+    return sys.stdout.isatty()
+
+
+def paint(text, *codes):
+    if not ENABLE_COLOR or not codes:
+        return text
+    return chr(27) + "[" + ";".join(codes) + "m" + text + chr(27) + "[0m"
+
+
+def accent(t):
+    return paint(t, "38;5;81")
+
+
+def accent2(t):
+    return paint(t, "38;5;213")
+
+
+def dim(t):
+    return paint(t, "2")
+
+
+def bold(t):
+    return paint(t, "1")
+
+
+def good(t):
+    return paint(t, "38;5;114")
+
+
+def bad(t):
+    return paint(t, "38;5;203")
+
+
+COMMANDS = [
+    ("/help", "show available commands"),
+    ("/repo", "show the active repository"),
+    ("/clear", "wipe saved history (server + session)"),
+    ("/new", "start a fresh conversation, keep saved history"),
+    ("/history", "how many turns are loaded this session"),
+    ("/exit", "leave the chat (or press Ctrl-D)"),
+]
+
+
+def print_banner(repo, username, history_count, no_history):
+    rule = accent(chr(0x2500) * 52)
+    mode = "off (--no-history)" if no_history else (str(history_count) + " turns loaded")
+    print()
+    print("  " + bold(accent2(chr(0x25C6) + " Lyncas")) + "  " + dim("interactive chat"))
+    print("  " + rule)
+    print("  " + dim("repo  ") + " " + accent(repo))
+    print("  " + dim("user  ") + " " + username)
+    print("  " + dim("memory") + " " + mode)
+    print()
+    print(
+        "  " + dim("type ") + accent("/help") + dim(" for commands  " + chr(0x00B7) + "  ")
+        + accent("/exit") + dim(" to quit")
+    )
+
+
+def print_help():
+    print()
+    print("  " + bold("Commands"))
+    for name, desc in COMMANDS:
+        print("    " + accent(name.ljust(10)) + " " + dim(desc))
+
+
+def interactive(username, repo, token, no_history):
+    """Run the REPL loop. Returns a process exit code.
+
+    History is loaded once at start, kept in memory for the session,
+    and (unless --no-history) saved back after every assistant turn so
+    a later one-shot 'lyncas ...' sees the same thread. In-memory
+    history is trimmed to 2x HISTORY_LIMIT so a marathon session can't
+    grow unbounded; the server slices to its own limit regardless."""
+    global ENABLE_COLOR
+    ENABLE_COLOR = supports_color()
+
+    history = [] if no_history else load_history(username, repo)
+    print_banner(repo, username, len(history), no_history)
+
+    prompt = chr(10) + paint(chr(0x276F) + " ", "38;5;81", "1")
+    while True:
+        try:
+            line = input(prompt)
+        except EOFError:
+            print(chr(10) + dim("  bye"))
+            return 0
+        except KeyboardInterrupt:
+            print(chr(10) + dim("  (press Ctrl-D or type /exit to quit)"))
+            continue
+
+        msg = line.strip()
+        if not msg:
+            continue
+
+        if msg.startswith("/"):
+            parts = msg[1:].split()
+            cmd = parts[0].lower() if parts else ""
+            if cmd in ("exit", "quit", "q"):
+                print(dim("  bye"))
+                return 0
+            if cmd in ("help", "h", "?"):
+                print_help()
+                continue
+            if cmd == "repo":
+                print("  " + accent(repo))
+                continue
+            if cmd == "clear":
+                clear_history(username, repo, token)
+                history = []
+                print("  " + good("history cleared"))
+                continue
+            if cmd in ("new", "reset"):
+                history = []
+                print("  " + dim("started a fresh conversation"))
+                continue
+            if cmd == "history":
+                print("  " + dim(str(len(history)) + " turns loaded this session"))
+                continue
+            print("  " + bad("unknown command: /" + cmd) + dim("  " + chr(0x2014) + " try /help"))
+            continue
+
+        # A normal message: stream the answer under a colored label.
+        print()
+        print(accent2(chr(0x25C6) + " lyncas"))
+        exit_code, assistant = stream_chat(msg, repo, token, history)
+        if exit_code == 0 and assistant.strip():
+            history = (history + [
+                {"role": "user", "content": msg},
+                {"role": "assistant", "content": assistant},
+            ])[-2 * HISTORY_LIMIT:]
+            if not no_history:
+                save_history(username, repo, token, history)
+
+
 def main():
     # Flag parsing happens BEFORE we require a message because
     # --clear is a standalone command (no message needed).
@@ -397,14 +547,13 @@ def main():
         sys.stdout.write(chr(0x2705) + " Conversation history cleared" + NEWLINE)
         return 0
 
-    # From here on we need a message.
+    # No message: a real terminal drops into the interactive REPL
+    # (the 'lyncas' claude/ollama-style chat experience). A piped
+    # stdin with no args still runs a single one-shot exchange so
+    # 'echo question | lyncas' keeps working in scripts.
     if not remaining:
         if sys.stdin.isatty():
-            sys.stderr.write(
-                "Usage: lyncas [--no-history|--clear] \\"your question\\"" + NEWLINE
-                + "       echo question | lyncas" + NEWLINE
-            )
-            return 64
+            return interactive(username, repo, token, no_history)
         message = sys.stdin.read().strip()
     else:
         message = " ".join(remaining).strip()
@@ -451,7 +600,10 @@ echo ""
 echo "Connect your DevPod:"
 echo "  devpod-connect --token YOUR_TOKEN"
 echo ""
-echo "Then ask the agent anything from your shell:"
+echo "Then start an interactive chat session:"
+echo "  lyncas"
+echo ""
+echo "Or ask one-shot questions:"
 echo "  lyncas \\"what changed in the last 3 commits\\""
 echo ""
 echo "Conversation history (per user, per repo) is on by default."
